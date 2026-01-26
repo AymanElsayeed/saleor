@@ -1,9 +1,8 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..product.models import ProductVariant
-    from .models import FulfillmentLine, OrderLine
+    from .models import FulfillmentLine
 
 
 class OrderStatus:
@@ -22,6 +21,7 @@ class OrderStatus:
     )
     RETURNED = "returned"  # order with all items marked as returned
     CANCELED = "canceled"  # permanently canceled order
+    EXPIRED = "expired"  # order marked as expired
 
     CHOICES = [
         (DRAFT, "Draft"),
@@ -32,18 +32,24 @@ class OrderStatus:
         (RETURNED, "Returned"),
         (FULFILLED, "Fulfilled"),
         (CANCELED, "Canceled"),
+        (EXPIRED, "Expired"),
     ]
+
+
+ORDER_EDITABLE_STATUS = (OrderStatus.DRAFT, OrderStatus.UNCONFIRMED)
 
 
 class OrderOrigin:
     CHECKOUT = "checkout"  # order created from checkout
     DRAFT = "draft"  # order created from draft order
     REISSUE = "reissue"  # order created from reissue existing one
+    BULK_CREATE = "bulk_create"  # order created from bulk upload
 
     CHOICES = [
         (CHECKOUT, "Checkout"),
         (DRAFT, "Draft"),
         (REISSUE, "Reissue"),
+        (BULK_CREATE, "Bulk create"),
     ]
 
 
@@ -56,6 +62,9 @@ class FulfillmentStatus:
     )
     REPLACED = "replaced"  # group of replaced products
     CANCELED = "canceled"  # fulfilled group of products in an order marked as canceled
+    WAITING_FOR_APPROVAL = (
+        "waiting_for_approval"  # group of products waiting for approval
+    )
 
     CHOICES = [
         (FULFILLED, "Fulfilled"),
@@ -64,6 +73,7 @@ class FulfillmentStatus:
         (REPLACED, "Replaced"),
         (REFUNDED_AND_RETURNED, "Refunded and returned"),
         (CANCELED, "Canceled"),
+        (WAITING_FOR_APPROVAL, "Waiting for approval"),
     ]
 
 
@@ -79,9 +89,11 @@ class OrderEvents:
 
     PLACED = "placed"
     PLACED_FROM_DRAFT = "placed_from_draft"
+    PLACED_AUTOMATICALLY_FROM_PAID_CHECKOUT = "placed_automatically_from_paid_checkout"
 
     OVERSOLD_ITEMS = "oversold_items"
     CANCELED = "canceled"
+    EXPIRED = "expired"
 
     ORDER_MARKED_AS_PAID = "order_marked_as_paid"
     ORDER_FULLY_PAID = "order_fully_paid"
@@ -106,6 +118,13 @@ class OrderEvents:
     PAYMENT_REFUNDED = "payment_refunded"
     PAYMENT_VOIDED = "payment_voided"
     PAYMENT_FAILED = "payment_failed"
+
+    TRANSACTION_EVENT = "transaction_event"
+    TRANSACTION_CHARGE_REQUESTED = "transaction_charge_requested"
+    TRANSACTION_REFUND_REQUESTED = "transaction_refund_requested"
+    TRANSACTION_CANCEL_REQUESTED = "transaction_cancel_requested"
+    TRANSACTION_MARK_AS_PAID_FAILED = "transaction_mark_as_paid_failed"
+
     EXTERNAL_SERVICE_NOTIFICATION = "external_service_notification"
 
     INVOICE_REQUESTED = "invoice_requested"
@@ -119,8 +138,10 @@ class OrderEvents:
     FULFILLMENT_REFUNDED = "fulfillment_refunded"
     FULFILLMENT_RETURNED = "fulfillment_returned"
     FULFILLMENT_REPLACED = "fulfillment_replaced"
+    FULFILLMENT_AWAITS_APPROVAL = "fulfillment_awaits_approval"
     TRACKING_UPDATED = "tracking_updated"
     NOTE_ADDED = "note_added"
+    NOTE_UPDATED = "note_updated"
 
     # Used mostly for importing legacy data from before Enum-based events
     OTHER = "other"
@@ -132,8 +153,13 @@ class OrderEvents:
         (REMOVED_PRODUCTS, "Some products were removed from the order"),
         (PLACED, "The order was placed"),
         (PLACED_FROM_DRAFT, "The draft order was placed"),
+        (
+            PLACED_AUTOMATICALLY_FROM_PAID_CHECKOUT,
+            "The order was placed automatically from fully paid checkout",
+        ),
         (OVERSOLD_ITEMS, "The draft order was placed with oversold items"),
         (CANCELED, "The order was canceled"),
+        (EXPIRED, "The order was automatically expired"),
         (ORDER_MARKED_AS_PAID, "The order was manually marked as fully paid"),
         (ORDER_FULLY_PAID, "The order was fully paid"),
         (ORDER_REPLACEMENT_CREATED, "The draft order was created based on this order."),
@@ -157,6 +183,11 @@ class OrderEvents:
         (PAYMENT_REFUNDED, "The payment was refunded"),
         (PAYMENT_VOIDED, "The payment was voided"),
         (PAYMENT_FAILED, "The payment was failed"),
+        (TRANSACTION_EVENT, "The transaction event"),
+        (TRANSACTION_CHARGE_REQUESTED, "The charge requested for transaction"),
+        (TRANSACTION_REFUND_REQUESTED, "The refund requested for transaction"),
+        (TRANSACTION_CANCEL_REQUESTED, "The cancel requested for transaction"),
+        (TRANSACTION_MARK_AS_PAID_FAILED, "The mark as paid failed for transaction"),
         (INVOICE_REQUESTED, "An invoice was requested"),
         (INVOICE_GENERATED, "An invoice was generated"),
         (INVOICE_UPDATED, "An invoice was updated"),
@@ -167,8 +198,10 @@ class OrderEvents:
         (FULFILLMENT_REFUNDED, "Some items were refunded"),
         (FULFILLMENT_RETURNED, "Some items were returned"),
         (FULFILLMENT_REPLACED, "Some items were replaced"),
+        (FULFILLMENT_AWAITS_APPROVAL, "Fulfillments awaits approval"),
         (TRACKING_UPDATED, "The fulfillment's tracking code was updated"),
         (NOTE_ADDED, "A note was added to the order"),
+        (NOTE_UPDATED, "A note was updated in the order"),
         (OTHER, "An unknown order event containing a message"),
     ]
 
@@ -199,13 +232,73 @@ class OrderEventsEmails:
     ]
 
 
-@dataclass
-class OrderLineData:
-    line: "OrderLine"
-    quantity: int
-    variant: Optional["ProductVariant"] = None
-    replace: bool = False
-    warehouse_pk: Optional[str] = None
+class OrderAuthorizeStatus:
+    """Determine a current authorize status for order.
+
+    We treat the order as fully authorized when the sum of authorized and charged funds
+    cover the `order.total`-`order.totalGrantedRefund`.
+    We treat the order as partially authorized when the sum of authorized and charged
+    funds covers only part of the `order.total`-`order.totalGrantedRefund`.
+    We treat the order as not authorized when the sum of authorized and charged funds is
+    0.
+
+    NONE - the funds are not authorized
+    PARTIAL - the funds that are authorized and charged don't cover fully the
+    `order.total`-`order.totalGrantedRefund`
+    FULL - the funds that are authorized and charged fully cover the
+    `order.total`-`order.totalGrantedRefund`
+    """
+
+    NONE = "none"
+    PARTIAL = "partial"
+    FULL = "full"
+
+    CHOICES = [
+        (NONE, "The funds are not authorized"),
+        (
+            PARTIAL,
+            "The funds that are authorized and charged don't cover fully the order's "
+            "total",
+        ),
+        (
+            FULL,
+            "The funds that are authorized and charged fully cover the order's total",
+        ),
+    ]
+
+
+class OrderChargeStatus:
+    """Determine the current charge status for the order.
+
+    An order is considered overcharged when the sum of the
+    transactionItem's charge amounts exceeds the value of
+    `order.total` - `order.totalGrantedRefund`.
+    If the sum of the transactionItem's charge amounts equals
+    `order.total` - `order.totalGrantedRefund`, we consider the order to be fully
+    charged.
+    If the sum of the transactionItem's charge amounts covers a part of the
+    `order.total` - `order.totalGrantedRefund`, we treat the order as partially charged.
+
+    NONE - the funds are not charged.
+    PARTIAL - the funds that are charged don't cover the
+    `order.total`-`order.totalGrantedRefund`
+    FULL - the funds that are charged fully cover the
+    `order.total`-`order.totalGrantedRefund`
+    OVERCHARGED - the charged funds are bigger than the
+    `order.total`-`order.totalGrantedRefund`
+    """
+
+    NONE = "none"
+    PARTIAL = "partial"
+    FULL = "full"
+    OVERCHARGED = "overcharged"
+
+    CHOICES = [
+        (NONE, "The order is not charged."),
+        (PARTIAL, "The order is partially charged"),
+        (FULL, "The order is fully charged"),
+        (OVERCHARGED, "The order is overcharged"),
+    ]
 
 
 @dataclass
@@ -213,3 +306,44 @@ class FulfillmentLineData:
     line: "FulfillmentLine"
     quantity: int
     replace: bool = False
+
+
+class StockUpdatePolicy:
+    """Determine how stocks should be updated, while processing an order.
+
+    SKIP - stocks are not checked and not updated.
+    UPDATE - only do update, if there is enough stock.
+    FORCE - force update, if there is not enough stock.
+    """
+
+    SKIP = "skip"
+    UPDATE = "update"
+    FORCE = "force"
+
+    CHOICES = [
+        (SKIP, "Stocks are not checked and not updated."),
+        (UPDATE, "Only do update, if there is enough stocks."),
+        (FORCE, "Force update, if there is not enough stocks."),
+    ]
+
+
+class OrderGrantedRefundStatus:
+    """Represents the status of a granted refund.
+
+    NONE - the refund on related transactionItem is not processed
+    PENDING - the refund on related transactionItem is pending
+    FULL - the refund on related transactionItem is fully processed
+    FAIL - the refund on related transactionItem failed
+    """
+
+    NONE = "none"
+    PENDING = "pending"
+    SUCCESS = "success"
+    FAILURE = "failure"
+
+    CHOICES = [
+        (NONE, "The refund on related transactionItem is not processed"),
+        (PENDING, "The refund on related transactionItem is pending"),
+        (SUCCESS, "The refund on related transactionItem is successfully processed"),
+        (FAILURE, "The refund on related transactionItem failed"),
+    ]

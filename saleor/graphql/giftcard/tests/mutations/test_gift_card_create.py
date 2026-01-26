@@ -1,31 +1,32 @@
-from datetime import date, timedelta
+import datetime
+import json
+from unittest import mock
 
+import graphene
+import pytest
+from django.utils.functional import SimpleLazyObject
+from freezegun import freeze_time
+
+from .....core.utils.json_serializer import CustomJsonEncoder
 from .....giftcard import GiftCardEvents
 from .....giftcard.error_codes import GiftCardErrorCode
-from ....core.enums import TimePeriodTypeEnum
+from .....giftcard.models import GiftCard
+from .....webhook.event_types import WebhookEventAsyncType
+from .....webhook.payloads import generate_meta, generate_requestor
 from ....tests.utils import assert_no_permission, get_graphql_content
-from ...enums import GiftCardExpiryTypeEnum
 
 CREATE_GIFT_CARD_MUTATION = """
-    mutation giftCardCreate(
-        $balance: PriceInput!, $userEmail: String, $tag: String,
-        $expirySettings: GiftCardExpirySettingsInput!, $note: String
-    ){
-        giftCardCreate(input: {
-                balance: $balance, userEmail: $userEmail, tag: $tag,
-                expirySettings: $expirySettings, note: $note }) {
+    mutation giftCardCreate($input: GiftCardCreateInput!){
+        giftCardCreate(input: $input) {
             giftCard {
                 id
                 code
-                displayCode
+                last4CodeChars
                 isActive
                 expiryDate
-                expiryType
-                expiryPeriod {
-                    amount
-                    type
+                tags {
+                    name
                 }
-                tag
                 created
                 lastUsedOn
                 initialBalance {
@@ -52,6 +53,7 @@ CREATE_GIFT_CARD_MUTATION = """
                 }
                 events {
                     type
+                    message
                     user {
                         email
                     }
@@ -88,29 +90,38 @@ CREATE_GIFT_CARD_MUTATION = """
 """
 
 
+@mock.patch(
+    "saleor.graphql.giftcard.mutations.gift_card_create.send_gift_card_notification"
+)
 def test_create_never_expiry_gift_card(
+    send_notification_mock,
     staff_api_client,
     customer_user,
+    channel_USD,
     permission_manage_gift_card,
     permission_manage_users,
     permission_manage_apps,
+    gift_card_tag_list,
 ):
     # given
     initial_balance = 100
     currency = "USD"
-    expiry_type = GiftCardExpiryTypeEnum.NEVER_EXPIRE.name
-    tag = "gift-card-tag"
+    new_tag = "gift-card-tag"
+    existing_tag_name = gift_card_tag_list[0].name
+    tags = [new_tag, existing_tag_name]
+    note = "This is gift card note that will be save in gift card event."
     variables = {
-        "balance": {
-            "amount": initial_balance,
-            "currency": currency,
-        },
-        "userEmail": customer_user.email,
-        "tag": tag,
-        "note": "This is gift card note that will be save in gift card event.",
-        "expirySettings": {
-            "expiryType": expiry_type,
-        },
+        "input": {
+            "balance": {
+                "amount": initial_balance,
+                "currency": currency,
+            },
+            "userEmail": customer_user.email,
+            "channel": channel_USD.slug,
+            "addTags": tags,
+            "note": note,
+            "isActive": True,
+        }
     }
 
     # when
@@ -131,11 +142,10 @@ def test_create_never_expiry_gift_card(
 
     assert not errors
     assert data["code"]
-    assert data["displayCode"]
-    assert data["expiryType"] == expiry_type.upper()
+    assert data["last4CodeChars"]
     assert not data["expiryDate"]
-    assert not data["expiryPeriod"]
-    assert data["tag"] == tag
+    assert len(data["tags"]) == 2
+    assert {tag["name"] for tag in data["tags"]} == set(tags)
     assert data["createdBy"]["email"] == staff_api_client.user.email
     assert data["createdByEmail"] == staff_api_client.user.email
     assert not data["usedBy"]
@@ -146,42 +156,62 @@ def test_create_never_expiry_gift_card(
     assert data["initialBalance"]["amount"] == initial_balance
     assert data["currentBalance"]["amount"] == initial_balance
 
-    assert len(data["events"]) == 1
-    event = data["events"][0]
-    assert event["type"] == GiftCardEvents.ISSUED.upper()
-    assert event["user"]["email"] == staff_api_client.user.email
-    assert not event["app"]
-    assert event["balance"]["initialBalance"]["amount"] == initial_balance
-    assert event["balance"]["initialBalance"]["currency"] == currency
-    assert event["balance"]["currentBalance"]["amount"] == initial_balance
-    assert event["balance"]["currentBalance"]["currency"] == currency
-    assert not event["balance"]["oldInitialBalance"]
-    assert not event["balance"]["oldCurrentBalance"]
+    assert len(data["events"]) == 2
+    created_event, note_added = data["events"]
+
+    assert created_event["type"] == GiftCardEvents.ISSUED.upper()
+    assert created_event["user"]["email"] == staff_api_client.user.email
+    assert not created_event["app"]
+    assert created_event["balance"]["initialBalance"]["amount"] == initial_balance
+    assert created_event["balance"]["initialBalance"]["currency"] == currency
+    assert created_event["balance"]["currentBalance"]["amount"] == initial_balance
+    assert created_event["balance"]["currentBalance"]["currency"] == currency
+    assert not created_event["balance"]["oldInitialBalance"]
+    assert not created_event["balance"]["oldCurrentBalance"]
+
+    assert note_added["type"] == GiftCardEvents.NOTE_ADDED.upper()
+    assert note_added["user"]["email"] == staff_api_client.user.email
+    assert not note_added["app"]
+    assert note_added["message"] == note
+
+    gift_card = GiftCard.objects.get()
+    send_notification_mock.assert_called_once_with(
+        staff_api_client.user,
+        None,
+        customer_user,
+        customer_user.email,
+        gift_card,
+        mock.ANY,
+        channel_slug=channel_USD.slug,
+        resending=False,
+    )
 
 
+@mock.patch(
+    "saleor.graphql.giftcard.mutations.gift_card_create.send_gift_card_notification"
+)
 def test_create_gift_card_by_app(
+    send_notification_mock,
     app_api_client,
-    customer_user,
     permission_manage_gift_card,
     permission_manage_users,
 ):
     # given
     initial_balance = 100
     currency = "USD"
-    expiry_type = GiftCardExpiryTypeEnum.NEVER_EXPIRE.name
     tag = "gift-card-tag"
+    note = "This is gift card note that will be save in gift card event."
     variables = {
-        "balance": {
-            "amount": initial_balance,
-            "currency": currency,
-        },
-        "userEmail": customer_user.email,
-        "tag": tag,
-        "note": "This is gift card note that will be save in gift card event.",
-        "expirySettings": {
-            "expiryType": expiry_type,
+        "input": {
+            "balance": {
+                "amount": initial_balance,
+                "currency": currency,
+            },
+            "addTags": [tag],
+            "note": note,
             "expiryDate": None,
-        },
+            "isActive": False,
+        }
     }
 
     # when
@@ -198,52 +228,59 @@ def test_create_gift_card_by_app(
 
     assert not errors
     assert data["code"]
-    assert data["displayCode"]
-    assert data["expiryType"] == expiry_type.upper()
+    assert data["last4CodeChars"]
     assert not data["expiryDate"]
-    assert not data["expiryPeriod"]
-    assert data["tag"] == tag
+    assert len(data["tags"]) == 1
+    assert data["tags"][0]["name"] == tag
     assert not data["createdBy"]
     assert not data["createdByEmail"]
     assert not data["usedBy"]
     assert not data["usedByEmail"]
     assert data["app"]["name"] == app_api_client.app.name
     assert not data["lastUsedOn"]
-    assert data["isActive"]
+    assert data["isActive"] is False
     assert data["initialBalance"]["amount"] == initial_balance
     assert data["currentBalance"]["amount"] == initial_balance
 
-    assert len(data["events"]) == 1
-    event = data["events"][0]
-    assert event["type"] == GiftCardEvents.ISSUED.upper()
-    assert not event["user"]
-    assert event["app"]["name"] == app_api_client.app.name
-    assert event["balance"]["initialBalance"]["amount"] == initial_balance
-    assert event["balance"]["initialBalance"]["currency"] == currency
-    assert event["balance"]["currentBalance"]["amount"] == initial_balance
-    assert event["balance"]["currentBalance"]["currency"] == currency
-    assert not event["balance"]["oldInitialBalance"]
-    assert not event["balance"]["oldCurrentBalance"]
+    assert len(data["events"]) == 2
+    created_event, note_added = data["events"]
+
+    assert created_event["type"] == GiftCardEvents.ISSUED.upper()
+    assert not created_event["user"]
+    assert created_event["app"]["name"] == app_api_client.app.name
+    assert created_event["balance"]["initialBalance"]["amount"] == initial_balance
+    assert created_event["balance"]["initialBalance"]["currency"] == currency
+    assert created_event["balance"]["currentBalance"]["amount"] == initial_balance
+    assert created_event["balance"]["currentBalance"]["currency"] == currency
+    assert not created_event["balance"]["oldInitialBalance"]
+    assert not created_event["balance"]["oldCurrentBalance"]
+
+    assert note_added["type"] == GiftCardEvents.NOTE_ADDED.upper()
+    assert not note_added["user"]
+    assert note_added["app"]["name"] == app_api_client.app.name
+    assert note_added["message"] == note
+
+    send_notification_mock.assert_not_called()
 
 
-def test_create_gift_card_by_customer(api_client, customer_user):
+def test_create_gift_card_by_customer(api_client, customer_user, channel_USD):
     # given
     initial_balance = 100
     currency = "USD"
-    expiry_type = GiftCardExpiryTypeEnum.NEVER_EXPIRE.name
     tag = "gift-card-tag"
     variables = {
-        "balance": {
-            "amount": initial_balance,
-            "currency": currency,
-        },
-        "userEmail": customer_user.email,
-        "tag": tag,
-        "note": "This is gift card note that will be save in gift card event.",
-        "expirySettings": {
-            "expiryType": expiry_type,
+        "input": {
+            "balance": {
+                "amount": initial_balance,
+                "currency": currency,
+            },
+            "userEmail": customer_user.email,
+            "channel": channel_USD.slug,
+            "addTags": [tag],
+            "note": "This is gift card note that will be save in gift card event.",
             "expiryDate": None,
-        },
+            "isActive": True,
+        }
     }
 
     # when
@@ -260,19 +297,18 @@ def test_create_gift_card_no_premissions(staff_api_client):
     # given
     initial_balance = 100
     currency = "USD"
-    expiry_type = GiftCardExpiryTypeEnum.NEVER_EXPIRE.name
     tag = "gift-card-tag"
     variables = {
-        "balance": {
-            "amount": initial_balance,
-            "currency": currency,
-        },
-        "tag": tag,
-        "note": "This is gift card note that will be save in gift card event.",
-        "expirySettings": {
-            "expiryType": expiry_type,
+        "input": {
+            "balance": {
+                "amount": initial_balance,
+                "currency": currency,
+            },
+            "addTags": [tag],
+            "note": "This is gift card note that will be save in gift card event.",
             "expiryDate": None,
-        },
+            "isActive": True,
+        }
     }
 
     # when
@@ -295,19 +331,18 @@ def test_create_gift_card_with_too_many_decimal_places_in_balance_amount(
     # given
     initial_balance = 10.123
     currency = "USD"
-    expiry_type = GiftCardExpiryTypeEnum.NEVER_EXPIRE.name
     tag = "gift-card-tag"
     variables = {
-        "balance": {
-            "amount": initial_balance,
-            "currency": currency,
-        },
-        "userEmail": customer_user.email,
-        "tag": tag,
-        "note": "This is gift card note that will be save in gift card event.",
-        "expirySettings": {
-            "expiryType": expiry_type,
-        },
+        "input": {
+            "balance": {
+                "amount": initial_balance,
+                "currency": currency,
+            },
+            "userEmail": customer_user.email,
+            "addTags": [tag],
+            "note": "This is gift card note that will be save in gift card event.",
+            "isActive": True,
+        }
     }
 
     # when
@@ -332,9 +367,152 @@ def test_create_gift_card_with_too_many_decimal_places_in_balance_amount(
     assert errors[0]["code"] == GiftCardErrorCode.INVALID.name
 
 
+def test_create_gift_card_with_malformed_email(
+    staff_api_client,
+    permission_manage_gift_card,
+    permission_manage_users,
+    permission_manage_apps,
+):
+    # given
+    initial_balance = 10
+    currency = "USD"
+    tag = "gift-card-tag"
+    variables = {
+        "input": {
+            "balance": {
+                "amount": initial_balance,
+                "currency": currency,
+            },
+            "userEmail": "malformed",
+            "addTags": [tag],
+            "note": "This is gift card note that will be save in gift card event.",
+            "isActive": True,
+        }
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CREATE_GIFT_CARD_MUTATION,
+        variables,
+        permissions=[
+            permission_manage_gift_card,
+            permission_manage_users,
+            permission_manage_apps,
+        ],
+    )
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["giftCardCreate"]["giftCard"]
+    errors = content["data"]["giftCardCreate"]["errors"]
+
+    assert not data
+    assert len(errors) == 1
+    error = errors[0]
+    assert error["field"] == "email"
+    assert error["code"] == GiftCardErrorCode.INVALID.name
+
+
+def test_create_gift_card_lack_of_channel(
+    staff_api_client,
+    customer_user,
+    permission_manage_gift_card,
+    permission_manage_users,
+    permission_manage_apps,
+):
+    # given
+    initial_balance = 10
+    currency = "USD"
+    tag = "gift-card-tag"
+    variables = {
+        "input": {
+            "balance": {
+                "amount": initial_balance,
+                "currency": currency,
+            },
+            "userEmail": customer_user.email,
+            "addTags": [tag],
+            "note": "This is gift card note that will be save in gift card event.",
+            "isActive": True,
+        }
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CREATE_GIFT_CARD_MUTATION,
+        variables,
+        permissions=[
+            permission_manage_gift_card,
+            permission_manage_users,
+            permission_manage_apps,
+        ],
+    )
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["giftCardCreate"]["giftCard"]
+    errors = content["data"]["giftCardCreate"]["errors"]
+
+    assert not data
+    assert len(errors) == 1
+    error = errors[0]
+    assert error["field"] == "channel"
+    assert error["code"] == GiftCardErrorCode.REQUIRED.name
+
+
+def test_create_gift_card_with_zero_balance_amount(
+    staff_api_client,
+    customer_user,
+    permission_manage_gift_card,
+    permission_manage_users,
+    permission_manage_apps,
+):
+    # given
+    currency = "USD"
+    tag = "gift-card-tag"
+    variables = {
+        "input": {
+            "balance": {
+                "amount": 0,
+                "currency": currency,
+            },
+            "userEmail": customer_user.email,
+            "addTags": [tag],
+            "note": "This is gift card note that will be save in gift card event.",
+            "isActive": True,
+        }
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CREATE_GIFT_CARD_MUTATION,
+        variables,
+        permissions=[
+            permission_manage_gift_card,
+            permission_manage_users,
+            permission_manage_apps,
+        ],
+    )
+
+    # then
+    content = get_graphql_content(response)
+    errors = content["data"]["giftCardCreate"]["errors"]
+    data = content["data"]["giftCardCreate"]["giftCard"]
+
+    assert not data
+    assert len(errors) == 1
+    assert errors[0]["field"] == "balance"
+    assert errors[0]["code"] == GiftCardErrorCode.INVALID.name
+
+
+@mock.patch(
+    "saleor.graphql.giftcard.mutations.gift_card_create.send_gift_card_notification"
+)
 def test_create_gift_card_with_expiry_date(
+    send_notification_mock,
     staff_api_client,
     customer_user,
+    channel_USD,
     permission_manage_gift_card,
     permission_manage_users,
     permission_manage_apps,
@@ -342,21 +520,22 @@ def test_create_gift_card_with_expiry_date(
     # given
     initial_balance = 100
     currency = "USD"
-    expiry_type = GiftCardExpiryTypeEnum.EXPIRY_DATE.name
-    date_value = date.today() + timedelta(days=365)
+    date_value = datetime.datetime.now(tz=datetime.UTC).date() + datetime.timedelta(
+        days=365
+    )
     tag = "gift-card-tag"
     variables = {
-        "balance": {
-            "amount": initial_balance,
-            "currency": currency,
-        },
-        "userEmail": customer_user.email,
-        "tag": tag,
-        "note": "This is gift card note that will be save in gift card event.",
-        "expirySettings": {
-            "expiryType": expiry_type,
+        "input": {
+            "balance": {
+                "amount": initial_balance,
+                "currency": currency,
+            },
+            "userEmail": customer_user.email,
+            "channel": channel_USD.slug,
+            "addTags": [tag],
             "expiryDate": date_value,
-        },
+            "isActive": True,
+        }
     }
 
     # when
@@ -377,65 +556,41 @@ def test_create_gift_card_with_expiry_date(
 
     assert not errors
     assert data["code"]
-    assert data["displayCode"]
-    assert data["expiryType"] == expiry_type.upper()
+    assert data["last4CodeChars"]
     assert data["expiryDate"] == date_value.isoformat()
-    assert not data["expiryPeriod"]
 
     assert len(data["events"]) == 1
-    event = data["events"][0]
-    assert event["type"] == GiftCardEvents.ISSUED.upper()
-    assert event["user"]["email"] == staff_api_client.user.email
+    created_event = data["events"][0]
 
+    assert created_event["type"] == GiftCardEvents.ISSUED.upper()
+    assert created_event["user"]["email"] == staff_api_client.user.email
+    assert not created_event["app"]
+    assert created_event["balance"]["initialBalance"]["amount"] == initial_balance
+    assert created_event["balance"]["initialBalance"]["currency"] == currency
+    assert created_event["balance"]["currentBalance"]["amount"] == initial_balance
+    assert created_event["balance"]["currentBalance"]["currency"] == currency
+    assert not created_event["balance"]["oldInitialBalance"]
+    assert not created_event["balance"]["oldCurrentBalance"]
 
-def test_create_gift_card_with_expiry_date_type_date_not_given(
-    staff_api_client,
-    customer_user,
-    permission_manage_gift_card,
-    permission_manage_users,
-    permission_manage_apps,
-):
-    # given
-    initial_balance = 100
-    currency = "USD"
-    expiry_type = GiftCardExpiryTypeEnum.EXPIRY_DATE.name
-    tag = "gift-card-tag"
-    variables = {
-        "balance": {
-            "amount": initial_balance,
-            "currency": currency,
-        },
-        "userEmail": customer_user.email,
-        "tag": tag,
-        "note": "This is gift card note that will be save in gift card event.",
-        "expirySettings": {
-            "expiryType": expiry_type,
-        },
-    }
-
-    # when
-    response = staff_api_client.post_graphql(
-        CREATE_GIFT_CARD_MUTATION,
-        variables,
-        permissions=[
-            permission_manage_gift_card,
-            permission_manage_users,
-            permission_manage_apps,
-        ],
+    gift_card = GiftCard.objects.get()
+    send_notification_mock.assert_called_once_with(
+        staff_api_client.user,
+        None,
+        customer_user,
+        customer_user.email,
+        gift_card,
+        mock.ANY,
+        channel_slug=channel_USD.slug,
+        resending=False,
     )
 
-    # then
-    content = get_graphql_content(response)
-    errors = content["data"]["giftCardCreate"]["errors"]
-    data = content["data"]["giftCardCreate"]["giftCard"]
 
-    assert not data
-    assert len(errors) == 1
-    assert errors[0]["field"] == "expiryDate"
-    assert errors[0]["code"] == GiftCardErrorCode.REQUIRED.name
-
-
-def test_create_gift_card_with_expiry_date_type_date_in_past(
+@pytest.mark.parametrize(
+    "date_value",
+    [datetime.date(1999, 1, 1), datetime.datetime.now(tz=datetime.UTC).date()],
+)
+def test_create_gift_card_with_expiry_date_type_invalid(
+    date_value,
     staff_api_client,
     customer_user,
     permission_manage_gift_card,
@@ -445,21 +600,19 @@ def test_create_gift_card_with_expiry_date_type_date_in_past(
     # given
     initial_balance = 100
     currency = "USD"
-    expiry_type = GiftCardExpiryTypeEnum.EXPIRY_DATE.name
-    date_value = date(1999, 1, 1)
     tag = "gift-card-tag"
     variables = {
-        "balance": {
-            "amount": initial_balance,
-            "currency": currency,
-        },
-        "userEmail": customer_user.email,
-        "tag": tag,
-        "note": "This is gift card note that will be save in gift card event.",
-        "expirySettings": {
-            "expiryType": expiry_type,
+        "input": {
+            "balance": {
+                "amount": initial_balance,
+                "currency": currency,
+            },
+            "userEmail": customer_user.email,
+            "addTags": [tag],
+            "note": "This is gift card note that will be save in gift card event.",
             "expiryDate": date_value,
-        },
+            "isActive": True,
+        }
     }
 
     # when
@@ -484,35 +637,173 @@ def test_create_gift_card_with_expiry_date_type_date_in_past(
     assert errors[0]["code"] == GiftCardErrorCode.INVALID.name
 
 
-def test_create_gift_card_with_expiry_period(
-    staff_api_client,
+@freeze_time("2022-05-12 12:00:00")
+@mock.patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
+@mock.patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
+def test_create_gift_card_trigger_webhook(
+    mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
+    app_api_client,
+    permission_manage_gift_card,
+    permission_manage_users,
+    settings,
+):
+    # given
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
+    settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
+
+    initial_balance = 100
+    currency = "USD"
+    tag = "gift-card-tag"
+    note = "This is gift card note that will be save in gift card event."
+    variables = {
+        "input": {
+            "balance": {
+                "amount": initial_balance,
+                "currency": currency,
+            },
+            "addTags": [tag],
+            "note": note,
+            "expiryDate": None,
+            "isActive": False,
+        }
+    }
+
+    # when
+    response = app_api_client.post_graphql(
+        CREATE_GIFT_CARD_MUTATION,
+        variables,
+        permissions=[permission_manage_gift_card, permission_manage_users],
+    )
+    gift_card = GiftCard.objects.last()
+
+    # then
+    content = get_graphql_content(response)
+    errors = content["data"]["giftCardCreate"]["errors"]
+    data = content["data"]["giftCardCreate"]["giftCard"]
+
+    assert not errors
+    assert data["code"]
+
+    mocked_webhook_trigger.assert_called_once_with(
+        json.dumps(
+            {
+                "id": graphene.Node.to_global_id("GiftCard", gift_card.id),
+                "is_active": gift_card.is_active,
+                "meta": generate_meta(
+                    requestor_data=generate_requestor(
+                        SimpleLazyObject(lambda: app_api_client.app)
+                    )
+                ),
+            },
+            cls=CustomJsonEncoder,
+        ),
+        WebhookEventAsyncType.GIFT_CARD_CREATED,
+        [any_webhook],
+        gift_card,
+        SimpleLazyObject(lambda: app_api_client.app),
+        allow_replica=False,
+    )
+
+
+@freeze_time("2022-05-12 12:00:00")
+@mock.patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
+@mock.patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
+def test_create_gift_card_with_email_triggers_gift_card_sent_webhook(
+    mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
+    app_api_client,
+    channel_USD,
     customer_user,
+    permission_manage_gift_card,
+    permission_manage_users,
+    settings,
+):
+    # given
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
+    settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
+
+    initial_balance = 100
+    currency = "USD"
+    tag = "gift-card-tag"
+    note = "This is gift card note that will be save in gift card event."
+    variables = {
+        "input": {
+            "balance": {
+                "amount": initial_balance,
+                "currency": currency,
+            },
+            "addTags": [tag],
+            "note": note,
+            "expiryDate": None,
+            "isActive": False,
+            "channel": channel_USD.slug,
+            "userEmail": customer_user.email,
+        }
+    }
+
+    # when
+    response = app_api_client.post_graphql(
+        CREATE_GIFT_CARD_MUTATION,
+        variables,
+        permissions=[permission_manage_gift_card, permission_manage_users],
+    )
+    gift_card = GiftCard.objects.last()
+
+    # then
+    content = get_graphql_content(response)
+    errors = content["data"]["giftCardCreate"]["errors"]
+    data = content["data"]["giftCardCreate"]["giftCard"]
+
+    assert not errors
+    assert data["code"]
+
+    mocked_webhook_trigger.assert_any_call(
+        json.dumps(
+            {
+                "id": graphene.Node.to_global_id("GiftCard", gift_card.id),
+                "is_active": gift_card.is_active,
+                "channel_slug": channel_USD.slug,
+                "sent_to_email": customer_user.email,
+                "meta": generate_meta(
+                    requestor_data=generate_requestor(
+                        SimpleLazyObject(lambda: app_api_client.app)
+                    )
+                ),
+            },
+            cls=CustomJsonEncoder,
+        ),
+        WebhookEventAsyncType.GIFT_CARD_SENT,
+        [any_webhook],
+        {
+            "gift_card": gift_card,
+            "channel_slug": channel_USD.slug,
+            "sent_to_email": customer_user.email,
+        },
+        SimpleLazyObject(lambda: app_api_client.app),
+        allow_replica=False,
+    )
+
+
+def test_create_gift_card_with_code(
+    staff_api_client,
     permission_manage_gift_card,
     permission_manage_users,
     permission_manage_apps,
 ):
     # given
-    initial_balance = 100
-    currency = "USD"
-    expiry_type = GiftCardExpiryTypeEnum.EXPIRY_PERIOD.name
-    tag = "gift-card-tag"
-    period_amount = 10
-    period_type = TimePeriodTypeEnum.MONTH.name
+    code = "custom-code"
     variables = {
-        "balance": {
-            "amount": initial_balance,
-            "currency": currency,
-        },
-        "userEmail": customer_user.email,
-        "tag": tag,
-        "note": "This is gift card note that will be save in gift card event.",
-        "expirySettings": {
-            "expiryType": expiry_type,
-            "expiryPeriod": {
-                "type": period_type,
-                "amount": period_amount,
+        "input": {
+            "balance": {
+                "amount": 1,
+                "currency": "USD",
             },
-        },
+            "code": code,
+            "isActive": True,
+        }
     }
 
     # when
@@ -532,48 +823,26 @@ def test_create_gift_card_with_expiry_period(
     data = content["data"]["giftCardCreate"]["giftCard"]
 
     assert not errors
-    assert data["code"]
-    assert data["displayCode"]
-    assert data["expiryType"] == expiry_type.upper()
-    assert not data["expiryDate"]
-    assert data["expiryPeriod"]["amount"] == period_amount
-    assert data["expiryPeriod"]["type"] == period_type
-
-    assert len(data["events"]) == 1
-    event = data["events"][0]
-    assert event["type"] == GiftCardEvents.ISSUED.upper()
-    assert event["user"]["email"] == staff_api_client.user.email
+    assert data["code"] == code
 
 
-def test_create_gift_card_with_expiry_period_negative_amount(
+def test_create_gift_card_with_to_short_code(
     staff_api_client,
-    customer_user,
     permission_manage_gift_card,
     permission_manage_users,
     permission_manage_apps,
 ):
     # given
-    initial_balance = 100
-    currency = "USD"
-    expiry_type = GiftCardExpiryTypeEnum.EXPIRY_PERIOD.name
-    tag = "gift-card-tag"
-    period_amount = -10
-    period_type = TimePeriodTypeEnum.MONTH.name
+    code = "short"
     variables = {
-        "balance": {
-            "amount": initial_balance,
-            "currency": currency,
-        },
-        "userEmail": customer_user.email,
-        "tag": tag,
-        "note": "This is gift card note that will be save in gift card event.",
-        "expirySettings": {
-            "expiryType": expiry_type,
-            "expiryPeriod": {
-                "type": period_type,
-                "amount": period_amount,
+        "input": {
+            "balance": {
+                "amount": 1,
+                "currency": "USD",
             },
-        },
+            "code": code,
+            "isActive": True,
+        }
     }
 
     # when
@@ -594,43 +863,55 @@ def test_create_gift_card_with_expiry_period_negative_amount(
 
     assert not data
     assert len(errors) == 1
-    assert errors[0]["field"] == "expiryPeriod"
-    assert errors[0]["code"] == GiftCardErrorCode.INVALID.name
+    assert errors[0]["field"] == "code"
+    assert errors[0]["code"] == "INVALID"
 
 
-def test_create_gift_card_with_expiry_period_type_period_data_not_given(
+CREATE_GIFT_CARD_MUTATION_FOR_METADATA = """
+    mutation giftCardCreate($input: GiftCardCreateInput!){
+        giftCardCreate(input: $input) {
+            giftCard {
+                id
+                metadata { key value }
+                privateMetadata { key value }
+            }
+            errors {
+                field
+                message
+                code
+            }
+        }
+    }
+"""
+
+
+def test_create_gift_card_with_public_metadata(
     staff_api_client,
-    customer_user,
     permission_manage_gift_card,
-    permission_manage_users,
-    permission_manage_apps,
 ):
     # given
-    initial_balance = 100
-    currency = "USD"
-    expiry_type = GiftCardExpiryTypeEnum.EXPIRY_PERIOD.name
-    tag = "gift-card-tag"
+    code = "custom-code"
+    metadata_key = "key"
+    metadata_value = "value"
+
     variables = {
-        "balance": {
-            "amount": initial_balance,
-            "currency": currency,
-        },
-        "userEmail": customer_user.email,
-        "tag": tag,
-        "note": "This is gift card note that will be save in gift card event.",
-        "expirySettings": {
-            "expiryType": expiry_type,
-        },
+        "input": {
+            "balance": {
+                "amount": 1,
+                "currency": "USD",
+            },
+            "code": code,
+            "isActive": True,
+            "metadata": [{"key": metadata_key, "value": metadata_value}],
+        }
     }
 
     # when
     response = staff_api_client.post_graphql(
-        CREATE_GIFT_CARD_MUTATION,
+        CREATE_GIFT_CARD_MUTATION_FOR_METADATA,
         variables,
         permissions=[
             permission_manage_gift_card,
-            permission_manage_users,
-            permission_manage_apps,
         ],
     )
 
@@ -639,7 +920,89 @@ def test_create_gift_card_with_expiry_period_type_period_data_not_given(
     errors = content["data"]["giftCardCreate"]["errors"]
     data = content["data"]["giftCardCreate"]["giftCard"]
 
-    assert not data
-    assert len(errors) == 1
-    assert errors[0]["field"] == "expiryPeriod"
-    assert errors[0]["code"] == GiftCardErrorCode.REQUIRED.name
+    assert not errors
+    assert data["metadata"][0]["key"] == metadata_key
+    assert data["metadata"][0]["value"] == metadata_value
+
+
+def test_create_gift_card_with_private_metadata(
+    staff_api_client,
+    permission_manage_gift_card,
+):
+    # given
+    code = "custom-code"
+    metadata_key = "key"
+    metadata_value = "value"
+
+    variables = {
+        "input": {
+            "balance": {
+                "amount": 1,
+                "currency": "USD",
+            },
+            "code": code,
+            "isActive": True,
+            "privateMetadata": [{"key": metadata_key, "value": metadata_value}],
+        }
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CREATE_GIFT_CARD_MUTATION_FOR_METADATA,
+        variables,
+        permissions=[
+            permission_manage_gift_card,
+        ],
+    )
+
+    # then
+    content = get_graphql_content(response)
+    errors = content["data"]["giftCardCreate"]["errors"]
+    data = content["data"]["giftCardCreate"]["giftCard"]
+
+    assert not errors
+    assert data["privateMetadata"][0]["key"] == metadata_key
+    assert data["privateMetadata"][0]["value"] == metadata_value
+
+
+def test_create_gift_card_with_private_and_public_metadata(
+    staff_api_client,
+    permission_manage_gift_card,
+):
+    # given
+    code = "custom-code"
+    metadata_key = "key"
+    metadata_value = "value"
+
+    variables = {
+        "input": {
+            "balance": {
+                "amount": 1,
+                "currency": "USD",
+            },
+            "code": code,
+            "isActive": True,
+            "privateMetadata": [{"key": metadata_key, "value": metadata_value}],
+            "metadata": [{"key": metadata_key, "value": metadata_value}],
+        }
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CREATE_GIFT_CARD_MUTATION_FOR_METADATA,
+        variables,
+        permissions=[
+            permission_manage_gift_card,
+        ],
+    )
+
+    # then
+    content = get_graphql_content(response)
+    errors = content["data"]["giftCardCreate"]["errors"]
+    data = content["data"]["giftCardCreate"]["giftCard"]
+
+    assert not errors
+    assert data["metadata"][0]["key"] == metadata_key
+    assert data["metadata"][0]["value"] == metadata_value
+    assert data["privateMetadata"][0]["key"] == metadata_key
+    assert data["privateMetadata"][0]["value"] == metadata_value

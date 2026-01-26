@@ -18,7 +18,7 @@ def migrate_attributes_to_list(model_name):
                     # Fix a migration error where attributes were stored as repr(list)
                     loaded = json.loads(v.replace("'", '"'))
                     assert isinstance(loaded, list)
-                    assert all([isinstance(v_pk, str) for v_pk in loaded])
+                    assert all(isinstance(v_pk, str) for v_pk in loaded)
                     new_attributes[k] = loaded
                 elif not isinstance(v, list):
                     new_attributes[k] = [v]
@@ -32,7 +32,6 @@ def migrate_attributes_to_list(model_name):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [("product", "0103_schema_data_enterprise_grade_attributes")]
 
     operations = [

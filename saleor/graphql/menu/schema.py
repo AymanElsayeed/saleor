@@ -1,8 +1,10 @@
 import graphene
 
-from ..channel import ChannelQsContext
 from ..channel.utils import get_default_channel_slug_or_graphql_error
-from ..core.fields import ChannelContextFilterConnectionField
+from ..core import ResolveInfo
+from ..core.connection import create_connection_slice, filter_connection_queryset
+from ..core.context import ChannelQsContext
+from ..core.fields import FilterConnectionField
 from ..core.utils import from_global_id_or_error
 from ..translations.mutations import MenuItemTranslate
 from .bulk_mutations import MenuBulkDelete, MenuItemBulkDelete
@@ -24,7 +26,7 @@ from .resolvers import (
     resolve_menus,
 )
 from .sorters import MenuItemSortingInput, MenuSortingInput
-from .types import Menu, MenuItem
+from .types import Menu, MenuCountableConnection, MenuItem, MenuItemCountableConnection
 
 
 class MenuQueries(graphene.ObjectType):
@@ -38,13 +40,15 @@ class MenuQueries(graphene.ObjectType):
         slug=graphene.Argument(graphene.String, description="The menu's slug."),
         description="Look up a navigation menu by ID or name.",
     )
-    menus = ChannelContextFilterConnectionField(
-        Menu,
+    menus = FilterConnectionField(
+        MenuCountableConnection,
         channel=graphene.String(
             description="Slug of a channel for which the data should be returned."
         ),
         sort_by=MenuSortingInput(description="Sort menus."),
-        filter=MenuFilterInput(description="Filtering options for menus."),
+        filter=MenuFilterInput(
+            description="Filtering options for menus.\n\n`slug`: Use `slugs` instead."
+        ),
         description="List of the storefront's menus.",
     )
     menu_item = graphene.Field(
@@ -57,8 +61,8 @@ class MenuQueries(graphene.ObjectType):
         ),
         description="Look up a menu item by ID.",
     )
-    menu_items = ChannelContextFilterConnectionField(
-        MenuItem,
+    menu_items = FilterConnectionField(
+        MenuItemCountableConnection,
         channel=graphene.String(
             description="Slug of a channel for which the data should be returned."
         ),
@@ -67,29 +71,49 @@ class MenuQueries(graphene.ObjectType):
         description="List of the storefronts's menu items.",
     )
 
-    def resolve_menu(self, info, channel=None, **data):
+    @staticmethod
+    def resolve_menu(_root, info: ResolveInfo, *, channel=None, **data):
         if channel is None:
-            channel = get_default_channel_slug_or_graphql_error()
+            channel = get_default_channel_slug_or_graphql_error(
+                allow_replica=info.context.allow_replica
+            )
         return resolve_menu(
             info, channel, data.get("id"), data.get("name"), data.get("slug")
         )
 
-    def resolve_menus(self, info, channel=None, **kwargs):
+    @staticmethod
+    def resolve_menus(_root, info: ResolveInfo, *, channel=None, **kwargs):
         if channel is None:
-            channel = get_default_channel_slug_or_graphql_error()
-        return resolve_menus(info, channel, **kwargs)
+            channel = get_default_channel_slug_or_graphql_error(
+                allow_replica=info.context.allow_replica
+            )
+        qs = resolve_menus(info, channel)
+        qs = filter_connection_queryset(
+            qs, kwargs, allow_replica=info.context.allow_replica
+        )
+        return create_connection_slice(qs, info, kwargs, MenuCountableConnection)
 
-    def resolve_menu_item(self, info, channel=None, **data):
+    @staticmethod
+    def resolve_menu_item(_root, info: ResolveInfo, *, channel=None, id: str):
         if channel is None:
-            channel = get_default_channel_slug_or_graphql_error()
-        _, id = from_global_id_or_error(data.get("id"), MenuItem)
-        return resolve_menu_item(id, channel)
+            channel = get_default_channel_slug_or_graphql_error(
+                allow_replica=info.context.allow_replica
+            )
+        _, id = from_global_id_or_error(id, MenuItem)
+        return resolve_menu_item(info, id, channel)
 
-    def resolve_menu_items(self, info, channel=None, **kwargs):
+    @staticmethod
+    def resolve_menu_items(_root, info: ResolveInfo, *, channel=None, **kwargs):
         if channel is None:
-            channel = get_default_channel_slug_or_graphql_error()
-        menu_items = resolve_menu_items(info, **kwargs)
-        return ChannelQsContext(qs=menu_items, channel_slug=channel)
+            channel = get_default_channel_slug_or_graphql_error(
+                allow_replica=info.context.allow_replica
+            )
+        menu_items = resolve_menu_items(info)
+        qs = ChannelQsContext(qs=menu_items, channel_slug=channel)
+        qs = filter_connection_queryset(
+            qs, kwargs, allow_replica=info.context.allow_replica
+        )
+        return create_connection_slice(qs, info, kwargs, MenuItemCountableConnection)
 
 
 class MenuMutations(graphene.ObjectType):

@@ -1,246 +1,166 @@
-import json
-from functools import partial
+from functools import wraps
+from json import JSONDecodeError
 
 import graphene
-from graphene.relay import PageInfo
-from graphene_django.fields import DjangoConnectionField
-from graphql.error import GraphQLError
-from graphql_relay.connection.arrayconnection import connection_from_list_slice
-from promise import Promise
+from django.conf import settings
+from graphene.relay import Connection, is_node
 
-from ...channel.exceptions import ChannelNotDefined, NoDefaultChannel
-from ..channel import ChannelContext, ChannelQsContext
-from ..channel.utils import get_default_channel_slug_or_graphql_error
-from ..utils.sorting import sort_queryset_for_connection
-from .connection import connection_from_queryset_slice
+from ...permission.utils import message_one_of_permissions_required
+from ..decorators import one_of_permissions_required
+from .connection import FILTERS_NAME, FILTERSET_CLASS, WHERE_FILTERSET_CLASS, WHERE_NAME
+from .utils import WebhookEventInfo, message_webhook_events
 
 
-def patch_pagination_args(field: DjangoConnectionField):
-    """Add descriptions to pagination arguments in a connection field.
-
-    By default Graphene's connection fields comes without description for pagination
-    arguments. This functions patches those fields to add the descriptions.
-    """
-    field.args["first"].description = "Return the first n elements from the list."
-    field.args["last"].description = "Return the last n elements from the list."
-    field.args[
-        "before"
-    ].description = (
-        "Return the elements in the list that come before the specified cursor."
-    )
-    field.args[
-        "after"
-    ].description = (
-        "Return the elements in the list that come after the specified cursor."
-    )
-
-
-class BaseConnectionField(graphene.ConnectionField):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        patch_pagination_args(self)
-
-
-class BaseDjangoConnectionField(DjangoConnectionField):
-    @classmethod
-    def resolve_connection(cls, connection, args, iterable, max_limit=None):
-        common_args = {
-            "connection_type": connection,
-            "edge_type": connection.Edge,
-            "pageinfo_type": PageInfo,
-        }
-        if isinstance(iterable, list):
-            common_args["args"] = args
-            _len = len(iterable)
-            connection = connection_from_list_slice(
-                iterable,
-                slice_start=0,
-                list_length=_len,
-                list_slice_length=_len,
-                **common_args,
-            )
-        else:
-            iterable, sort_by = sort_queryset_for_connection(
-                iterable=iterable, args=args
-            )
-            args["sort_by"] = sort_by
-            common_args["args"] = args
-            connection = connection_from_queryset_slice(iterable, **common_args)
-        connection.iterable = iterable
-        return connection
+class BaseField(graphene.Field):
+    description: str | None
+    doc_category: str | None
+    webhook_events_info: list[WebhookEventInfo] | None
 
     def __init__(self, *args, **kwargs):
+        auto_webhook_events_info_message = kwargs.pop(
+            "auto_webhook_events_info_message", True
+        )
+        self.doc_category = kwargs.pop("doc_category", None)
+        self.webhook_events_info = kwargs.pop("webhook_events_info", None)
+
         super().__init__(*args, **kwargs)
-        patch_pagination_args(self)
+
+        if self.webhook_events_info and auto_webhook_events_info_message:
+            description = self.description or ""
+            description += message_webhook_events(self.webhook_events_info)
+            self.description = description
+
+    def get_resolver(self, parent_resolver):
+        resolver = self.resolver or parent_resolver
+        setattr(resolver, "doc_category", self.doc_category)
+        setattr(resolver, "webhook_events_info", self.webhook_events_info)
+        return resolver
 
 
-class PrefetchingConnectionField(BaseDjangoConnectionField):
-    @classmethod
-    def connection_resolver(
-        cls,
-        resolver,
-        connection,
-        default_manager,
-        queryset_resolver,
-        max_limit,
-        enforce_first_or_last,
-        root,
-        info,
-        **args,
-    ):
+class PermissionsField(BaseField):
+    description: str | None
 
-        # Disable `enforce_first_or_last` if not querying for `edges`.
-        values = [
-            field.name.value for field in info.field_asts[0].selection_set.selections
-        ]
-        if "edges" not in values:
-            enforce_first_or_last = False
-
-        return super().connection_resolver(
-            resolver,
-            connection,
-            default_manager,
-            queryset_resolver,
-            max_limit,
-            enforce_first_or_last,
-            root,
-            info,
-            **args,
+    def __init__(self, *args, **kwargs):
+        self.permissions = kwargs.pop("permissions", [])
+        auto_permission_message = kwargs.pop("auto_permission_message", True)
+        assert isinstance(self.permissions, list), (
+            "FieldWithPermissions `permissions` argument must be a list: "
+            f"{self.permissions}"
         )
 
+        super().__init__(*args, **kwargs)
+        if auto_permission_message and self.permissions:
+            permissions_msg = message_one_of_permissions_required(self.permissions)
+            description = self.description or ""
+            self.description = description + permissions_msg
 
-class FilterInputConnectionField(BaseDjangoConnectionField):
-    def __init__(self, *args, **kwargs):
+    def get_resolver(self, parent_resolver):
+        resolver = self.resolver or parent_resolver
+        if self.permissions:
+            resolver = one_of_permissions_required(self.permissions)(resolver)
+        resolver = super().get_resolver(resolver)
+        return resolver
+
+
+class ConnectionField(PermissionsField):
+    def __init__(self, type_, *args, **kwargs):
+        kwargs.setdefault(
+            "before",
+            graphene.String(
+                description=(
+                    "Return the elements in the list that come before "
+                    "the specified cursor."
+                )
+            ),
+        )
+        kwargs.setdefault(
+            "after",
+            graphene.String(
+                description=(
+                    "Return the elements in the list that come after "
+                    "the specified cursor."
+                )
+            ),
+        )
+        kwargs.setdefault(
+            "first",
+            graphene.Int(
+                description=(
+                    "Retrieve the first n elements from the list. "
+                    "Note that the system only allows fetching "
+                    f"a maximum of {settings.GRAPHQL_PAGINATION_LIMIT} "
+                    "objects in a single query."
+                ),
+            ),
+        )
+        kwargs.setdefault(
+            "last",
+            graphene.Int(
+                description=(
+                    "Retrieve the last n elements from the list. "
+                    "Note that the system only allows fetching "
+                    f"a maximum of {settings.GRAPHQL_PAGINATION_LIMIT} "
+                    "objects in a single query."
+                )
+            ),
+        )
+        super().__init__(type_, *args, **kwargs)
+
+    @property
+    def type(self):
+        type = super().type
+        connection_type = type
+        if isinstance(type, graphene.NonNull):
+            connection_type = type.of_type
+
+        if is_node(connection_type):
+            raise Exception(
+                "ConnectionFields now need a explicit ConnectionType for Nodes.\n"
+                "Read more: https://github.com/graphql-python/graphene/blob/v2.0.0/"
+                "UPGRADE-v2.0.md#node-connections"
+            )
+
+        assert issubclass(connection_type, Connection), (
+            f"{self.__class__.__name__} type have to be a subclass of Connection. "
+            f'Received "{connection_type}".'
+        )
+        return type
+
+
+class FilterConnectionField(ConnectionField):
+    def __init__(self, type_, *args, **kwargs):
         self.filter_field_name = kwargs.pop("filter_field_name", "filter")
         self.filter_input = kwargs.get(self.filter_field_name)
         self.filterset_class = None
         if self.filter_input:
             self.filterset_class = self.filter_input.filterset_class
-        super().__init__(*args, **kwargs)
 
-    @classmethod
-    def connection_resolver(
-        cls,
-        resolver,
-        connection,
-        default_manager,
-        queryset_resolver,
-        max_limit,
-        enforce_first_or_last,
-        filterset_class,
-        filters_name,
-        root,
-        info,
-        **args,
-    ):
-        # Disable `enforce_first_or_last` if not querying for `edges`.
-        values = [
-            field.name.value for field in info.field_asts[0].selection_set.selections
-        ]
-        if "edges" not in values:
-            enforce_first_or_last = False
+        self.where_field_name = kwargs.get("where_field_name", "where")
+        self.where_input = kwargs.get(self.where_field_name)
+        self.where_filterset_class = None
+        if self.where_input:
+            self.where_filterset_class = self.where_input.filterset_class
 
-        first = args.get("first")
-        last = args.get("last")
-
-        if enforce_first_or_last and not (first or last):
-            raise GraphQLError(
-                f"You must provide a `first` or `last` value to properly paginate "
-                f"the `{info.field_name}` connection."
-            )
-
-        if max_limit:
-            if first:
-                assert first <= max_limit, (
-                    "Requesting {} records on the `{}` connection exceeds the "
-                    "`first` limit of {} records."
-                ).format(first, info.field_name, max_limit)
-                args["first"] = min(first, max_limit)
-
-            if last:
-                assert last <= max_limit, (
-                    "Requesting {} records on the `{}` connection exceeds the "
-                    "`last` limit of {} records."
-                ).format(last, info.field_name, max_limit)
-                args["last"] = min(last, max_limit)
-
-        iterable = resolver(root, info, **args)
-
-        if iterable is None:
-            iterable = default_manager
-        # thus the iterable gets refiltered by resolve_queryset
-        # but iterable might be promise
-        iterable = queryset_resolver(connection, iterable, info, args)
-
-        on_resolve = partial(
-            cls.resolve_connection, connection, args, max_limit=max_limit
-        )
-
-        # for nested filters get channel from ChannelContext object
-        if "channel" not in args and hasattr(root, "channel_slug"):
-            args["channel"] = root.channel_slug
-
-        iterable = cls.filter_iterable(
-            iterable, filterset_class, filters_name, info, **args
-        )
-
-        if Promise.is_thenable(iterable):
-            return Promise.resolve(iterable).then(on_resolve)
-        return on_resolve(iterable)
-
-    @classmethod
-    def filter_iterable(cls, iterable, filterset_class, filters_name, info, **args):
-        filter_input = args.get(filters_name)
-        if filter_input:
-            try:
-                filter_channel = str(filter_input["channel"])
-            except (NoDefaultChannel, ChannelNotDefined, GraphQLError, KeyError):
-                filter_channel = None
-            filter_input["channel"] = (
-                args.get("channel")
-                or filter_channel
-                or get_default_channel_slug_or_graphql_error()
-            )
-        if filter_input and filterset_class:
-            instance = filterset_class(
-                data=dict(filter_input), queryset=iterable, request=info.context
-            )
-            # Make sure filter input has valid values
-            if not instance.is_valid():
-                raise GraphQLError(json.dumps(instance.errors.get_json_data()))
-            iterable = instance.qs
-        return iterable
+        super().__init__(type_, *args, **kwargs)
 
     def get_resolver(self, parent_resolver):
-        return partial(
-            super().get_resolver(parent_resolver),
-            self.filterset_class,
-            self.filter_field_name,
-        )
+        wrapped_resolver = super().get_resolver(parent_resolver)
+
+        @wraps(wrapped_resolver)
+        def new_resolver(obj, info, **kwargs):
+            kwargs[FILTERSET_CLASS] = self.filterset_class
+            kwargs[FILTERS_NAME] = self.filter_field_name
+            kwargs[WHERE_FILTERSET_CLASS] = self.where_filterset_class
+            kwargs[WHERE_NAME] = self.where_field_name
+            return wrapped_resolver(obj, info, **kwargs)
+
+        return new_resolver
 
 
-class ChannelContextFilterConnectionField(FilterInputConnectionField):
-    @classmethod
-    def filter_iterable(cls, iterable, filterset_class, filters_name, info, **args):
-        # Overriding filter_iterable to unpack the queryset from iterable, which is
-        # an instance of ChannelQsContext and pack it back after filtering is done.
-        channel_slug = iterable.channel_slug
-        iterable = super().filter_iterable(
-            iterable.qs, filterset_class, filters_name, info, **args
-        )
-        return ChannelQsContext(qs=iterable, channel_slug=channel_slug)
-
-    @classmethod
-    def resolve_connection(
-        cls, connection, args, iterable: ChannelQsContext, max_limit=None
-    ):
-        connection = super().resolve_connection(
-            connection, args, iterable.qs, max_limit
-        )
-        edges_with_context = []
-        for edge in connection.edges:
-            node = edge.node
-            edge.node = ChannelContext(node=node, channel_slug=iterable.channel_slug)
-            edges_with_context.append(edge)
-        connection.edges = edges_with_context
-        return connection
+class JSONString(graphene.JSONString):
+    @staticmethod
+    def parse_literal(node):
+        try:
+            return graphene.JSONString.parse_literal(node)
+        except JSONDecodeError:
+            return None

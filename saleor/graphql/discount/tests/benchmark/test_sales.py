@@ -1,36 +1,6 @@
 import pytest
 
-from .....discount.models import Sale, SaleChannelListing
 from ....tests.utils import get_graphql_content
-
-
-@pytest.fixture
-def sales_list(channel_USD, channel_PLN):
-    sales = Sale.objects.bulk_create(
-        [Sale(name="Sale1"), Sale(name="Sale2"), Sale(name="Sale2")]
-    )
-    values = [15, 5, 25]
-    sale_channel_listings = []
-    for sale, value in zip(sales, values):
-        sale_channel_listings.append(
-            SaleChannelListing(
-                sale=sale,
-                channel=channel_USD,
-                discount_value=value,
-                currency=channel_USD.currency_code,
-            )
-        )
-        sale_channel_listings.append(
-            SaleChannelListing(
-                sale=sale,
-                channel=channel_PLN,
-                discount_value=value * 2,
-                currency=channel_PLN.currency_code,
-            )
-        )
-    SaleChannelListing.objects.bulk_create(sale_channel_listings)
-    return sales
-
 
 SALES_QUERY = """
 query GetSales($channel: String){
@@ -63,6 +33,13 @@ query GetSales($channel: String){
             }
           }
         }
+        variants(first: 10) {
+          edges {
+            node {
+              id
+            }
+          }
+        }
         channelListings {
           id
           discountValue
@@ -88,7 +65,7 @@ query GetSales($channel: String){
 @pytest.mark.count_queries(autouse=False)
 def test_sales_query_with_channel_slug(
     staff_api_client,
-    sales_list,
+    promotion_converted_from_sale_list_for_benchmark,
     channel_USD,
     permission_manage_discounts,
     count_queries,
@@ -106,9 +83,9 @@ def test_sales_query_with_channel_slug(
 
 @pytest.mark.django_db
 @pytest.mark.count_queries(autouse=False)
-def test_sales_query_withot_channel_slug(
+def test_sales_query_without_channel_slug(
     staff_api_client,
-    sales_list,
+    promotion_converted_from_sale_list_for_benchmark,
     permission_manage_discounts,
     count_queries,
 ):

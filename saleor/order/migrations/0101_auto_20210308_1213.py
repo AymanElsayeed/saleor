@@ -5,30 +5,33 @@ from django.db import migrations
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("order", "0100_auto_20210216_0914"),
     ]
 
     operations = [
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="fulfillment",
             index=django.contrib.postgres.indexes.GinIndex(
                 fields=["private_metadata"], name="fulfillment_p_meta_idx"
             ),
         ),
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="fulfillment",
             index=django.contrib.postgres.indexes.GinIndex(
                 fields=["metadata"], name="fulfillment_meta_idx"
             ),
         ),
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="order",
             index=django.contrib.postgres.indexes.GinIndex(
                 fields=["private_metadata"], name="order_p_meta_idx"
             ),
         ),
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="order",
             index=django.contrib.postgres.indexes.GinIndex(

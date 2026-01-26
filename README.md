@@ -1,159 +1,196 @@
-![Saleor Commerce - A GraphQL-first platform for perfectionists](https://user-images.githubusercontent.com/249912/71523206-4e45f800-28c8-11ea-84ba-345a9bfc998a.png)
+<div align="center" width="100px">
 
-<div align="center">
-  <h1>Saleor Commerce</h1>
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/76e3079f-696a-4fcd-8658-89739647090b">
+   <source media="(prefers-color-scheme: light)" srcset="https://github.com/user-attachments/assets/8477d643-a905-4c63-8ed3-03d0976f6fc3">
+   <img width="200" alt="saleor-commerce-logo" src="https://user-images.githubusercontent.com/4006792/214636328-8e4f83e8-66cb-4114-a3d8-473eb908b9c3.png">
+
+ </picture>
 </div>
 
 <div align="center">
-  <strong>Customer-centric e-commerce on a modern stack</strong>
+  <strong>Commerce that works with your language and stack</strong>
 </div>
 
 <div align="center">
-  A headless, GraphQL commerce platform delivering ultra-fast, dynamic, personalized shopping experiences. Beautiful online stores, anywhere, on any device.
+  GraphQL native, API-only platform for scalable composable commerce.
 </div>
 
 <br>
 
 <div align="center">
-  Join our active, engaged community: <br>
-  <a href="https://saleor.io/">Website</a>
+ Get to know Saleor: <br>
+  <a href="https://saleor.io/cloud/talk-to-us?utm_source=github&utm_medium=readme&utm_campaign=repo_saleor">Talk to a human</a>
   <span> | </span>
-  <a href="https://medium.com/saleor">Blog</a>
+  <a href="https://cloud.saleor.io/signup?utm_source=github&utm_medium=readme&utm_campaign=repo_saleor">Talk to the API</a>
+</div>
+
+<br>
+
+<div align="center">
+  Join our community: <br>
+  <a href="https://saleor.io/">Website</a>
   <span> | </span>
   <a href="https://twitter.com/getsaleor">Twitter</a>
   <span> | </span>
-  <a href="https://gitter.im/mirumee/saleor">Gitter</a>
+  <a href="https://saleor.io/discord">Discord</a>
+</div>
+
+<div align="center">
+   <a href="https://saleor.io/blog">Blog</a>
   <span> | </span>
-  <a href="https://spectrum.chat/saleor">Spectrum</a>
+  <a href="https://saleor.typeform.com/to/JTJK0Nou">Subscribe to newsletter</a>
 </div>
 
 <br>
 
 <div align="center">
-  <a href="http://codecov.io/github/mirumee/saleor?branch=master">
-    <img src="http://codecov.io/github/mirumee/saleor/coverage.svg?branch=master" alt="Codecov" />
+  <a href="https://codecov.io/gh/saleor/saleor" >
+    <img src="https://codecov.io/gh/saleor/saleor/graph/badge.svg?token=qkNcTJ4TmI" alt="Coverage"/>
   </a>
   <a href="https://docs.saleor.io/">
     <img src="https://img.shields.io/badge/docs-docs.saleor.io-brightgreen.svg" alt="Documentation" />
   </a>
-  <a href="https://github.com/python/black">
-    <img src="https://img.shields.io/badge/code%20style-black-000000.svg" alt="Code style: black">
+  <a href="https://github.com/astral-sh/ruff">
+    <img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json" alt="Linted by Ruff">
   </a>
+ <a href="https://saleor.io/discord">
+   <img src="https://img.shields.io/discord/864066819866624010"  alt="Discord" >
+ </a>
 </div>
 
 ## Table of Contents
 
 - [What makes Saleor special?](#what-makes-saleor-special)
+- [Why API-only Architecture?](#why-api-only-architecture)
 - [Features](#features)
 - [Installation](#installation)
 - [Documentation](#documentation)
-- [Demo](#demo)
+- [Saleor Platform](#saleor-platform)
+- [Storefront](#storefront)
+- [Dashboard](#dashboard)
 - [Contributing](#contributing)
-- [Translations](#translations)
-- [Your feedback](#your-feedback)
 - [License](#license)
 
 ## What makes Saleor special?
 
-Saleor is a rapidly-growing open source e-commerce platform that has served high-volume companies from branches like publishing and apparel since 2012. Based on Python and Django, the latest major update introduces a modular front end powered by a GraphQL API and written with React and TypeScript.
+- **Technology-agnostic** - no monolithic plugin architecture or technology lock-in.
+
+- **GraphQL only** - Not afterthought API design or fragmentation across different styles of API.
+
+- **Headless and API only** - APIs are the only way to interact, configure, or extend the backend.
+
+- **Open source** -  a single version of Saleor without feature fragmentation or commercial limitations.
+
+- **Cloud native** - battle tested on global brands.
+
+- **Native-multichannel** - Per [channel](https://docs.saleor.io/developer/channels/overview) control of pricing, currencies, stock, product, and more.
+
+## Why API-only Architecture?
+
+Saleor's API-first extensibility provides powerful tools for developers to extend backend using [webhooks](https://docs.saleor.io/developer/extending/webhooks/overview), attributes, [metadata](https://docs.saleor.io/api-usage/metadata), [apps](https://docs.saleor.io/developer/extending/apps/overview), [subscription queries](https://docs.saleor.io/developer/extending/webhooks/subscription-webhook-payloads), [API extensions](https://docs.saleor.io/developer/extending/webhooks/synchronous-events/overview), [dashboard iframes](https://docs.saleor.io/developer/extending/apps/overview).
+
+Compared to traditional plugin architectures (monoliths) it provides the following benefits:
+
+- There is less downtime as apps are deployed independently.
+- Reliability and performance - custom logic is separated from the core.
+- Simplified upgrade paths - eliminates incompatibility conflicts between extensions.
+- Technology-agnostic - works with any technology, stack, or language.
+- Parallel development - easier to collaborate than with a monolithic core.
+- Simplified debugging - easier to narrow down bugs in independent services.
+- Scalability - extensions and apps can be scaled independently.
+
+### What are the tradeoffs?
+
+If you are a single developer working with a small business that doesn't have high traffic or a critical need for 24/7 availability, using a service-oriented approach might feel more complex compared to the traditional WordPress or Magento approach that provides a language-specific framework, runtime, database schema, aspect-oriented programming, and other tools to a quick start.
+
+However, if you deploy on a daily basis, reliability and uptime is critical,
+you need to collaborate with other developers, or you have non-trivial requirements you might be in the right place.
 
 ## Features
 
-- **PWA**: End users can shop offline for better sales and shopping experiences
-- **GraphQL API**: Access all data from any web or mobile client using the latest technology
-- **Headless commerce**: Build mobile apps, customize storefronts and externalize processes
-- **UX and UI**: Designed for a user experience that rivals even the top commercial platforms
-- **Dashboard**: Administrators have total control of users, processes, and products
-- **Orders**: A comprehensive system for orders, dispatch, and refunds
-- **Cart**: Advanced payment and tax options, with full control over discounts and promotions
-- **Payments**: Flexible API architecture allows integration of any payment method. It comes with Braintree support out of the box.
-- **Geo-adaptive**: Automatic localized pricing. Over 20 local languages. Localized checkout experience by country.
-- **SEO**: Packed with features that get stores to a wider audience
-- **Cloud**: Optimized for deployments using Docker
-- **Analytics**: Server-side Google Analytics to report e-commerce metrics without affecting privacy
+- **Enterprise ready**: Secure, scalable, and stable. Battle-tested by big brands
+- **Dashboard**: User-friendly, fast, and productive. (Decoupled project [repo](https://github.com/saleor/saleor-dashboard) )
+- **Global by design** Multi-currency, multi-language, multi-warehouse, tutti multi!
+- **CMS**: Manage product or marketing content.
+- **Product management**: A rich content model for large and complex catalogs.
+- **Orders**: Flexible order model, split payments, multi-warehouse, returns, and more.
+- **Customers**: Order history and preferences.
+- **Promotion engine**: Sales, vouchers, cart rules, giftcards.
+- **Payment orchestration**: multi-gateway, extensible payment API, flexible flows.
+- **Cart**: Advanced payment and tax options, with full control over discounts and promotions.
+- **Payments**: Flexible API architecture allows integration of any payment method.
+- **Translations**: Fully translatable catalog.
+- **SEO**: Unlimited SEO freedom with headless architecture.
+- **Apps**: Extend dashboard via iframe with any web stack.
 
-Saleor is free and always will be.
-Help us out… If you love free stuff and great software, give us a star! 🌟
-
-![Saleor Storefront - React-based PWA e-commerce storefront](https://user-images.githubusercontent.com/249912/71527146-5b6be280-28da-11ea-901d-eb76161a6bfb.png)
-![Saleor Dashboard - Modern UI for managing your e-commerce](https://user-images.githubusercontent.com/249912/71523261-8a795880-28c8-11ea-98c0-6281ea37f412.png)
+![Saleor Dashboard - Modern UI for managing your e-commerce](https://user-images.githubusercontent.com/9268745/224249510-d3c7658e-6d5c-42c5-b4fb-93eaf65a5335.png)
 
 ## Installation
 
-Saleor requires Python 3.8, Node.js 10.0+, PostgreSQL and OS-specific dependency tools.
-
-[See the Saleor docs](https://docs.saleor.io/docs/developer/installation) for step-by-step installation and deployment instructions.
+[See the Saleor docs](https://docs.saleor.io/setup/docker-compose) for step-by-step installation and deployment instructions. For local development without Docker, follow our [Contributing Guide](./CONTRIBUTING.md).
 
 Note:
-The `master` branch is the development version of Saleor and it may be unstable. To use the latest stable version, download it from the [Releases](https://github.com/mirumee/saleor/releases/) page or switch to a release tag.
+The `main` branch is the development version of Saleor and it may be unstable. To use the latest stable version, download it from the [Releases](https://github.com/saleor/saleor/releases/) page or switch to a release tag.
 
-The current stable version is 2.11 and you should use this version for all three components:
+The current production-ready version is 3.x and you should use this version for all three components:
 
-- Saleor: https://github.com/mirumee/saleor/releases/tag/2.11.1
-- Dashboard: https://github.com/mirumee/saleor-dashboard/releases/tag/2.11.1
-- Storefront: https://github.com/mirumee/saleor-storefront/releases/tag/2.11.0
+- Saleor: <https://github.com/saleor/saleor/releases/>
+- Dashboard: <https://github.com/saleor/saleor-dashboard/releases/>
+- Storefront: <https://github.com/saleor/react-storefront/releases/>
+
+### Saleor Cloud
+
+The fastest way to develop with Saleor is by using developer accounts in [Saleor Cloud](https://cloud.saleor.io).
+
+Register [here](https://cloud.saleor.io/register) or install our [CLI tool](https://github.com/saleor/saleor-cli):
+
+`npm i -g @saleor/cli`
+
+and run the following command:
+
+`saleor register`
+
+Bootstrap your first [storefront](https://github.com/saleor/react-storefront) with:
+
+`saleor storefront create --url {your-saleor-graphql-endpoint}`
 
 ## Documentation
 
 Saleor documentation is available here: [docs.saleor.io](https://docs.saleor.io)
 
-To contribute, please see the [`mirumee/saleor-docs` repository](https://github.com/mirumee/saleor-docs/).
+To contribute, please see the [`saleor/saleor-docs` repository](https://github.com/saleor/saleor-docs/).
 
 ## Saleor Platform
 
-The easiest way to run all components of Saleor (API, storefront and dashboard) together on your local machine is to use the [saleor-platform](https://github.com/mirumee/saleor-platform) project. Go to that repository for instructions on how to use it.
+The easiest way to run all components of Saleor (API, storefront, and dashboard) together on your local machine is to use the [saleor-platform](https://github.com/saleor/saleor-platform) project. Go to that repository for instructions on how to use it.
 
-[View saleor-platform](https://github.com/mirumee/saleor-platform)
+[View saleor-platform](https://github.com/saleor/saleor-platform)
 
 ## Storefront
 
-For PWA, single-page storefront go to the [saleor-storefront](https://github.com/mirumee/saleor-storefront) repository.
+An open-source storefront example built with Next.js App Router, React.js, TypeScript, GraphQL, and Tailwind CSS.
 
-[View storefront demo](https://demo.saleor.io/)
+[React Storefront Repository](https://github.com/saleor/storefront)
+
+[View Storefront Example](https://storefront.saleor.io/)
 
 ## Dashboard
 
-For dashboard go to the [saleor-dashboard](https://github.com/mirumee/saleor-dashboard) repository.
-
-[View dashboard demo](https://demo.saleor.io/dashboard/)
-
-## Demo
-
-Want to see Saleor in action?
-
-[View Storefront](https://demo.saleor.io/) | [View Dashboard (admin area)](https://demo.saleor.io/dashboard/)
-
-Or launch the demo on a free Heroku instance.
-
-[![Deploy](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy)
-
-Login credentials: `admin@example.com`/`admin`
+For the dashboard, go to the [saleor-dashboard](https://github.com/saleor/saleor-dashboard) repository.
 
 ## Contributing
 
-We love your contributions and do our best to provide you with mentorship and support. If you are looking for an issue to tackle, take a look at issues labeled [`Help Wanted`](https://github.com/mirumee/saleor/issues?q=is%3Aopen+is%3Aissue+label%3A%22help+wanted%22).
+We love your contributions and do our best to provide you with mentorship and support. If you are looking for an issue to tackle, take a look at issues labeled [`Good first issue`](https://github.com/saleor/saleor/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22+) and [`Help wanted`](https://github.com/saleor/saleor/issues?q=is%3Aopen+is%3Aissue+label%3A%22help+wanted%22).
 
-If nothing grabs your attention, check [our roadmap](https://github.com/mirumee/saleor/projects/12) or come up with your feature. Just drop us a line or [open an issue](https://github.com/mirumee/saleor/issues/new) and we’ll work out how to handle it.
+If nothing grabs your attention, check [our roadmap](https://saleor.io/roadmap) or [start a Discord discussion](https://saleor.io/discord) about a feature you'd like to see. Make sure to read our [Contribution Guidelines](http://docs.saleor.io/developer/community/contributing) before opening a PR or issue.
 
-Get more details in our [Contributing Guide](https://docs.saleor.io/docs/developer/community/contributing).
-
-## Legacy views
-
-If you're interested in using the old version of Saleor, go the [legacy-views](https://github.com/mirumee/legacy-views) repository. It contains the 2.9.0 release, which includes Django-based views and HTML templates of Storefront 1.0 and Dashboard 1.0. Note: this version of Saleor is no longer officially maintained.
-
-## Your feedback
-
-Do you use Saleor as an e-commerce platform?
-Fill out this short survey and help us grow. It will take just a minute, but mean a lot!
-
-[Take a survey](https://mirumee.typeform.com/to/sOIJbJ)
+Get more details (e.g., how to run Saleor on your local machine) in our [Contributing Guide](./CONTRIBUTING.md).
 
 ## License
 
-Disclaimer: Everything you see here is open and free to use as long as you comply with the [license](https://github.com/mirumee/saleor/blob/master/LICENSE). There are no hidden charges. We promise to do our best to fix bugs and improve the code.
+Disclaimer: Everything you see here is open and free to use as long as you comply with the [license](https://github.com/saleor/saleor/blob/master/LICENSE). There are no hidden charges. We promise to do our best to fix bugs and improve the code.
 
-Some situations do call for extra code; we can cover exotic use cases or build you a custom e-commerce appliance.
+#### Crafted with ❤️ by [Saleor Commerce](https://saleor.io)
 
-#### Crafted with ❤️ by [Mirumee Software](http://mirumee.com)
-
-hello@mirumee.com
+<hello@saleor.io>

@@ -1,25 +1,36 @@
 import logging
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING
 
-from django.contrib.sites.models import Site
 from django.core.exceptions import ValidationError
-from django.core.handlers.wsgi import WSGIRequest
 from django.http import HttpResponse, HttpResponseNotFound
 from django.http.request import split_domain_port
 
+from ....core.utils import get_domain
+from ....graphql.core import SaleorContext
 from ....graphql.core.enums import PluginErrorCode
 from ....plugins.base_plugin import BasePlugin, ConfigurationTypeField
-from ... import TransactionKind
+from ... import PaymentError, TransactionKind
 from ...interface import (
     CustomerSource,
     GatewayConfig,
     GatewayResponse,
     PaymentData,
     PaymentMethodInfo,
+    StorePaymentMethodEnum,
 )
 from ...models import Transaction
 from ...utils import price_from_minor_unit, price_to_minor_unit
-from ..utils import get_supported_currencies, require_active_plugin
+from ..utils import get_supported_currencies
+from .consts import (
+    ACTION_REQUIRED_STATUSES,
+    AUTHORIZED_STATUS,
+    PLUGIN_DESCRIPTION,
+    PLUGIN_ID,
+    PLUGIN_NAME,
+    PROCESSING_STATUS,
+    SUCCESS_STATUS,
+    WEBHOOK_PATH,
+)
 from .stripe_api import (
     cancel_payment_intent,
     capture_payment_intent,
@@ -36,24 +47,15 @@ from .stripe_api import (
 from .webhooks import handle_webhook
 
 if TYPE_CHECKING:
-    # flake8: noqa
     from ....plugins.models import PluginConfiguration
 
-from .consts import (
-    ACTION_REQUIRED_STATUSES,
-    AUTHORIZED_STATUS,
-    PLUGIN_ID,
-    PLUGIN_NAME,
-    PROCESSING_STATUS,
-    SUCCESS_STATUS,
-    WEBHOOK_PATH,
-)
 
 logger = logging.getLogger(__name__)
 
 
 class StripeGatewayPlugin(BasePlugin):
     PLUGIN_NAME = PLUGIN_NAME
+    PLUGIN_DESCRIPTION = PLUGIN_DESCRIPTION
     PLUGIN_ID = PLUGIN_ID
     DEFAULT_CONFIGURATION = [
         {"name": "public_api_key", "value": None},
@@ -62,6 +64,7 @@ class StripeGatewayPlugin(BasePlugin):
         {"name": "supported_currencies", "value": ""},
         {"name": "webhook_endpoint_id", "value": None},
         {"name": "webhook_secret_key", "value": None},
+        {"name": "include_receipt_email", "value": True},
     ]
 
     CONFIG_STRUCTURE = {
@@ -86,6 +89,16 @@ class StripeGatewayPlugin(BasePlugin):
             " Please enter currency codes separated by a comma.",
             "label": "Supported currencies",
         },
+        "include_receipt_email": {
+            "type": ConfigurationTypeField.BOOLEAN,
+            "help_text": "Determine whether the `receipt_email` should be included in "
+            "the payment request sent to Stripe. If `receipt_email` is specified for a "
+            "payment in live mode, a receipt will be sent by Stripe, regardless of "
+            "your email settings. More info: "
+            "https://stripe.com/docs/api/payment_intents/create#"
+            "create_payment_intent-receipt_email",
+            "label": "Include receipt email",
+        },
         "webhook_endpoint_id": {
             "type": ConfigurationTypeField.OUTPUT,
             "help_text": "Unique identifier for the webhook endpoint object.",
@@ -93,17 +106,13 @@ class StripeGatewayPlugin(BasePlugin):
         },
     }
 
-    def __init__(self, *args, **kwargs):
-
+    def __init__(self, *, configuration, **kwargs):
         # Webhook details are not listed in CONFIG_STRUCTURE as user input is not
         # required here
-        plugin_configuration = kwargs.get("configuration")
-        raw_configuration = {
-            item["name"]: item["value"] for item in plugin_configuration
-        }
+        raw_configuration = {item["name"]: item["value"] for item in configuration}
         webhook_secret = raw_configuration.get("webhook_secret_key")
 
-        super().__init__(*args, **kwargs)
+        super().__init__(configuration=configuration, **kwargs)
         configuration = {item["name"]: item["value"] for item in self.configuration}
         self.config = GatewayConfig(
             gateway_name=PLUGIN_NAME,
@@ -114,35 +123,43 @@ class StripeGatewayPlugin(BasePlugin):
                 "secret_api_key": configuration["secret_api_key"],
                 "webhook_id": configuration["webhook_endpoint_id"],
                 "webhook_secret": webhook_secret,
+                "include_receipt_email": configuration["include_receipt_email"],
             },
             store_customer=True,
         )
 
-    def webhook(self, request: WSGIRequest, path: str, previous_value) -> HttpResponse:
+    def webhook(
+        self, request: SaleorContext, path: str, previous_value
+    ) -> HttpResponse:
         config = self.config
+        if not self.channel:
+            return HttpResponseNotFound()
         if path.startswith(WEBHOOK_PATH, 1):  # 1 as we don't check the '/'
-            return handle_webhook(request, config, self.channel.slug)  # type: ignore
+            return handle_webhook(request, config, self.channel.slug)
         logger.warning(
             "Received request to incorrect stripe path", extra={"path": path}
         )
         return HttpResponseNotFound()
 
-    @require_active_plugin
     def token_is_required_as_payment_input(self, previous_value):
+        if not self.active:
+            return previous_value
         return False
 
-    @require_active_plugin
     def get_supported_currencies(self, previous_value):
+        if not self.active:
+            return previous_value
         return get_supported_currencies(self.config, PLUGIN_NAME)
 
     @property
     def order_auto_confirmation(self):
-        site_settings = Site.objects.get_current().settings
-        return site_settings.automatically_confirm_all_new_orders
+        if not self.channel:
+            return False
+        return self.channel.automatically_confirm_all_new_orders
 
     def _get_transaction_details_for_stripe_status(
         self, status: str
-    ) -> Tuple[str, bool]:
+    ) -> tuple[str, bool]:
         kind = TransactionKind.AUTH
         action_required = True
 
@@ -161,12 +178,23 @@ class StripeGatewayPlugin(BasePlugin):
 
         return kind, action_required
 
-    @require_active_plugin
+    def _get_setup_future_usage_from_store_payment_method(
+        self, store_payment_method: StorePaymentMethodEnum
+    ) -> str | None:
+        if store_payment_method == StorePaymentMethodEnum.ON_SESSION:
+            return "on_session"
+        if store_payment_method == StorePaymentMethodEnum.OFF_SESSION:
+            return "off_session"
+        return None
+
     def process_payment(
         self, payment_information: "PaymentData", previous_value
     ) -> "GatewayResponse":
+        if not self.active:
+            return previous_value
 
         api_key = self.config.connection_params["secret_api_key"]
+        include_receipt_email = self.config.connection_params["include_receipt_email"]
 
         auto_capture = self.config.auto_capture
         if self.order_auto_confirmation is False:
@@ -177,12 +205,18 @@ class StripeGatewayPlugin(BasePlugin):
         payment_method_id = data.get("payment_method_id") if data else None
 
         setup_future_usage = None
+        # DEPRECATED: reuse_source will be removed in Saleor 4.0
         if payment_information.reuse_source:
             setup_future_usage = data.get("setup_future_usage") if data else None
 
         off_session = data.get("off_session") if data else None
 
         payment_method_types = data.get("payment_method_types") if data else None
+
+        if not setup_future_usage:
+            setup_future_usage = self._get_setup_future_usage_from_store_payment_method(
+                payment_information.store_payment_method
+            )
 
         customer = None
         # confirm that we creates customer on stripe side only for log-in customers
@@ -202,33 +236,43 @@ class StripeGatewayPlugin(BasePlugin):
             customer=customer,
             payment_method_id=payment_method_id,
             metadata={
-                "channel": self.channel.slug,  # type: ignore
+                **payment_information.payment_metadata,
+                "channel": self.channel.slug,  # type: ignore[union-attr]
                 "payment_id": payment_information.graphql_payment_id,
             },
             setup_future_usage=setup_future_usage,
             off_session=off_session,
             payment_method_types=payment_method_types,
-            customer_email=payment_information.customer_email,
+            customer_email=payment_information.customer_email
+            if include_receipt_email
+            else None,
         )
 
-        if error and payment_method_id and not intent:
-            # we can receive an error which is caused by a required authentication
-            # but stripe already created payment_intent.
-            stripe_error = error.error
-            intent = getattr(stripe_error, "payment_intent", None)
-            error = None if intent else error
-
         raw_response = None
+        if error:
+            raw_response = getattr(error, "json_body", None)
+            if payment_method_id and not intent:
+                # we can receive an error which is caused by a required authentication
+                # but stripe already created payment_intent.
+                if error.code == "authentication_required":
+                    stripe_error = error.error
+                    intent = getattr(stripe_error, "payment_intent", None)
+                error = None if intent else error
+
         client_secret = None
         intent_id = None
         kind = TransactionKind.ACTION_TO_CONFIRM
         action_required = True
+        payment_method_info = None
         if intent:
             kind, action_required = self._get_transaction_details_for_stripe_status(
                 intent.status
             )
+            if kind in (TransactionKind.AUTH, TransactionKind.CAPTURE):
+                payment_method_info = get_payment_method_details(intent)
             client_secret = intent.client_secret
-            raw_response = intent.last_response.data
+            last_response = intent.last_response
+            raw_response = last_response.data if last_response else None
             intent_id = intent.id
 
         return GatewayResponse(
@@ -243,12 +287,14 @@ class StripeGatewayPlugin(BasePlugin):
             action_required_data={"client_secret": client_secret, "id": intent_id},
             customer_id=customer.id if customer else None,
             psp_reference=intent.id if intent else None,
+            payment_method_info=payment_method_info,
         )
 
-    @require_active_plugin
     def confirm_payment(
         self, payment_information: "PaymentData", previous_value
     ) -> "GatewayResponse":
+        if not self.active:
+            return previous_value
         payment_intent_id = payment_information.token
         api_key = self.config.connection_params["secret_api_key"]
 
@@ -294,8 +340,10 @@ class StripeGatewayPlugin(BasePlugin):
             kind, action_required = self._get_transaction_details_for_stripe_status(
                 payment_intent.status
             )
-            if kind == TransactionKind.CAPTURE:
+
+            if kind in (TransactionKind.AUTH, TransactionKind.CAPTURE):
                 payment_method_info = get_payment_method_details(payment_intent)
+
         else:
             action_required = False
             amount = payment_information.amount
@@ -318,17 +366,20 @@ class StripeGatewayPlugin(BasePlugin):
             payment_method_info=payment_method_info,
         )
 
-    @require_active_plugin
     def capture_payment(
         self, payment_information: "PaymentData", previous_value
     ) -> "GatewayResponse":
+        if not self.active:
+            return previous_value
         payment_intent_id = payment_information.token
+        if not payment_intent_id:
+            raise PaymentError("Cannot find a payment reference to capture.")
         capture_amount = price_to_minor_unit(
             payment_information.amount, payment_information.currency
         )
         payment_intent, error = capture_payment_intent(
             api_key=self.config.connection_params["secret_api_key"],
-            payment_intent_id=payment_intent_id,  # type: ignore
+            payment_intent_id=payment_intent_id,
             amount_to_capture=capture_amount,
         )
 
@@ -352,17 +403,20 @@ class StripeGatewayPlugin(BasePlugin):
             payment_method_info=payment_method_info,
         )
 
-    @require_active_plugin
     def refund_payment(
         self, payment_information: "PaymentData", previous_value
     ) -> "GatewayResponse":
+        if not self.active:
+            return previous_value
         payment_intent_id = payment_information.token
+        if not payment_intent_id:
+            raise PaymentError("Cannot find a payment reference to refund.")
         refund_amount = price_to_minor_unit(
             payment_information.amount, payment_information.currency
         )
         refund, error = refund_payment_intent(
             api_key=self.config.connection_params["secret_api_key"],
-            payment_intent_id=payment_intent_id,  # type: ignore
+            payment_intent_id=payment_intent_id,
             amount_to_refund=refund_amount,
         )
 
@@ -381,15 +435,18 @@ class StripeGatewayPlugin(BasePlugin):
             raw_response=raw_response,
         )
 
-    @require_active_plugin
     def void_payment(
         self, payment_information: "PaymentData", previous_value
     ) -> "GatewayResponse":
+        if not self.active:
+            return previous_value
         payment_intent_id = payment_information.token
+        if not payment_intent_id:
+            raise PaymentError("Cannot find a payment reference to void.")
 
         payment_intent, error = cancel_payment_intent(
             api_key=self.config.connection_params["secret_api_key"],
-            payment_intent_id=payment_intent_id,  # type: ignore
+            payment_intent_id=payment_intent_id,
         )
 
         raw_response = None
@@ -407,16 +464,16 @@ class StripeGatewayPlugin(BasePlugin):
             raw_response=raw_response,
         )
 
-    @require_active_plugin
     def list_payment_sources(
         self, customer_id: str, previous_value
-    ) -> List[CustomerSource]:
+    ) -> list[CustomerSource]:
+        if not self.active:
+            return previous_value
         payment_methods, error = list_customer_payment_methods(
             api_key=self.config.connection_params["secret_api_key"],
             customer_id=customer_id,
         )
         if payment_methods:
-            channel_slug: str = self.channel.slug  # type: ignore
             customer_sources = [
                 CustomerSource(
                     id=payment_method.id,
@@ -428,9 +485,9 @@ class StripeGatewayPlugin(BasePlugin):
                         name=None,
                         brand=payment_method.card.brand,
                     ),
+                    metadata=payment_method.metadata,
                 )
                 for payment_method in payment_methods
-                if payment_method.metadata.get("channel") == channel_slug
             ]
             previous_value.extend(customer_sources)
         return previous_value
@@ -438,12 +495,11 @@ class StripeGatewayPlugin(BasePlugin):
     @classmethod
     def pre_save_plugin_configuration(cls, plugin_configuration: "PluginConfiguration"):
         configuration = plugin_configuration.configuration
-        flat_configuration = {item["name"]: item["value"] for item in configuration}
+        flat_configuration = {item["name"]: item for item in configuration}
 
-        api_key = flat_configuration["secret_api_key"]
-        webhook_id = flat_configuration.get("webhook_endpoint_id")
-        webhook_secret = flat_configuration.get("webhook_secret_key")
-
+        api_key = flat_configuration["secret_api_key"]["value"]
+        webhook_id = flat_configuration.get("webhook_endpoint_id", {}).get("value")
+        webhook_secret_data = flat_configuration.get("webhook_secret_key", {})
         if not plugin_configuration.active:
             if webhook_id:
                 # delete all webhook details when we disable a stripe integration.
@@ -454,19 +510,15 @@ class StripeGatewayPlugin(BasePlugin):
                 ][0]
                 webhook_id_field["value"] = ""
 
-                plugin_configuration.configuration.remove(
-                    {
-                        "name": "webhook_secret_key",
-                        "value": webhook_secret,
-                    }
-                )
+                if webhook_secret_data:
+                    plugin_configuration.configuration.remove(webhook_secret_data)
                 delete_webhook(api_key, webhook_id)
 
             return
 
         # check saved domain. Make sure that it is not localhost domain. We are not able
         # to subscribe to stripe webhooks with localhost.
-        domain = Site.objects.get_current().domain
+        domain = get_domain()
         localhost_domains = ["localhost", "127.0.0.1"]
         domain, _ = split_domain_port(domain)
         if not domain:
@@ -483,9 +535,10 @@ class StripeGatewayPlugin(BasePlugin):
             return
 
         webhook = None
-        if not webhook_id and not webhook_secret:
+        if not webhook_id and not webhook_secret_data.get("value"):
             webhook = subscribe_webhook(
-                api_key, plugin_configuration.channel.slug  # type: ignore
+                api_key,
+                plugin_configuration.channel.slug,  # type: ignore[union-attr]
             )
 
         if not webhook:
@@ -501,7 +554,9 @@ class StripeGatewayPlugin(BasePlugin):
         )
 
     @classmethod
-    def _update_or_create_config_field(cls, configuration, field, value):
+    def _update_or_create_config_field(
+        cls, configuration: list[dict], field: str, value
+    ):
         for c_field in configuration:
             if c_field["name"] == field:
                 c_field["value"] = value
@@ -509,12 +564,14 @@ class StripeGatewayPlugin(BasePlugin):
         configuration.append({"name": field, "value": value})
 
     @classmethod
-    def validate_plugin_configuration(cls, plugin_configuration: "PluginConfiguration"):
+    def validate_plugin_configuration(
+        cls, plugin_configuration: "PluginConfiguration", **kwargs
+    ):
         configuration = plugin_configuration.configuration
         configuration = {item["name"]: item["value"] for item in configuration}
         required_fields = ["secret_api_key", "public_api_key"]
         all_required_fields_provided = all(
-            [configuration.get(field) for field in required_fields]
+            configuration.get(field) for field in required_fields
         )
         if plugin_configuration.active:
             if not all_required_fields_provided:
@@ -524,8 +581,8 @@ class StripeGatewayPlugin(BasePlugin):
                             "The parameter is required.",
                             code=PluginErrorCode.REQUIRED.value,
                         )
+                        for field in required_fields
                     }
-                    for field in required_fields
                 )
 
             api_key = configuration["secret_api_key"]
@@ -539,8 +596,9 @@ class StripeGatewayPlugin(BasePlugin):
                     }
                 )
 
-    @require_active_plugin
     def get_payment_config(self, previous_value):
+        if not self.active:
+            return previous_value
         return [
             {
                 "field": "api_key",

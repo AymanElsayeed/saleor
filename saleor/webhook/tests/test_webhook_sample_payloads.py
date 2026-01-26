@@ -1,11 +1,12 @@
 import copy
 import json
+from unittest import mock
 
 import graphene
 import pytest
 
 from ...order import OrderStatus
-from ..event_types import WebhookEventType
+from ..event_types import WebhookEventAsyncType
 from ..payloads import (
     generate_checkout_payload,
     generate_fulfillment_payload,
@@ -27,13 +28,14 @@ def _remove_anonymized_order_data(order_data: dict) -> dict:
 
 
 @pytest.mark.parametrize(
-    "event_name, order_status",
+    ("event_name", "order_status"),
     [
-        (WebhookEventType.ORDER_CREATED, OrderStatus.UNFULFILLED),
-        (WebhookEventType.ORDER_UPDATED, OrderStatus.CANCELED),
-        (WebhookEventType.ORDER_CANCELLED, OrderStatus.CANCELED),
-        (WebhookEventType.ORDER_FULFILLED, OrderStatus.FULFILLED),
-        (WebhookEventType.ORDER_FULLY_PAID, OrderStatus.FULFILLED),
+        (WebhookEventAsyncType.ORDER_CREATED, OrderStatus.UNFULFILLED),
+        (WebhookEventAsyncType.ORDER_UPDATED, OrderStatus.CANCELED),
+        (WebhookEventAsyncType.ORDER_CANCELLED, OrderStatus.CANCELED),
+        (WebhookEventAsyncType.ORDER_EXPIRED, OrderStatus.CANCELED),
+        (WebhookEventAsyncType.ORDER_FULFILLED, OrderStatus.FULFILLED),
+        (WebhookEventAsyncType.ORDER_FULLY_PAID, OrderStatus.FULFILLED),
     ],
 )
 def test_generate_sample_payload_order(
@@ -43,9 +45,8 @@ def test_generate_sample_payload_order(
     order.status = order_status
     order.save()
     order_id = graphene.Node.to_global_id("Order", order.id)
-
     payload = generate_sample_payload(event_name)
-    order_payload = json.loads(generate_order_payload(fulfilled_order))
+    order_payload = json.loads(generate_order_payload(order))
     # Check anonymized data differ
     assert order_id == payload[0]["id"]
     assert order.user_email != payload[0]["user_email"]
@@ -62,13 +63,14 @@ def test_generate_sample_payload_order(
     # Remove anonymized data
     payload = _remove_anonymized_order_data(payload[0])
     order_payload = _remove_anonymized_order_data(order_payload[0])
+    del payload["meta"]["issued_at"], order_payload["meta"]["issued_at"]
     # Compare the payloads
     assert payload == order_payload
 
 
 def test_generate_sample_payload_fulfillment_created(fulfillment):
     sample_fulfillment_payload = generate_sample_payload(
-        WebhookEventType.FULFILLMENT_CREATED
+        WebhookEventAsyncType.FULFILLMENT_CREATED
     )[0]
     fulfillment_payload = json.loads(generate_fulfillment_payload(fulfillment))[0]
     order = fulfillment.order
@@ -97,20 +99,48 @@ def test_generate_sample_payload_fulfillment_created(fulfillment):
     fulfillment_payload["order"] = _remove_anonymized_order_data(
         fulfillment_payload["order"]
     )
+    del (
+        sample_fulfillment_payload["meta"]["issued_at"],
+        fulfillment_payload["meta"]["issued_at"],
+    )
     # Compare the payloads
     assert sample_fulfillment_payload == fulfillment_payload
+
+
+def test_generate_sample_payload_order_removed_channel_listing_from_shipping(
+    fulfilled_order, payment_txn_captured
+):
+    # given
+    event_name = WebhookEventAsyncType.ORDER_UPDATED
+    order_status = OrderStatus.CANCELED
+    order = fulfilled_order
+    order.status = order_status
+    order.shipping_method.channel_listings.all().delete()
+    order.save()
+    order_id = graphene.Node.to_global_id("Order", order.id)
+
+    # when
+    payload = generate_sample_payload(event_name)
+    order_payload = json.loads(generate_order_payload(order))
+    # then
+    assert order_id == payload[0]["id"]
+    assert order.user_email != payload[0]["user_email"]
+    assert order_payload[0]["shipping_method"] is None
 
 
 @pytest.mark.parametrize(
     "event_name",
     [
-        WebhookEventType.ORDER_CREATED,
-        WebhookEventType.ORDER_UPDATED,
-        WebhookEventType.ORDER_CANCELLED,
-        WebhookEventType.ORDER_FULFILLED,
-        WebhookEventType.ORDER_FULLY_PAID,
-        WebhookEventType.PRODUCT_CREATED,
-        WebhookEventType.PRODUCT_UPDATED,
+        WebhookEventAsyncType.ORDER_CREATED,
+        WebhookEventAsyncType.ORDER_UPDATED,
+        WebhookEventAsyncType.ORDER_CANCELLED,
+        WebhookEventAsyncType.ORDER_FULFILLED,
+        WebhookEventAsyncType.ORDER_FULLY_PAID,
+        WebhookEventAsyncType.DRAFT_ORDER_CREATED,
+        WebhookEventAsyncType.DRAFT_ORDER_UPDATED,
+        WebhookEventAsyncType.DRAFT_ORDER_DELETED,
+        WebhookEventAsyncType.PRODUCT_CREATED,
+        WebhookEventAsyncType.PRODUCT_UPDATED,
         "Non_existing_event",
         None,
         "",
@@ -121,17 +151,19 @@ def test_generate_sample_payload_empty_response_(event_name):
 
 
 def test_generate_sample_customer_payload(customer_user):
-    payload = generate_sample_payload(WebhookEventType.CUSTOMER_CREATED)
+    payload = generate_sample_payload(WebhookEventAsyncType.CUSTOMER_CREATED)
     assert payload
     # Assert that the payload was generated from the fake user
     assert payload[0]["email"] != customer_user.email
 
 
 def test_generate_sample_product_payload(variant):
-    payload = generate_sample_payload(WebhookEventType.PRODUCT_CREATED)
+    payload = generate_sample_payload(WebhookEventAsyncType.PRODUCT_CREATED)
     product = variant.product
     product.refresh_from_db()
-    assert payload == json.loads(generate_product_payload(variant.product))
+    expected_payload = json.loads(generate_product_payload(variant.product))
+    del payload[0]["meta"]["issued_at"], expected_payload[0]["meta"]["issued_at"]
+    assert payload == expected_payload
 
 
 def _remove_anonymized_checkout_data(checkout_data: dict) -> dict:
@@ -146,27 +178,36 @@ def _remove_anonymized_checkout_data(checkout_data: dict) -> dict:
     return checkout_data
 
 
-def test_generate_sample_checkout_payload(user_checkout_with_items):
-    checkout = user_checkout_with_items
-    payload = generate_sample_payload(WebhookEventType.CHECKOUT_UPDATED)
-    checkout_payload = json.loads(generate_checkout_payload(checkout))
-    # Check anonymized data differ
-    assert checkout.token != payload[0]["token"]
-    assert checkout.user.email != payload[0]["user"]["email"]
-    assert checkout.email != payload[0]["email"]
-    assert (
-        checkout.billing_address.street_address_1
-        != payload[0]["billing_address"]["street_address_1"]
-    )
-    assert (
-        checkout.shipping_address.street_address_1
-        != payload[0]["shipping_address"]["street_address_1"]
-    )
-    assert "note" not in payload[0]
-    assert checkout.metadata != payload[0]["metadata"]
-    assert checkout.private_metadata != payload[0]["private_metadata"]
-    # Remove anonymized data
-    payload = _remove_anonymized_checkout_data(payload)
-    checkout_payload = _remove_anonymized_checkout_data(checkout_payload)
-    # Compare the payloads
-    assert payload == checkout_payload
+@pytest.mark.parametrize(
+    "user_checkouts", ["regular", "click_and_collect"], indirect=True
+)
+def test_generate_sample_checkout_payload(user_checkouts):
+    with mock.patch(
+        "saleor.webhook.payloads._get_sample_object", return_value=user_checkouts
+    ):
+        checkout = user_checkouts
+        payload = generate_sample_payload(WebhookEventAsyncType.CHECKOUT_UPDATED)
+        checkout_payload = json.loads(generate_checkout_payload(checkout))
+        # Check anonymized data differ
+        assert checkout.token != payload[0]["token"]
+        assert checkout.user.email != payload[0]["user"]["email"]
+        assert checkout.email != payload[0]["email"]
+        assert (
+            checkout.billing_address.street_address_1
+            != payload[0]["billing_address"]["street_address_1"]
+        )
+        assert (
+            checkout.shipping_address.street_address_1
+            != payload[0]["shipping_address"]["street_address_1"]
+        )
+        assert "note" not in payload[0]
+        assert checkout.metadata_storage.metadata != payload[0]["metadata"]
+        assert (
+            checkout.metadata_storage.private_metadata != payload[0]["private_metadata"]
+        )
+        # Remove anonymized data
+        payload = _remove_anonymized_checkout_data(payload)
+        checkout_payload = _remove_anonymized_checkout_data(checkout_payload)
+        del payload[0]["meta"]["issued_at"], checkout_payload[0]["meta"]["issued_at"]
+        # Compare the payloads
+        assert payload == checkout_payload

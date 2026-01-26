@@ -2,17 +2,33 @@ import os
 
 from django.conf import settings
 from django.contrib.postgres.indexes import GinIndex
+from django.contrib.postgres.search import SearchVectorField
+from django.core.validators import MinLengthValidator
 from django.db import models
 from django.db.models import JSONField, Q
 from django.utils import timezone
-from django_prices.models import MoneyField
 
 from ..app.models import App
-from ..core import TimePeriodType
+from ..core.db.fields import MoneyField
 from ..core.models import ModelWithMetadata
-from ..core.permissions import GiftcardPermissions
 from ..core.utils.json_serializer import CustomJsonEncoder
-from . import GiftCardEvents, GiftCardExpiryType
+from ..permission.enums import GiftcardPermissions
+from . import GiftCardEvents
+
+
+class GiftCardTag(models.Model):
+    name = models.CharField(max_length=255, unique=True)
+
+    class Meta:
+        ordering = ("name",)
+        indexes = [
+            GinIndex(
+                name="gift_card_tag_search_gin",
+                # `opclasses` and `fields` should be the same length
+                fields=["name"],
+                opclasses=["gin_trgm_ops"],
+            ),
+        ]
 
 
 class GiftCardQueryset(models.QuerySet):
@@ -23,8 +39,13 @@ class GiftCardQueryset(models.QuerySet):
         )
 
 
+GiftCardManager = models.Manager.from_queryset(GiftCardQueryset)
+
+
 class GiftCard(ModelWithMetadata):
-    code = models.CharField(max_length=16, unique=True, db_index=True)
+    code = models.CharField(
+        max_length=16, unique=True, validators=[MinLengthValidator(8)], db_index=True
+    )
     is_active = models.BooleanField(default=True)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -51,17 +72,9 @@ class GiftCard(ModelWithMetadata):
     )
 
     expiry_date = models.DateField(null=True, blank=True)
-    expiry_type = models.CharField(
-        max_length=32,
-        choices=GiftCardExpiryType.CHOICES,
-    )
-    expiry_period_type = models.CharField(
-        max_length=32, choices=TimePeriodType.CHOICES, null=True, blank=True
-    )
-    expiry_period = models.PositiveIntegerField(null=True, blank=True)
 
-    tag = models.CharField(max_length=255, null=True, blank=True)
-    created = models.DateTimeField(auto_now_add=True)
+    tags = models.ManyToManyField(GiftCardTag, "gift_cards")
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     last_used_on = models.DateTimeField(null=True, blank=True)
     product = models.ForeignKey(
         "product.Product",
@@ -69,6 +82,13 @@ class GiftCard(ModelWithMetadata):
         blank=True,
         on_delete=models.SET_NULL,
         related_name="gift_cards",
+    )
+    fulfillment_line = models.ForeignKey(
+        "order.FulfillmentLine",
+        related_name="gift_cards",
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
     )
 
     currency = models.CharField(
@@ -91,27 +111,22 @@ class GiftCard(ModelWithMetadata):
     current_balance = MoneyField(
         amount_field="current_balance_amount", currency_field="currency"
     )
+    search_vector = SearchVectorField(blank=True, null=True)
+    search_index_dirty = models.BooleanField(default=True)
 
-    objects = models.Manager.from_queryset(GiftCardQueryset)()
+    objects = GiftCardManager()
 
-    class Meta:
+    class Meta(ModelWithMetadata.Meta):
         ordering = ("code",)
         permissions = (
             (GiftcardPermissions.MANAGE_GIFT_CARD.codename, "Manage gift cards."),
         )
-        indexes = [
-            *ModelWithMetadata.Meta.indexes,
-            GinIndex(
-                name="giftcard_search_gin",
-                # `opclasses` and `fields` should be the same length
-                fields=["tag"],
-                opclasses=["gin_trgm_ops"],
-            ),
-        ]
+        indexes = [GinIndex(name="giftcard_tsearch", fields=["search_vector"])]
+        indexes.extend(ModelWithMetadata.Meta.indexes)
 
     @property
     def display_code(self):
-        return "****%s" % self.code[-4:]
+        return self.code[-4:]
 
 
 class GiftCardEvent(models.Model):
@@ -127,6 +142,7 @@ class GiftCardEvent(models.Model):
     app = models.ForeignKey(
         App, related_name="gift_card_events", on_delete=models.SET_NULL, null=True
     )
+    order = models.ForeignKey("order.Order", null=True, on_delete=models.SET_NULL)
     gift_card = models.ForeignKey(
         GiftCard, related_name="events", on_delete=models.CASCADE
     )

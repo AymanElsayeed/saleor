@@ -4,10 +4,15 @@ import graphene
 import pytest
 from graphene import Node
 
+from .....attribute.tests.model_helpers import (
+    get_product_attribute_values,
+    get_product_attributes,
+)
 from .....attribute.utils import associate_attribute_values_to_instance
+from .....channel.models import Channel
 from .....core.taxes import TaxType
 from .....plugins.manager import PluginsManager
-from .....product.models import ProductTranslation
+from .....product.models import ProductChannelListing, ProductMedia, ProductTranslation
 from ....tests.utils import get_graphql_content
 
 
@@ -139,6 +144,7 @@ def test_product_details(product_with_image, api_client, count_queries, channel_
                           }
                         }
                       }
+                      displayGrossPrices
                     }
                   }
                 }
@@ -244,11 +250,15 @@ def test_retrieve_product_media(product_list, api_client, count_queries, channel
 @pytest.mark.django_db
 @pytest.mark.count_queries(autouse=False)
 def test_retrieve_channel_listings(
+    django_assert_num_queries,
     product_list_with_many_channels,
+    product_list,
     staff_api_client,
     count_queries,
     permission_manage_products,
     channel_USD,
+    channel_JPY,
+    channel_PLN,
 ):
     query = """
         query($channel: String) {
@@ -257,7 +267,7 @@ def test_retrieve_channel_listings(
               node {
                 id
                 channelListings {
-                  publicationDate
+                  publishedAt
                   isPublished
                   channel{
                     slug
@@ -283,7 +293,7 @@ def test_retrieve_channel_listings(
                     stop
                   }
                   isAvailableForPurchase
-                  availableForPurchase
+                  availableForPurchaseAt
                   pricing {
                     priceRangeUndiscounted {
                       start {
@@ -299,6 +309,7 @@ def test_retrieve_channel_listings(
                         }
                       }
                     }
+                    displayGrossPrices
                   }
                 }
               }
@@ -307,15 +318,49 @@ def test_retrieve_channel_listings(
         }
     """
 
+    assert Channel.objects.count() > 1
+
     variables = {"channel": channel_USD.slug}
-    get_graphql_content(
-        staff_api_client.post_graphql(
-            query,
-            variables,
-            permissions=(permission_manage_products,),
-            check_no_permissions=False,
+
+    expected_db_queries = 14
+    with django_assert_num_queries(expected_db_queries):
+        get_graphql_content(
+            staff_api_client.post_graphql(
+                query,
+                variables,
+                permissions=(permission_manage_products,),
+                check_no_permissions=False,
+            )
         )
+
+    ProductChannelListing.objects.bulk_create(
+        [
+            ProductChannelListing(
+                product=product_list[0],
+                channel=channel_JPY,
+                is_published=True,
+            ),
+            ProductChannelListing(
+                product=product_list[1],
+                channel=channel_JPY,
+                is_published=True,
+            ),
+            ProductChannelListing(
+                product=product_list[2],
+                channel=channel_JPY,
+                is_published=True,
+            ),
+        ]
     )
+    with django_assert_num_queries(expected_db_queries):
+        get_graphql_content(
+            staff_api_client.post_graphql(
+                query,
+                variables,
+                permissions=(permission_manage_products,),
+                check_no_permissions=False,
+            )
+        )
 
 
 @pytest.mark.django_db
@@ -463,6 +508,9 @@ def test_update_product(
     non_default_category,
     collection_list,
     product_with_variant_with_two_attributes,
+    color_attribute,
+    size_attribute,
+    boolean_attribute,
     other_description_json,
     permission_manage_products,
     monkeypatch,
@@ -527,6 +575,24 @@ def test_update_product(
     product_slug = "updated-product"
     product_charge_taxes = True
     product_tax_rate = "STANDARD"
+    product.product_type.product_attributes.add(size_attribute)
+    product.product_type.product_attributes.add(color_attribute)
+    product.product_type.product_attributes.add(boolean_attribute)
+
+    attributes = [
+        {
+            "id": graphene.Node.to_global_id("Attribute", color_attribute.pk),
+            "values": ["newValue"],
+        },
+        {
+            "id": graphene.Node.to_global_id("Attribute", size_attribute.pk),
+            "values": ["newValue"],
+        },
+        {
+            "id": graphene.Node.to_global_id("Attribute", boolean_attribute.pk),
+            "values": ["False"],
+        },
+    ]
 
     # Mock tax interface with fake response from tax gateway
     monkeypatch.setattr(
@@ -544,6 +610,7 @@ def test_update_product(
             "description": other_description_json,
             "chargeTaxes": product_charge_taxes,
             "taxCode": product_tax_rate,
+            "attributes": attributes,
         },
     }
 
@@ -555,39 +622,38 @@ def test_update_product(
     assert not data["errors"]
 
 
+QUERY_PRODUCTS_WITH_FILTER = """
+    query ($channel: String, $filter: ProductFilterInput){
+        products(
+            channel: $channel,
+            filter: $filter,
+            first: 20,
+        ) {
+            edges {
+                node {
+                    name
+                }
+            }
+        }
+    }
+"""
+
+
 @pytest.mark.django_db
 @pytest.mark.count_queries(autouse=False)
 def test_filter_products_by_attributes(
     api_client, product_list, channel_USD, count_queries
 ):
-    query = """
-      query ($channel: String, $filter: ProductFilterInput){
-          products(
-              channel: $channel,
-              filter: $filter,
-              first: 20,
-          ) {
-              edges {
-                  node {
-                      name
-                  }
-              }
-          }
-      }
-    """
-
     product = product_list[0]
-    attr_assignment = product.attributes.first()
-    attr = attr_assignment.attribute
+    attr = get_product_attributes(product).first()
+    first_assigned_value = get_product_attribute_values(product, attr).first()
     variables = {
         "channel": channel_USD.slug,
         "filter": {
-            "attributes": [
-                {"slug": attr.slug, "values": [attr_assignment.values.first().slug]}
-            ]
+            "attributes": [{"slug": attr.slug, "values": [first_assigned_value.slug]}]
         },
     }
-    get_graphql_content(api_client.post_graphql(query, variables))
+    get_graphql_content(api_client.post_graphql(QUERY_PRODUCTS_WITH_FILTER, variables))
 
 
 @pytest.mark.django_db
@@ -595,26 +661,10 @@ def test_filter_products_by_attributes(
 def test_filter_products_by_numeric_attributes(
     api_client, product_list, numeric_attribute, channel_USD, count_queries
 ):
-    query = """
-      query ($channel: String,  $filter: ProductFilterInput){
-          products(
-              channel: $channel,
-              filter: $filter,
-              first: 20,
-          ) {
-              edges {
-                  node {
-                      name
-                  }
-              }
-          }
-      }
-    """
-
     product = product_list[0]
     product.product_type.product_attributes.add(numeric_attribute)
     associate_attribute_values_to_instance(
-        product, numeric_attribute, *numeric_attribute.values.all()
+        product, {numeric_attribute.id: list(numeric_attribute.values.all())}
     )
     variables = {
         "channel": channel_USD.slug,
@@ -630,7 +680,7 @@ def test_filter_products_by_numeric_attributes(
             ]
         },
     }
-    get_graphql_content(api_client.post_graphql(query, variables))
+    get_graphql_content(api_client.post_graphql(QUERY_PRODUCTS_WITH_FILTER, variables))
 
 
 @pytest.mark.django_db
@@ -638,26 +688,10 @@ def test_filter_products_by_numeric_attributes(
 def test_filter_products_by_boolean_attributes(
     api_client, product_list, boolean_attribute, channel_USD, count_queries
 ):
-    query = """
-      query ($channel: String,  $filter: ProductFilterInput){
-          products(
-              channel: $channel,
-              filter: $filter,
-              first: 20,
-          ) {
-              edges {
-                  node {
-                      name
-                  }
-              }
-          }
-      }
-    """
-
     product = product_list[0]
     product.product_type.product_attributes.add(boolean_attribute)
     associate_attribute_values_to_instance(
-        product, boolean_attribute, *boolean_attribute.values.all()
+        product, {boolean_attribute.id: list(boolean_attribute.values.all())}
     )
     variables = {
         "channel": channel_USD.slug,
@@ -670,7 +704,24 @@ def test_filter_products_by_boolean_attributes(
             ]
         },
     }
-    get_graphql_content(api_client.post_graphql(query, variables))
+    get_graphql_content(api_client.post_graphql(QUERY_PRODUCTS_WITH_FILTER, variables))
+
+
+@pytest.mark.django_db
+@pytest.mark.count_queries(autouse=False)
+def test_filter_products_by_gift_card(
+    staff_api_client,
+    product_list,
+    boolean_attribute,
+    channel_USD,
+    count_queries,
+    shippable_gift_card_product,
+):
+    variables = {"channel": channel_USD.slug, "filter": {"giftCard": True}}
+
+    get_graphql_content(
+        staff_api_client.post_graphql(QUERY_PRODUCTS_WITH_FILTER, variables)
+    )
 
 
 @pytest.mark.django_db
@@ -697,3 +748,179 @@ def test_product_translations(api_client, product_list, channel_USD, count_queri
 
     variables = {"channel": channel_USD.slug}
     get_graphql_content(api_client.post_graphql(query, variables))
+
+
+@pytest.mark.django_db
+@pytest.mark.count_queries(autouse=False)
+def test_products_for_federation_query_count(
+    api_client,
+    product,
+    shippable_gift_card_product,
+    channel_USD,
+    django_assert_num_queries,
+    count_queries,
+):
+    query = """
+      query GetProductInFederation($representations: [_Any]) {
+        _entities(representations: $representations) {
+          __typename
+          ... on Product {
+            id
+            name
+          }
+        }
+      }
+    """
+
+    variables = {
+        "representations": [
+            {
+                "__typename": "Product",
+                "id": graphene.Node.to_global_id("Product", product.pk),
+                "channel": channel_USD.slug,
+            },
+        ],
+    }
+
+    with django_assert_num_queries(3):
+        response = api_client.post_graphql(query, variables)
+        content = get_graphql_content(response)
+        assert len(content["data"]["_entities"]) == 1
+
+    variables = {
+        "representations": [
+            {
+                "__typename": "Product",
+                "id": graphene.Node.to_global_id("Product", product.pk),
+                "channel": channel_USD.slug,
+            },
+            {
+                "__typename": "Product",
+                "id": graphene.Node.to_global_id(
+                    "Product", shippable_gift_card_product.pk
+                ),
+                "channel": channel_USD.slug,
+            },
+        ],
+    }
+
+    with django_assert_num_queries(3):
+        response = api_client.post_graphql(query, variables)
+        content = get_graphql_content(response)
+        assert len(content["data"]["_entities"]) == 2
+
+
+@pytest.mark.django_db
+@pytest.mark.count_queries(autouse=False)
+def test_products_media_for_federation_query_count(
+    api_client,
+    product,
+    image,
+    media_root,
+    django_assert_num_queries,
+    count_queries,
+):
+    medias = ProductMedia.objects.bulk_create(
+        [
+            ProductMedia(product=product, image=image),
+            ProductMedia(product=product, image=image),
+            ProductMedia(product=product, image=image),
+        ]
+    )
+
+    query = """
+      query GetProductMediaInFederation($representations: [_Any]) {
+        _entities(representations: $representations) {
+          __typename
+          ... on ProductMedia {
+            id
+            url(size: 0)
+          }
+        }
+      }
+    """
+
+    variables = {
+        "representations": [
+            {
+                "__typename": "ProductMedia",
+                "id": graphene.Node.to_global_id("ProductMedia", medias[0].pk),
+            },
+        ],
+    }
+
+    with django_assert_num_queries(1):
+        response = api_client.post_graphql(query, variables)
+        content = get_graphql_content(response)
+        assert len(content["data"]["_entities"]) == 1
+
+    variables = {
+        "representations": [
+            {
+                "__typename": "ProductMedia",
+                "id": graphene.Node.to_global_id("ProductMedia", media.pk),
+            }
+            for media in medias
+        ],
+    }
+
+    with django_assert_num_queries(1):
+        response = api_client.post_graphql(query, variables)
+        content = get_graphql_content(response)
+        assert len(content["data"]["_entities"]) == 3
+
+
+@pytest.mark.django_db
+@pytest.mark.count_queries(autouse=False)
+def test_products_types_for_federation_query_count(
+    api_client,
+    product_type,
+    product_type_without_variant,
+    django_assert_num_queries,
+    count_queries,
+):
+    query = """
+      query GetProductTypeInFederation($representations: [_Any]) {
+        _entities(representations: $representations) {
+          __typename
+          ... on ProductType {
+            id
+            name
+          }
+        }
+      }
+    """
+
+    variables = {
+        "representations": [
+            {
+                "__typename": "ProductType",
+                "id": graphene.Node.to_global_id("ProductType", product_type.pk),
+            },
+        ],
+    }
+
+    with django_assert_num_queries(1):
+        response = api_client.post_graphql(query, variables)
+        content = get_graphql_content(response)
+        assert len(content["data"]["_entities"]) == 1
+
+    variables = {
+        "representations": [
+            {
+                "__typename": "ProductType",
+                "id": graphene.Node.to_global_id("ProductType", product_type.pk),
+            },
+            {
+                "__typename": "ProductType",
+                "id": graphene.Node.to_global_id(
+                    "ProductType", product_type_without_variant.pk
+                ),
+            },
+        ],
+    }
+
+    with django_assert_num_queries(1):
+        response = api_client.post_graphql(query, variables)
+        content = get_graphql_content(response)
+        assert len(content["data"]["_entities"]) == 2

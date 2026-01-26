@@ -7,7 +7,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("order", "0045_auto_20180329_0142"),
         ("product", "0057_auto_20180403_0852"),
@@ -28,7 +27,7 @@ class Migration(migrations.Migration):
             model_name="productvariant",
             name="quantity",
             field=models.IntegerField(
-                default=Decimal("1"),
+                default=Decimal(1),
                 validators=[django.core.validators.MinValueValidator(0)],
             ),
         ),
@@ -36,7 +35,7 @@ class Migration(migrations.Migration):
             model_name="productvariant",
             name="quantity_allocated",
             field=models.IntegerField(
-                default=Decimal("0"),
+                default=Decimal(0),
                 validators=[django.core.validators.MinValueValidator(0)],
             ),
         ),

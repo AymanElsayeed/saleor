@@ -1,12 +1,20 @@
+import json
+from unittest import mock
+
 import graphene
+from django.utils.functional import SimpleLazyObject
+from freezegun import freeze_time
 
 from .....app.error_codes import AppErrorCode
 from .....app.models import App, AppToken
+from .....core.utils.json_serializer import CustomJsonEncoder
+from .....webhook.event_types import WebhookEventAsyncType
+from .....webhook.payloads import generate_meta, generate_requestor
 from ....core.enums import PermissionEnum
 from ....tests.utils import assert_no_permission, get_graphql_content
 
 APP_UPDATE_MUTATION = """
-mutation AppUpdate($id: ID!, $permissions: [PermissionEnum]){
+mutation AppUpdate($id: ID!, $permissions: [PermissionEnum!]){
     appUpdate(id: $id,
         input:{permissions:$permissions}){
         app{
@@ -33,7 +41,7 @@ mutation AppUpdate($id: ID!, $permissions: [PermissionEnum]){
 
 
 def test_app_update_mutation(
-    app,
+    app_with_token,
     permission_manage_apps,
     permission_manage_products,
     permission_manage_users,
@@ -41,6 +49,7 @@ def test_app_update_mutation(
     staff_user,
 ):
     query = APP_UPDATE_MUTATION
+    app = app_with_token
     staff_user.user_permissions.add(permission_manage_products, permission_manage_users)
     id = graphene.Node.to_global_id("App", app.id)
 
@@ -68,6 +77,67 @@ def test_app_update_mutation(
         permission_manage_products,
         permission_manage_users,
     }
+
+
+@freeze_time("2022-05-12 12:00:00")
+@mock.patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
+@mock.patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
+def test_app_update_trigger_mutation(
+    mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
+    app_with_token,
+    permission_manage_apps,
+    permission_manage_products,
+    permission_manage_users,
+    staff_api_client,
+    staff_user,
+    settings,
+):
+    # given
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
+    settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
+
+    staff_user.user_permissions.add(permission_manage_products, permission_manage_users)
+    app_global_id = graphene.Node.to_global_id("App", app_with_token.id)
+
+    variables = {
+        "id": app_global_id,
+        "permissions": [
+            PermissionEnum.MANAGE_PRODUCTS.name,
+            PermissionEnum.MANAGE_USERS.name,
+        ],
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        APP_UPDATE_MUTATION, variables=variables, permissions=(permission_manage_apps,)
+    )
+    content = get_graphql_content(response)
+    app_with_token.refresh_from_db()
+
+    # then
+    assert content["data"]["appUpdate"]["app"]
+    mocked_webhook_trigger.assert_called_once_with(
+        json.dumps(
+            {
+                "id": variables["id"],
+                "is_active": app_with_token.is_active,
+                "name": app_with_token.name,
+                "meta": generate_meta(
+                    requestor_data=generate_requestor(
+                        SimpleLazyObject(lambda: staff_api_client.user)
+                    )
+                ),
+            },
+            cls=CustomJsonEncoder,
+        ),
+        WebhookEventAsyncType.APP_UPDATED,
+        [any_webhook],
+        app_with_token,
+        SimpleLazyObject(lambda: staff_api_client.user),
+        allow_replica=False,
+    )
 
 
 def test_app_update_mutation_for_app(
@@ -151,7 +221,7 @@ def test_app_update_mutation_out_of_scope_permissions(
 
 
 def test_app_update_mutation_superuser_can_add_any_permissions_to_app(
-    app,
+    app_with_token,
     permission_manage_apps,
     permission_manage_products,
     permission_manage_users,
@@ -159,6 +229,7 @@ def test_app_update_mutation_superuser_can_add_any_permissions_to_app(
 ):
     """Ensure superuser can add any permissions to app."""
     query = APP_UPDATE_MUTATION
+    app = app_with_token
     id = graphene.Node.to_global_id("App", app.id)
 
     variables = {
@@ -265,7 +336,7 @@ def test_app_update_mutation_out_of_scope_app(
 
 
 def test_app_update_mutation_superuser_can_update_any_app(
-    app,
+    app_with_token,
     permission_manage_apps,
     permission_manage_products,
     permission_manage_orders,
@@ -274,6 +345,7 @@ def test_app_update_mutation_superuser_can_update_any_app(
 ):
     """Ensure superuser can manage any app."""
     query = APP_UPDATE_MUTATION
+    app = app_with_token
     app.permissions.add(permission_manage_orders)
     id = graphene.Node.to_global_id("App", app.id)
 
@@ -349,3 +421,39 @@ def test_app_update_no_permission(app, staff_api_client, staff_user):
     }
     response = staff_api_client.post_graphql(query, variables=variables)
     assert_no_permission(response)
+
+
+def test_app_update_mutation_removed_app(
+    removed_app,
+    permission_manage_apps,
+    permission_manage_products,
+    permission_manage_users,
+    staff_api_client,
+    staff_user,
+):
+    # given
+    query = APP_UPDATE_MUTATION
+    app = removed_app
+    staff_user.user_permissions.add(permission_manage_products, permission_manage_users)
+    id = graphene.Node.to_global_id("App", app.id)
+
+    variables = {
+        "id": id,
+        "permissions": [
+            PermissionEnum.MANAGE_PRODUCTS.name,
+            PermissionEnum.MANAGE_USERS.name,
+        ],
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables=variables, permissions=(permission_manage_apps,)
+    )
+
+    # then
+    content = get_graphql_content(response)
+
+    app_data = content["data"]["appUpdate"]
+    assert app_data["app"] is None
+    assert app_data["errors"][0]["code"] == AppErrorCode.NOT_FOUND.name
+    assert app_data["errors"][0]["field"] == "id"

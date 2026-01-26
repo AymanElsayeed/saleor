@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING
 
 from django.apps import AppConfig
 from django.conf import settings
@@ -23,12 +23,12 @@ class PluginConfig(AppConfig):
         try:
             plugin = import_string(plugin_path)
         except ImportError as e:
-            raise (ImportError(f"Failed to import plugin {plugin_path}: {e}"))
+            raise ImportError(f"Failed to import plugin {plugin_path}: {e}") from e
 
         self.check_plugin_fields(["PLUGIN_ID"], plugin)
 
-    def check_plugin_fields(self, fields: List[str], plugin_class: "BasePlugin"):
-        name = plugin_class.__name__  # type: ignore
+    def check_plugin_fields(self, fields: list[str], plugin_class: type["BasePlugin"]):
+        name = plugin_class.__name__
 
         for field in fields:
             if not getattr(plugin_class, field, None):

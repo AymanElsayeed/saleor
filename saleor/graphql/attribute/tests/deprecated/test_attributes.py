@@ -6,6 +6,7 @@ from django.db.models import Q
 from .....attribute.models import Attribute
 from .....channel.models import Channel
 from .....channel.utils import DEPRECATION_WARNING_MESSAGE
+from .....product import ProductTypeKind
 from .....product.models import Category, Product, ProductType
 from ....tests.utils import get_graphql_content
 
@@ -39,7 +40,10 @@ def test_attributes_query_with_filter(
     other_category = Category.objects.create(name="Other Category", slug="other-cat")
     other_attribute = Attribute.objects.create(name="Other", slug="other")
     other_product_type = ProductType.objects.create(
-        name="Other type", has_variants=True, is_shipping_required=True
+        name="Other type",
+        has_variants=True,
+        is_shipping_required=True,
+        kind=ProductTypeKind.NORMAL,
     )
     other_product_type.product_attributes.add(other_attribute)
 
@@ -64,6 +68,4 @@ def test_attributes_query_with_filter(
     expected_flat_attributes_data = list(expected_qs.values_list("slug", flat=True))
 
     assert flat_attributes_data == expected_flat_attributes_data
-    assert any(
-        [str(warning.message) == DEPRECATION_WARNING_MESSAGE for warning in warns]
-    )
+    assert any(str(warning.message) == DEPRECATION_WARNING_MESSAGE for warning in warns)

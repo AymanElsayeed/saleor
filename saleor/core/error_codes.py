@@ -16,13 +16,22 @@ class MetadataErrorCode(Enum):
     INVALID = "invalid"
     NOT_FOUND = "not_found"
     REQUIRED = "required"
+    NOT_UPDATED = "not_updated"
 
 
 class TranslationErrorCode(Enum):
     GRAPHQL_ERROR = "graphql_error"
+    INVALID = "invalid"
     NOT_FOUND = "not_found"
     REQUIRED = "required"
+    UNIQUE = "unique"
 
 
 class UploadErrorCode(Enum):
+    GRAPHQL_ERROR = "graphql_error"
+    INVALID_FILE_TYPE = "invalid_file_type"
+    UNSUPPORTED_MIME_TYPE = "unsupported_mime_type"
+
+
+class CoreErrorCode(Enum):
     GRAPHQL_ERROR = "graphql_error"

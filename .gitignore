@@ -1,27 +1,16 @@
 *.py[cod]
 .*
-!.babelrc
-!.circleci
-!.codeclimate.yml
-!.coveragerc
+!.devcontainer
 !.dockerignore
-!.eslintrc.json
-!.flowconfig
 !.github
 !.gitignore
-!.gqlconfig
-!.npmrc
-!.nvmrc
-!.plop
-!.pylintrc
-!.testcafe
-!.travis*
-!.tx
-*.css
+!.vscode
 *.log
 *.pot
 *.pyc
 local_settings.py
+.release_changelog.txt
+.base_ver_release.txt
 __pycache__/
 build/
 coverage/
@@ -31,7 +20,7 @@ dist/
 /media/
 /node_modules/
 /static/
-
+/digital_contents/
 # Environments
 .env
 .venv
@@ -40,6 +29,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+Pipfile
+!.env.example
 
 # Exported results file
 django-queries-results.html

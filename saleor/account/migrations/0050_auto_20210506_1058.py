@@ -5,12 +5,12 @@ from django.db import migrations
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("account", "0049_user_language_code"),
     ]
 
     operations = [
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="user",
             index=django.contrib.postgres.indexes.GinIndex(

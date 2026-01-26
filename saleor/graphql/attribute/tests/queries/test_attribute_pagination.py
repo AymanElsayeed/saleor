@@ -5,6 +5,7 @@ import pytest
 
 from .....attribute import AttributeType
 from .....attribute.models import Attribute, AttributeProduct, AttributeVariant
+from .....product import ProductTypeKind
 from .....product.models import (
     Product,
     ProductChannelListing,
@@ -57,7 +58,10 @@ def attributes_for_pagination(collection, category, channel_USD):
         ]
     )
 
-    product_type = ProductType.objects.create(name="My Product Type")
+    product_type = ProductType.objects.create(
+        name="My Product Type",
+        kind=ProductTypeKind.NORMAL,
+    )
     product = Product.objects.create(
         name="Test product",
         product_type=product_type,
@@ -151,7 +155,7 @@ QUERY_ATTRIBUTES_PAGINATION = """
 
 
 @pytest.mark.parametrize(
-    "sort_by, attributes_order",
+    ("sort_by", "attributes_order"),
     [
         ({"field": "NAME", "direction": "ASC"}, ["Attr1", "Attr2", "Attr3"]),
         ({"field": "NAME", "direction": "DESC"}, ["AttrAttr2", "AttrAttr1", "Attr3"]),
@@ -188,7 +192,7 @@ def test_attributes_pagination_with_sorting(
 
 
 @pytest.mark.parametrize(
-    "filter_by, attributes_order",
+    ("filter_by", "attributes_order"),
     [
         ({"search": "AttrAttr"}, ["AttrAttr2", "AttrAttr1"]),
         ({"search": "attr_attr"}, ["AttrAttr2", "AttrAttr1"]),

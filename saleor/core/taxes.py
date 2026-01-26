@@ -1,12 +1,21 @@
 from dataclasses import dataclass
-from typing import Union
+from decimal import Decimal
 
-from django.contrib.sites.models import Site
-from prices import Money, MoneyRange, TaxedMoney, TaxedMoneyRange
+from prices import Money, TaxedMoney
+
+TAX_ERROR_FIELD_LENGTH = 255
 
 
 class TaxError(Exception):
     """Default tax error."""
+
+
+class TaxDataError(Exception):
+    """Error in tax data received from tax app or plugin."""
+
+    def __init__(self, message: str, errors: list | None = None):
+        super().__init__(message)
+        self.errors = errors or []
 
 
 def zero_money(currency: str) -> Money:
@@ -22,38 +31,33 @@ def zero_taxed_money(currency: str) -> TaxedMoney:
     return TaxedMoney(net=zero, gross=zero)
 
 
-def include_taxes_in_prices() -> bool:
-    return Site.objects.get_current().settings.include_taxes_in_prices
-
-
-def display_gross_prices() -> bool:
-    return Site.objects.get_current().settings.display_gross_prices
-
-
-def charge_taxes_on_shipping() -> bool:
-    return Site.objects.get_current().settings.charge_taxes_on_shipping
-
-
-def get_display_price(
-    base: Union[TaxedMoney, TaxedMoneyRange], display_gross: bool = False
-) -> Money:
-    """Return the price amount that should be displayed based on settings."""
-    if not display_gross:
-        display_gross = display_gross_prices()
-    if isinstance(base, TaxedMoneyRange):
-        if display_gross:
-            base = MoneyRange(start=base.start.gross, stop=base.stop.gross)
-        else:
-            base = MoneyRange(start=base.start.net, stop=base.stop.net)
-
-    if isinstance(base, TaxedMoney):
-        base = base.gross if display_gross else base.net
-    return base
-
-
 @dataclass(frozen=True)
 class TaxType:
     """Dataclass for unifying tax type object that comes from tax gateway."""
 
     code: str
     description: str
+
+
+@dataclass(frozen=True)
+class TaxLineData:
+    tax_rate: Decimal
+    total_gross_amount: Decimal
+    total_net_amount: Decimal
+
+
+@dataclass(frozen=True)
+class TaxData:
+    shipping_price_gross_amount: Decimal
+    shipping_price_net_amount: Decimal
+    shipping_tax_rate: Decimal
+    lines: list[TaxLineData]
+
+
+class TaxDataErrorMessage:
+    EMPTY = "Empty tax data."
+    NEGATIVE_VALUE = "Tax data contains negative values."
+    LINE_NUMBER = (
+        "Number of lines from tax data doesn't match the line number from order."
+    )
+    OVERFLOW = "Tax data contains prices exceeding a billion or tax rate over 100%."

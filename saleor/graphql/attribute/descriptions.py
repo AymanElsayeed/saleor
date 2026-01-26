@@ -1,3 +1,6 @@
+from ..core.descriptions import RICH_CONTENT
+
+
 class AttributeDescriptions:
     INPUT_TYPE = "The input type to use for entering attribute values in the dashboard."
     ENTITY_TYPE = "The entity type which can be used as a reference."
@@ -29,11 +32,23 @@ class AttributeValueDescriptions:
     SLUG = "Internal representation of a value (unique per attribute)."
     TYPE = "Type of value (used only when `value` field is set)."
     FILE = "Represents file URL and content type (if attribute value is a file)."
+    VALUE = (
+        "Represent value of the attribute value "
+        "(e.g. color values for swatch attributes)."
+    )
     VALUES_RANGE = "The range that the returned values should be in."
-    DATE_TIME_RANGE = "The date time range that the returned values should be in."
-    DATE_RANGE = "The date range that the returned values should be in."
-    VALUE = "Represents the value of the attribute value."
-    RICH_TEXT = "Represents the text (JSON) of the attribute value."
+    DATE_TIME_RANGE = "The date/time range that the returned values should be in."
+    DATE_RANGE = (
+        "The date range that the returned values should be in. "
+        "In case of date/time attributes, the UTC midnight of the given date is used."
+    )
+    RICH_TEXT = (
+        "Represents the text of the attribute value, includes formatting."
+        + RICH_CONTENT
+    )
+    PLAIN_TEXT = (
+        "Represents the text of the attribute value, plain text without formatting."
+    )
     BOOLEAN = "Represents the boolean value of the attribute value."
     DATE = "Represents the date value of the attribute value."
-    DATE_TIME = "Represents the date time value of the attribute value."
+    DATE_TIME = "Represents the date/time value of the attribute value."

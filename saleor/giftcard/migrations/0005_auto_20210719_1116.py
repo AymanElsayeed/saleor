@@ -8,7 +8,6 @@ import saleor.core.utils.json_serializer
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
         ("app", "0004_auto_20210308_1135"),
@@ -145,18 +144,21 @@ class Migration(migrations.Migration):
             model_name="giftcard",
             name="start_date",
         ),
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="giftcard",
             index=django.contrib.postgres.indexes.GinIndex(
                 fields=["private_metadata"], name="giftcard_p_meta_idx"
             ),
         ),
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="giftcard",
             index=django.contrib.postgres.indexes.GinIndex(
                 fields=["metadata"], name="giftcard_meta_idx"
             ),
         ),
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="giftcard",
             index=django.contrib.postgres.indexes.GinIndex(

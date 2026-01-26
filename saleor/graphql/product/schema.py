@@ -1,65 +1,66 @@
 import graphene
+from django.db.models import Exists, OuterRef
+from promise import Promise
 
-from saleor.core.tracing import traced_resolver
-
-from ...account.utils import requestor_is_staff_member_or_app
-from ...core.permissions import ProductPermissions
-from ..channel import ChannelContext
+from ...permission.enums import ProductPermissions
+from ...permission.utils import has_one_of_permissions
+from ...product import models
+from ...product.models import ALL_PRODUCTS_PERMISSIONS
+from ...product.search import search_products
+from ..channel.dataloaders.by_self import ChannelBySlugLoader
 from ..channel.utils import get_default_channel_slug_or_graphql_error
-from ..core.enums import ReportingPeriod
-from ..core.fields import (
-    ChannelContextFilterConnectionField,
-    FilterInputConnectionField,
-    PrefetchingConnectionField,
+from ..core import ResolveInfo
+from ..core.connection import create_connection_slice, filter_connection_queryset
+from ..core.context import ChannelContext, ChannelQsContext
+from ..core.descriptions import (
+    ADDED_IN_321,
+    ADDED_IN_322,
+    DEFAULT_DEPRECATION_REASON,
+    DEPRECATED_IN_3X_INPUT,
 )
+from ..core.doc_category import DOC_CATEGORY_PRODUCTS
+from ..core.enums import LanguageCodeEnum, ReportingPeriod
+from ..core.fields import (
+    BaseField,
+    ConnectionField,
+    FilterConnectionField,
+    PermissionsField,
+)
+from ..core.tracing import traced_resolver
+from ..core.types import NonNullList
 from ..core.utils import from_global_id_or_error
 from ..core.validators import validate_one_of_args_is_in_query
-from ..decorators import permission_required
+from ..shop.resolvers import get_database_connection_name
 from ..translations.mutations import (
     CategoryTranslate,
     CollectionTranslate,
+    ProductBulkTranslate,
     ProductTranslate,
+    ProductVariantBulkTranslate,
     ProductVariantTranslate,
 )
 from ..utils import get_user_or_app_from_context
-from .bulk_mutations.products import (
+from .bulk_mutations import (
     CategoryBulkDelete,
     CollectionBulkDelete,
+    ProductBulkCreate,
     ProductBulkDelete,
     ProductMediaBulkDelete,
     ProductTypeBulkDelete,
     ProductVariantBulkCreate,
     ProductVariantBulkDelete,
+    ProductVariantBulkUpdate,
     ProductVariantStocksCreate,
     ProductVariantStocksDelete,
     ProductVariantStocksUpdate,
 )
-from .filters import (
-    CategoryFilterInput,
-    CollectionFilterInput,
-    ProductFilterInput,
-    ProductTypeFilterInput,
-    ProductVariantFilterInput,
-)
-from .mutations.attributes import (
-    ProductAttributeAssign,
-    ProductAttributeUnassign,
-    ProductReorderAttributeValues,
-    ProductTypeReorderAttributes,
-    ProductVariantReorderAttributeValues,
-)
-from .mutations.channels import (
-    CollectionChannelListingUpdate,
-    ProductChannelListingUpdate,
-    ProductVariantChannelListingUpdate,
-)
-from .mutations.digital_contents import (
-    DigitalContentCreate,
-    DigitalContentDelete,
-    DigitalContentUpdate,
-    DigitalContentUrlCreate,
-)
-from .mutations.products import (
+from .dataloaders.products import CategoryByIdLoader, CategoryBySlugLoader
+from .filters.category import CategoryFilterInput, CategoryWhereInput
+from .filters.collection import CollectionFilterInput, CollectionWhereInput
+from .filters.product import ProductFilterInput, ProductWhereInput
+from .filters.product_type import ProductTypeFilterInput
+from .filters.product_variant import ProductVariantFilterInput, ProductVariantWhereInput
+from .mutations import (
     CategoryCreate,
     CategoryDelete,
     CategoryUpdate,
@@ -81,160 +82,270 @@ from .mutations.products import (
     ProductUpdate,
     ProductVariantCreate,
     ProductVariantDelete,
+    ProductVariantPreorderDeactivate,
     ProductVariantReorder,
     ProductVariantSetDefault,
     ProductVariantUpdate,
     VariantMediaAssign,
     VariantMediaUnassign,
 )
+from .mutations.attributes import (
+    ProductAttributeAssign,
+    ProductAttributeAssignmentUpdate,
+    ProductAttributeUnassign,
+    ProductReorderAttributeValues,
+    ProductTypeReorderAttributes,
+    ProductVariantReorderAttributeValues,
+)
+from .mutations.channels import (
+    CollectionChannelListingUpdate,
+    ProductChannelListingUpdate,
+    ProductVariantChannelListingUpdate,
+)
+from .mutations.digital_contents import (
+    DigitalContentCreate,
+    DigitalContentDelete,
+    DigitalContentUpdate,
+    DigitalContentUrlCreate,
+)
 from .resolvers import (
     resolve_categories,
-    resolve_category_by_id,
-    resolve_category_by_slug,
+    resolve_category_by_translated_slug,
     resolve_collection_by_id,
     resolve_collection_by_slug,
+    resolve_collection_by_translated_slug,
     resolve_collections,
     resolve_digital_content_by_id,
     resolve_digital_contents,
-    resolve_product_by_id,
-    resolve_product_by_slug,
+    resolve_product,
     resolve_product_type_by_id,
     resolve_product_types,
-    resolve_product_variant_by_sku,
     resolve_product_variants,
     resolve_products,
     resolve_report_product_sales,
-    resolve_variant_by_id,
+    resolve_variant,
 )
 from .sorters import (
     CategorySortingInput,
     CollectionSortingInput,
     ProductOrder,
     ProductTypeSortingInput,
+    ProductVariantSortingInput,
 )
 from .types import (
     Category,
+    CategoryCountableConnection,
     Collection,
+    CollectionCountableConnection,
     DigitalContent,
+    DigitalContentCountableConnection,
     Product,
+    ProductCountableConnection,
     ProductType,
+    ProductTypeCountableConnection,
     ProductVariant,
+    ProductVariantCountableConnection,
 )
+from .utils import check_for_sorting_by_rank
 
 
 class ProductQueries(graphene.ObjectType):
-    digital_content = graphene.Field(
+    digital_content = PermissionsField(
         DigitalContent,
         description="Look up digital content by ID.",
         id=graphene.Argument(
             graphene.ID, description="ID of the digital content.", required=True
         ),
+        permissions=[
+            ProductPermissions.MANAGE_PRODUCTS,
+        ],
+        doc_category=DOC_CATEGORY_PRODUCTS,
     )
-    digital_contents = PrefetchingConnectionField(
-        DigitalContent, description="List of digital content."
+    digital_contents = ConnectionField(
+        DigitalContentCountableConnection,
+        description="List of digital content.",
+        permissions=[
+            ProductPermissions.MANAGE_PRODUCTS,
+        ],
+        doc_category=DOC_CATEGORY_PRODUCTS,
     )
-    categories = FilterInputConnectionField(
-        Category,
+    categories = FilterConnectionField(
+        CategoryCountableConnection,
         filter=CategoryFilterInput(description="Filtering options for categories."),
+        where=CategoryWhereInput(description="Where filtering options for categories."),
         sort_by=CategorySortingInput(description="Sort categories."),
         level=graphene.Argument(
             graphene.Int,
             description="Filter categories by the nesting level in the category tree.",
         ),
         description="List of the shop's categories.",
+        doc_category=DOC_CATEGORY_PRODUCTS,
     )
-    category = graphene.Field(
+    category = BaseField(
         Category,
         id=graphene.Argument(graphene.ID, description="ID of the category."),
         slug=graphene.Argument(graphene.String, description="Slug of the category"),
+        slug_language_code=graphene.Argument(
+            LanguageCodeEnum,
+            description="Language code of the category slug, omit to use primary slug."
+            + ADDED_IN_321,
+        ),
         description="Look up a category by ID or slug.",
+        doc_category=DOC_CATEGORY_PRODUCTS,
     )
-    collection = graphene.Field(
+    collection = BaseField(
         Collection,
         id=graphene.Argument(
             graphene.ID,
             description="ID of the collection.",
         ),
-        slug=graphene.Argument(graphene.String, description="Slug of the category"),
+        slug=graphene.Argument(graphene.String, description="Slug of the collection"),
+        slug_language_code=graphene.Argument(
+            LanguageCodeEnum,
+            description="Language code of the collection slug, omit to use primary slug."
+            + ADDED_IN_321,
+        ),
         channel=graphene.String(
             description="Slug of a channel for which the data should be returned."
         ),
-        description="Look up a collection by ID.",
+        description=(
+            "Look up a collection by ID or slug. If slugLanguageCode is provided, "
+            "category will be fetched by slug translation. Requires one of the "
+            "following permissions to include the unpublished items: "
+            f"{', '.join([p.name for p in ALL_PRODUCTS_PERMISSIONS])}."
+        ),
+        doc_category=DOC_CATEGORY_PRODUCTS,
     )
-    collections = ChannelContextFilterConnectionField(
-        Collection,
+    collections = FilterConnectionField(
+        CollectionCountableConnection,
         filter=CollectionFilterInput(description="Filtering options for collections."),
+        where=CollectionWhereInput(
+            description="Where filtering options for collections."
+        ),
         sort_by=CollectionSortingInput(description="Sort collections."),
-        description="List of the shop's collections.",
+        description=(
+            "List of the shop's collections. Requires one of the following permissions "
+            "to include the unpublished items: "
+            f"{', '.join([p.name for p in ALL_PRODUCTS_PERMISSIONS])}."
+        ),
         channel=graphene.String(
             description="Slug of a channel for which the data should be returned."
         ),
+        doc_category=DOC_CATEGORY_PRODUCTS,
     )
-    product = graphene.Field(
+    product = BaseField(
         Product,
         id=graphene.Argument(
             graphene.ID,
             description="ID of the product.",
         ),
         slug=graphene.Argument(graphene.String, description="Slug of the product."),
+        slug_language_code=graphene.Argument(
+            LanguageCodeEnum,
+            description="Language code of the product slug, omit to use primary slug."
+            + ADDED_IN_321,
+        ),
+        external_reference=graphene.Argument(
+            graphene.String, description="External ID of the product."
+        ),
         channel=graphene.String(
             description="Slug of a channel for which the data should be returned."
         ),
-        description="Look up a product by ID.",
+        description=(
+            "Look up a product by ID. Requires one of the following permissions to "
+            "include the unpublished items: "
+            f"{', '.join([p.name for p in ALL_PRODUCTS_PERMISSIONS])}."
+        ),
+        doc_category=DOC_CATEGORY_PRODUCTS,
     )
-    products = ChannelContextFilterConnectionField(
-        Product,
-        filter=ProductFilterInput(description="Filtering options for products."),
+    products = FilterConnectionField(
+        ProductCountableConnection,
+        filter=ProductFilterInput(
+            description=(
+                f"Filtering options for products. {DEPRECATED_IN_3X_INPUT}"
+                " Use `where` filter instead."
+            )
+        ),
+        where=ProductWhereInput(description="Where filtering options for products."),
         sort_by=ProductOrder(description="Sort products."),
+        search=graphene.String(description="Search products."),
         channel=graphene.String(
             description="Slug of a channel for which the data should be returned."
         ),
-        description="List of the shop's products.",
+        description=(
+            "List of the shop's products. Requires one of the following permissions to "
+            "include the unpublished items: "
+            f"{', '.join([p.name for p in ALL_PRODUCTS_PERMISSIONS])}."
+        ),
+        doc_category=DOC_CATEGORY_PRODUCTS,
     )
-    product_type = graphene.Field(
+    product_type = BaseField(
         ProductType,
         id=graphene.Argument(
             graphene.ID, description="ID of the product type.", required=True
         ),
         description="Look up a product type by ID.",
+        doc_category=DOC_CATEGORY_PRODUCTS,
     )
-    product_types = FilterInputConnectionField(
-        ProductType,
+    product_types = FilterConnectionField(
+        ProductTypeCountableConnection,
         filter=ProductTypeFilterInput(
             description="Filtering options for product types."
         ),
         sort_by=ProductTypeSortingInput(description="Sort product types."),
         description="List of the shop's product types.",
+        doc_category=DOC_CATEGORY_PRODUCTS,
     )
-    product_variant = graphene.Field(
+    product_variant = BaseField(
         ProductVariant,
         id=graphene.Argument(
             graphene.ID,
             description="ID of the product variant.",
         ),
         sku=graphene.Argument(
-            graphene.String, description="Sku of the product variant."
+            graphene.String, description="SKU of the product variant."
+        ),
+        external_reference=graphene.Argument(
+            graphene.String, description="External ID of the product."
         ),
         channel=graphene.String(
             description="Slug of a channel for which the data should be returned."
         ),
-        description="Look up a product variant by ID or SKU.",
+        description=(
+            "Look up a product variant by ID or SKU. Requires one of the following "
+            "permissions to include the unpublished items: "
+            f"{', '.join([p.name for p in ALL_PRODUCTS_PERMISSIONS])}."
+        ),
+        doc_category=DOC_CATEGORY_PRODUCTS,
     )
-    product_variants = ChannelContextFilterConnectionField(
-        ProductVariant,
-        ids=graphene.List(
+    product_variants = FilterConnectionField(
+        ProductVariantCountableConnection,
+        ids=NonNullList(
             graphene.ID, description="Filter product variants by given IDs."
         ),
         channel=graphene.String(
             description="Slug of a channel for which the data should be returned."
         ),
         filter=ProductVariantFilterInput(
-            description="Filtering options for product variant."
+            description=(
+                f"Filtering options for product variants. {DEPRECATED_IN_3X_INPUT}"
+                " Use `where` filter instead."
+            )
         ),
-        description="List of product variants.",
+        where=ProductVariantWhereInput(
+            description="Where filtering options for product variants."
+        ),
+        search=graphene.String(description="Search product variants." + ADDED_IN_322),
+        sort_by=ProductVariantSortingInput(description="Sort products variants."),
+        description=(
+            "List of product variants. Requires one of the following permissions to "
+            "include the unpublished items: "
+            f"{', '.join([p.name for p in ALL_PRODUCTS_PERMISSIONS])}."
+        ),
+        doc_category=DOC_CATEGORY_PRODUCTS,
     )
-    report_product_sales = ChannelContextFilterConnectionField(
-        ProductVariant,
+    report_product_sales = ConnectionField(
+        ProductVariantCountableConnection,
         period=graphene.Argument(
             ReportingPeriod, required=True, description="Span of time."
         ),
@@ -243,143 +354,333 @@ class ProductQueries(graphene.ObjectType):
             required=True,
         ),
         description="List of top selling products.",
+        permissions=[
+            ProductPermissions.MANAGE_PRODUCTS,
+        ],
+        doc_category=DOC_CATEGORY_PRODUCTS,
+        deprecation_reason=DEFAULT_DEPRECATION_REASON,
     )
 
-    def resolve_categories(self, info, level=None, **kwargs):
-        return resolve_categories(info, level=level, **kwargs)
+    @staticmethod
+    def resolve_categories(_root, info: ResolveInfo, *, level=None, **kwargs):
+        qs = resolve_categories(info, level=level)
+        qs = filter_connection_queryset(
+            qs, kwargs, allow_replica=info.context.allow_replica
+        )
+        return create_connection_slice(qs, info, kwargs, CategoryCountableConnection)
 
-    @traced_resolver
-    def resolve_category(self, info, id=None, slug=None, **kwargs):
+    @staticmethod
+    def resolve_category(
+        _root,
+        info: ResolveInfo,
+        *,
+        id=None,
+        slug=None,
+        slug_language_code=None,
+        **kwargs,
+    ) -> Promise[Category] | None | Category:
         validate_one_of_args_is_in_query("id", id, "slug", slug)
         if id:
             _, id = from_global_id_or_error(id, Category)
-            return resolve_category_by_id(id)
+            # FIXME: we should raise an error above
+            if id is not None:
+                return CategoryByIdLoader(info.context).load(int(id))
+            return None
         if slug:
-            return resolve_category_by_slug(slug=slug)
+            if slug_language_code:
+                return resolve_category_by_translated_slug(
+                    info, slug, slug_language_code
+                )
+            return CategoryBySlugLoader(info.context).load(slug)
+        return None
 
+    @staticmethod
     @traced_resolver
-    def resolve_collection(self, info, id=None, slug=None, channel=None, **_kwargs):
+    def resolve_collection(
+        _root,
+        info: ResolveInfo,
+        *,
+        id=None,
+        slug=None,
+        channel=None,
+        slug_language_code=None,
+    ):
         validate_one_of_args_is_in_query("id", id, "slug", slug)
         requestor = get_user_or_app_from_context(info.context)
 
-        is_staff = requestor_is_staff_member_or_app(requestor)
-        if channel is None and not is_staff:
-            channel = get_default_channel_slug_or_graphql_error()
+        has_required_permissions = has_one_of_permissions(
+            requestor, ALL_PRODUCTS_PERMISSIONS
+        )
+
+        if channel is None and not has_required_permissions:
+            channel = get_default_channel_slug_or_graphql_error(
+                allow_replica=info.context.allow_replica
+            )
         if id:
             _, id = from_global_id_or_error(id, Collection)
             collection = resolve_collection_by_id(info, id, channel, requestor)
         else:
-            collection = resolve_collection_by_slug(
-                info, slug=slug, channel_slug=channel, requestor=requestor
-            )
+            if slug_language_code is None:
+                collection = resolve_collection_by_slug(
+                    info, slug=slug, channel_slug=channel, requestor=requestor
+                )
+            else:
+                collection = resolve_collection_by_translated_slug(
+                    info,
+                    slug=slug,
+                    channel_slug=channel,
+                    slug_language_code=slug_language_code,
+                    requestor=requestor,
+                )
         return (
             ChannelContext(node=collection, channel_slug=channel)
             if collection
             else None
         )
 
-    def resolve_collections(self, info, channel=None, *_args, **_kwargs):
+    @staticmethod
+    def resolve_collections(_root, info: ResolveInfo, *, channel=None, **kwargs):
         requestor = get_user_or_app_from_context(info.context)
-        is_staff = requestor_is_staff_member_or_app(requestor)
-        if channel is None and not is_staff:
-            channel = get_default_channel_slug_or_graphql_error()
-        return resolve_collections(info, channel)
+        has_required_permissions = has_one_of_permissions(
+            requestor, ALL_PRODUCTS_PERMISSIONS
+        )
+        if channel is None and not has_required_permissions:
+            channel = get_default_channel_slug_or_graphql_error(
+                allow_replica=info.context.allow_replica
+            )
+        qs = resolve_collections(info, channel)
+        kwargs["channel"] = channel
+        qs = filter_connection_queryset(
+            qs, kwargs, allow_replica=info.context.allow_replica
+        )
+        return create_connection_slice(qs, info, kwargs, CollectionCountableConnection)
 
-    @permission_required(ProductPermissions.MANAGE_PRODUCTS)
-    def resolve_digital_content(self, info, id):
+    @staticmethod
+    def resolve_digital_content(_root, info: ResolveInfo, *, id):
         _, id = from_global_id_or_error(id, DigitalContent)
-        return resolve_digital_content_by_id(id)
+        return resolve_digital_content_by_id(info, id)
 
-    @permission_required(ProductPermissions.MANAGE_PRODUCTS)
-    def resolve_digital_contents(self, info, **_kwargs):
-        return resolve_digital_contents(info)
-
-    @traced_resolver
-    def resolve_product(self, info, id=None, slug=None, channel=None, **_kwargs):
-        validate_one_of_args_is_in_query("id", id, "slug", slug)
-        requestor = get_user_or_app_from_context(info.context)
-        is_staff = requestor_is_staff_member_or_app(requestor)
-
-        if channel is None and not is_staff:
-            channel = get_default_channel_slug_or_graphql_error()
-        if id:
-            _type, id = from_global_id_or_error(id, Product)
-            product = resolve_product_by_id(
-                info, id, channel_slug=channel, requestor=requestor
-            )
-        else:
-            product = resolve_product_by_slug(
-                info, product_slug=slug, channel_slug=channel, requestor=requestor
-            )
-        return ChannelContext(node=product, channel_slug=channel) if product else None
-
-    @traced_resolver
-    def resolve_products(self, info, channel=None, **kwargs):
-        requestor = get_user_or_app_from_context(info.context)
-        if channel is None and not requestor_is_staff_member_or_app(requestor):
-            channel = get_default_channel_slug_or_graphql_error()
-        return resolve_products(info, requestor, channel_slug=channel, **kwargs)
-
-    def resolve_product_type(self, info, id, **_kwargs):
-        _, id = from_global_id_or_error(id, ProductType)
-        return resolve_product_type_by_id(id)
-
-    def resolve_product_types(self, info, **kwargs):
-        return resolve_product_types(info, **kwargs)
-
-    @traced_resolver
-    def resolve_product_variant(
-        self,
-        info,
-        id=None,
-        sku=None,
-        channel=None,
-    ):
-        validate_one_of_args_is_in_query("id", id, "sku", sku)
-        requestor = get_user_or_app_from_context(info.context)
-        is_staff = requestor_is_staff_member_or_app(requestor)
-        if channel is None and not is_staff:
-            channel = get_default_channel_slug_or_graphql_error()
-        if id:
-            _, id = from_global_id_or_error(id, ProductVariant)
-            variant = resolve_variant_by_id(
-                info,
-                id,
-                channel_slug=channel,
-                requestor=requestor,
-                requestor_has_access_to_all=is_staff,
-            )
-        else:
-            variant = resolve_product_variant_by_sku(
-                info,
-                sku=sku,
-                channel_slug=channel,
-                requestor=requestor,
-                requestor_has_access_to_all=is_staff,
-            )
-        return ChannelContext(node=variant, channel_slug=channel) if variant else None
-
-    def resolve_product_variants(self, info, ids=None, channel=None, **_kwargs):
-        requestor = get_user_or_app_from_context(info.context)
-        is_staff = requestor_is_staff_member_or_app(requestor)
-        if channel is None and not is_staff:
-            channel = get_default_channel_slug_or_graphql_error()
-        return resolve_product_variants(
-            info,
-            ids=ids,
-            channel_slug=channel,
-            requestor_has_access_to_all=is_staff,
-            requestor=requestor,
+    @staticmethod
+    def resolve_digital_contents(_root, info: ResolveInfo, **kwargs):
+        qs = resolve_digital_contents(info)
+        return create_connection_slice(
+            qs, info, kwargs, DigitalContentCountableConnection
         )
 
-    @permission_required(ProductPermissions.MANAGE_PRODUCTS)
+    @staticmethod
     @traced_resolver
-    def resolve_report_product_sales(self, *_args, period, channel, **_kwargs):
-        return resolve_report_product_sales(period, channel_slug=channel)
+    def resolve_product(
+        _root,
+        info: ResolveInfo,
+        *,
+        id=None,
+        slug=None,
+        slug_language_code=None,
+        external_reference=None,
+        channel=None,
+    ):
+        validate_one_of_args_is_in_query(
+            "id", id, "slug", slug, "external_reference", external_reference
+        )
+        requestor = get_user_or_app_from_context(info.context)
+
+        has_required_permissions = has_one_of_permissions(
+            requestor, ALL_PRODUCTS_PERMISSIONS
+        )
+
+        limited_channel_access = False if channel is None else True
+        if channel is None and not has_required_permissions:
+            channel = get_default_channel_slug_or_graphql_error(
+                allow_replica=info.context.allow_replica
+            )
+
+        def _resolve_product(channel_obj):
+            product = resolve_product(
+                info,
+                id=id,
+                slug=slug,
+                slug_language_code=slug_language_code,
+                external_reference=external_reference,
+                channel=channel_obj,
+                limited_channel_access=limited_channel_access,
+                requestor=requestor,
+            )
+
+            return (
+                ChannelContext(node=product, channel_slug=channel) if product else None
+            )
+
+        if channel:
+            return (
+                ChannelBySlugLoader(info.context)
+                .load(str(channel))
+                .then(_resolve_product)
+            )
+        return _resolve_product(None)
+
+    @staticmethod
+    @traced_resolver
+    def resolve_products(_root, info: ResolveInfo, *, channel=None, **kwargs):
+        check_for_sorting_by_rank(info, kwargs)
+        search = kwargs.get("search")
+
+        requestor = get_user_or_app_from_context(info.context)
+        has_required_permissions = has_one_of_permissions(
+            requestor, ALL_PRODUCTS_PERMISSIONS
+        )
+        limited_channel_access = False if channel is None else True
+        if channel is None and not has_required_permissions:
+            channel = get_default_channel_slug_or_graphql_error(
+                allow_replica=info.context.allow_replica
+            )
+
+        def _resolve_products(channel_obj):
+            qs = resolve_products(info, requestor, channel_obj, limited_channel_access)
+            if search:
+                qs = ChannelQsContext(
+                    qs=search_products(qs.qs, search), channel_slug=channel
+                )
+            kwargs["channel"] = channel
+            qs = filter_connection_queryset(
+                qs, kwargs, allow_replica=info.context.allow_replica
+            )
+            return create_connection_slice(qs, info, kwargs, ProductCountableConnection)
+
+        if channel:
+            return (
+                ChannelBySlugLoader(info.context)
+                .load(str(channel))
+                .then(_resolve_products)
+            )
+        return _resolve_products(None)
+
+    @staticmethod
+    def resolve_product_type(_root, info: ResolveInfo, *, id):
+        _, id = from_global_id_or_error(id, ProductType)
+        return resolve_product_type_by_id(info, id)
+
+    @staticmethod
+    def resolve_product_types(_root, info: ResolveInfo, **kwargs):
+        qs = resolve_product_types(info)
+        qs = filter_connection_queryset(
+            qs, kwargs, allow_replica=info.context.allow_replica
+        )
+        return create_connection_slice(qs, info, kwargs, ProductTypeCountableConnection)
+
+    @staticmethod
+    @traced_resolver
+    def resolve_product_variant(
+        _root,
+        info: ResolveInfo,
+        *,
+        id=None,
+        sku=None,
+        external_reference=None,
+        channel=None,
+    ):
+        validate_one_of_args_is_in_query(
+            "id", id, "sku", sku, "external_reference", external_reference
+        )
+        requestor = get_user_or_app_from_context(info.context)
+        has_required_permissions = has_one_of_permissions(
+            requestor, ALL_PRODUCTS_PERMISSIONS
+        )
+
+        limited_channel_access = False if channel is None else True
+        if channel is None and not has_required_permissions:
+            channel = get_default_channel_slug_or_graphql_error(
+                allow_replica=info.context.allow_replica
+            )
+
+        def _resolve_product_variant(channel_obj):
+            variant = resolve_variant(
+                info,
+                id,
+                sku,
+                external_reference,
+                channel=channel_obj,
+                limited_channel_access=limited_channel_access,
+                requestor=requestor,
+                requestor_has_access_to_all=has_required_permissions,
+            )
+            return (
+                ChannelContext(node=variant, channel_slug=channel) if variant else None
+            )
+
+        if channel:
+            return (
+                ChannelBySlugLoader(info.context)
+                .load(str(channel))
+                .then(_resolve_product_variant)
+            )
+        return _resolve_product_variant(None)
+
+    @staticmethod
+    def resolve_product_variants(
+        _root, info: ResolveInfo, *, ids=None, channel=None, **kwargs
+    ):
+        requestor = get_user_or_app_from_context(info.context)
+        has_required_permissions = has_one_of_permissions(
+            requestor, ALL_PRODUCTS_PERMISSIONS
+        )
+        limited_channel_access = False if channel is None else True
+        if channel is None and not has_required_permissions:
+            channel = get_default_channel_slug_or_graphql_error(
+                allow_replica=info.context.allow_replica
+            )
+
+        search = kwargs.get("search")
+
+        def _resolve_product_variants(channel_obj):
+            qs = resolve_product_variants(
+                info,
+                ids=ids,
+                channel=channel_obj,
+                limited_channel_access=limited_channel_access,
+                requestor=requestor,
+            )
+            if search:
+                products = search_products(
+                    models.Product.objects.using(
+                        get_database_connection_name(info.context)
+                    ),
+                    search,
+                )
+                variant_qs = qs.qs.filter(
+                    Exists(products.filter(id=OuterRef("product_id")))
+                )
+                qs = ChannelQsContext(qs=variant_qs, channel_slug=qs.channel_slug)
+            kwargs["channel"] = qs.channel_slug
+            qs = filter_connection_queryset(
+                qs, kwargs, allow_replica=info.context.allow_replica
+            )
+            return create_connection_slice(
+                qs, info, kwargs, ProductVariantCountableConnection
+            )
+
+        if channel:
+            return (
+                ChannelBySlugLoader(info.context)
+                .load(str(channel))
+                .then(_resolve_product_variants)
+            )
+        return _resolve_product_variants(None)
+
+    @staticmethod
+    @traced_resolver
+    def resolve_report_product_sales(
+        _root, info: ResolveInfo, *, period, channel, **kwargs
+    ):
+        qs = resolve_report_product_sales(info, period, channel_slug=channel)
+        kwargs["channel"] = qs.channel_slug
+        return create_connection_slice(
+            qs, info, kwargs, ProductVariantCountableConnection
+        )
 
 
 class ProductMutations(graphene.ObjectType):
     product_attribute_assign = ProductAttributeAssign.Field()
+    product_attribute_assignment_update = ProductAttributeAssignmentUpdate.Field()
     product_attribute_unassign = ProductAttributeUnassign.Field()
 
     category_create = CategoryCreate.Field()
@@ -400,8 +701,10 @@ class ProductMutations(graphene.ObjectType):
 
     product_create = ProductCreate.Field()
     product_delete = ProductDelete.Field()
+    product_bulk_create = ProductBulkCreate.Field()
     product_bulk_delete = ProductBulkDelete.Field()
     product_update = ProductUpdate.Field()
+    product_bulk_translate = ProductBulkTranslate.Field()
     product_translate = ProductTranslate.Field()
 
     product_channel_listing_update = ProductChannelListingUpdate.Field()
@@ -429,6 +732,7 @@ class ProductMutations(graphene.ObjectType):
     product_variant_create = ProductVariantCreate.Field()
     product_variant_delete = ProductVariantDelete.Field()
     product_variant_bulk_create = ProductVariantBulkCreate.Field()
+    product_variant_bulk_update = ProductVariantBulkUpdate.Field()
     product_variant_bulk_delete = ProductVariantBulkDelete.Field()
     product_variant_stocks_create = ProductVariantStocksCreate.Field()
     product_variant_stocks_delete = ProductVariantStocksDelete.Field()
@@ -436,10 +740,12 @@ class ProductMutations(graphene.ObjectType):
     product_variant_update = ProductVariantUpdate.Field()
     product_variant_set_default = ProductVariantSetDefault.Field()
     product_variant_translate = ProductVariantTranslate.Field()
+    product_variant_bulk_translate = ProductVariantBulkTranslate.Field()
     product_variant_channel_listing_update = ProductVariantChannelListingUpdate.Field()
     product_variant_reorder_attribute_values = (
         ProductVariantReorderAttributeValues.Field()
     )
+    product_variant_preorder_deactivate = ProductVariantPreorderDeactivate.Field()
 
     variant_media_assign = VariantMediaAssign.Field()
     variant_media_unassign = VariantMediaUnassign.Field()

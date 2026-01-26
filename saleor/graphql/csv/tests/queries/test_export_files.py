@@ -2,7 +2,6 @@ import datetime
 
 import graphene
 import pytest
-from django.utils import timezone
 
 from .....account.models import User
 from .....app.models import App
@@ -57,7 +56,7 @@ SORT_EXPORT_FILES_QUERY = """
 
 
 @pytest.mark.parametrize(
-    "status_filter, count",
+    ("status_filter", "count"),
     [
         ({"status": JobStatus.SUCCESS.upper()}, 2),
         ({"status": JobStatus.PENDING.upper()}, 2),
@@ -87,10 +86,10 @@ def test_filter_export_files_by_status(
 
 
 @pytest.mark.parametrize(
-    "created_at_filter, count",
+    ("created_at_filter", "count"),
     [
         ({"createdAt": {"gte": "2019-04-10T00:00:00+00:00"}}, 3),
-        ({"createdAt": {"lte": "2019-04-10T00:00:00+00:00"}}, 2),
+        ({"createdAt": {"lte": "2019-04-10T00:00:00+00:00"}}, 4),
     ],
 )
 def test_filter_export_files_by_created_at_date(
@@ -116,10 +115,10 @@ def test_filter_export_files_by_created_at_date(
 
 
 @pytest.mark.parametrize(
-    "ended_at_filter, count",
+    ("ended_at_filter", "count"),
     [
         ({"updatedAt": {"gte": "2019-04-18T00:00:00+00:00"}}, 3),
-        ({"updatedAt": {"lte": "2019-04-18T00:00:00+00:00"}}, 2),
+        ({"updatedAt": {"lte": "2019-04-18T00:00:00+00:00"}}, 4),
     ],
 )
 def test_filter_export_files_by_ended_at_date(
@@ -245,16 +244,16 @@ def test_sort_export_files_query_by_created_at_date(
     )
 
 
+@pytest.mark.parametrize("sort_by", ["UPDATED_AT", "LAST_MODIFIED_AT"])
 def test_sort_export_files_query_by_updated_at_date(
+    sort_by,
     staff_api_client,
     user_export_file,
     permission_manage_products,
     permission_manage_apps,
     staff_user,
 ):
-    user_export_file.updated_at = datetime.datetime(
-        2010, 2, 19, tzinfo=timezone.get_current_timezone()
-    )
+    user_export_file.updated_at = datetime.datetime(2010, 2, 19, tzinfo=datetime.UTC)
     user_export_file.save()
 
     second_export_file = ExportFile.objects.create(user=staff_user)
@@ -264,7 +263,7 @@ def test_sort_export_files_query_by_updated_at_date(
     second_export_file.save()
 
     query = SORT_EXPORT_FILES_QUERY
-    variables = {"sortBy": {"field": "UPDATED_AT", "direction": "ASC"}}
+    variables = {"sortBy": {"field": sort_by, "direction": "ASC"}}
 
     response = staff_api_client.post_graphql(
         query,

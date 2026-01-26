@@ -1,120 +1,51 @@
 import datetime
-import uuid
 from contextlib import contextmanager
-from decimal import Decimal
 from functools import partial
 from io import BytesIO
-from typing import List, Optional
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock
 
 import graphene
 import pytest
-import pytz
 from django.conf import settings
-from django.contrib.auth.models import Group, Permission
-from django.contrib.sites.models import Site
-from django.core.files import File
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import connection
-from django.forms import ModelForm
-from django.template.defaultfilters import truncatechars
 from django.test.utils import CaptureQueriesContext as BaseCaptureQueriesContext
-from django.utils import timezone
-from django_countries import countries
+from freezegun import freeze_time
 from PIL import Image
-from prices import Money, TaxedMoney, fixed_discount
 
-from ..account.models import Address, StaffNotificationRecipient, User
-from ..app.models import App, AppInstallation
-from ..app.types import AppType
-from ..attribute import AttributeEntityType, AttributeInputType, AttributeType
-from ..attribute.models import (
-    Attribute,
-    AttributeTranslation,
-    AttributeValue,
-    AttributeValueTranslation,
-)
-from ..attribute.utils import associate_attribute_values_to_instance
-from ..checkout.fetch import fetch_checkout_info
-from ..checkout.models import Checkout
-from ..checkout.utils import add_variant_to_checkout
-from ..core import JobStatus, TimePeriodType
+from ..account.models import Address, Group, StaffNotificationRecipient
+from ..core import JobStatus
+from ..core.models import EventDelivery, EventDeliveryAttempt, EventPayload
 from ..core.payments import PaymentInterface
-from ..core.units import MeasurementUnits
-from ..core.utils.editorjs import clean_editor_js
+from ..core.telemetry import initialize_telemetry, meter, tracer
 from ..csv.events import ExportEvents
 from ..csv.models import ExportEvent, ExportFile
-from ..discount import DiscountInfo, DiscountValueType, VoucherType
+from ..discount import PromotionEvents
 from ..discount.models import (
-    Sale,
-    SaleChannelListing,
-    SaleTranslation,
-    Voucher,
-    VoucherChannelListing,
-    VoucherCustomer,
+    PromotionEvent,
+    PromotionRuleTranslation,
+    PromotionTranslation,
     VoucherTranslation,
 )
-from ..giftcard import GiftCardEvents, GiftCardExpiryType
-from ..giftcard.models import GiftCard, GiftCardEvent
-from ..menu.models import Menu, MenuItem, MenuItemTranslation
-from ..order import OrderLineData, OrderOrigin, OrderStatus
-from ..order.actions import cancel_fulfillment, fulfill_order_lines
-from ..order.events import (
-    OrderEvents,
-    fulfillment_refunded_event,
-    order_added_products_event,
-)
-from ..order.models import FulfillmentStatus, Order, OrderEvent, OrderLine
-from ..order.utils import recalculate_order
-from ..page.models import Page, PageTranslation, PageType
-from ..payment import ChargeStatus, TransactionKind
-from ..payment.interface import GatewayConfig, PaymentData
-from ..payment.models import Payment
-from ..plugins.manager import get_plugins_manager
-from ..plugins.models import PluginConfiguration
-from ..plugins.vatlayer.plugin import VatlayerPlugin
-from ..plugins.webhook.utils import to_payment_app_id
-from ..product import ProductMediaTypes
+from ..payment.interface import AddressData
+from ..permission.enums import get_permissions
 from ..product.models import (
-    Category,
     CategoryTranslation,
-    Collection,
-    CollectionChannelListing,
     CollectionTranslation,
-    DigitalContent,
-    DigitalContentUrl,
-    Product,
-    ProductChannelListing,
-    ProductMedia,
     ProductTranslation,
-    ProductType,
-    ProductVariant,
-    ProductVariantChannelListing,
     ProductVariantTranslation,
-    VariantMedia,
 )
-from ..product.tests.utils import create_image
-from ..shipping.models import (
-    ShippingMethod,
-    ShippingMethodChannelListing,
-    ShippingMethodTranslation,
-    ShippingMethodType,
-    ShippingZone,
-)
-from ..site.models import SiteSettings
-from ..warehouse.models import Allocation, Stock, Warehouse
-from ..webhook.event_types import WebhookEventType
-from ..webhook.models import Webhook, WebhookEvent
-from ..wishlist.models import Wishlist
+from ..tax import TaxCalculationStrategy
+from ..webhook.event_types import WebhookEventAsyncType
+from ..webhook.transport.utils import to_payment_app_id
 from .utils import dummy_editorjs
 
 
 class CaptureQueriesContext(BaseCaptureQueriesContext):
-    IGNORED_QUERIES = settings.PATTERNS_IGNORED_IN_QUERY_CAPTURES  # type: ignore
+    IGNORED_QUERIES = settings.PATTERNS_IGNORED_IN_QUERY_CAPTURES  # type: ignore[misc]
 
     @property
     def captured_queries(self):
-        # flake8: noqa
         base_queries = self.connection.queries[
             self.initial_queries : self.final_queries
         ]
@@ -135,9 +66,7 @@ class CaptureQueriesContext(BaseCaptureQueriesContext):
 
 
 def _assert_num_queries(context, *, config, num, exact=True, info=None):
-    """
-    Extracted from pytest_django.fixtures._assert_num_queries
-    """
+    # Extracted from pytest_django.fixtures._assert_num_queries
     yield context
 
     verbose = config.getoption("verbose") > 0
@@ -154,18 +83,60 @@ def _assert_num_queries(context, *, config, num, exact=True, info=None):
     msg = "Expected to perform {} queries {}{}".format(
         num,
         "" if exact else "or less ",
-        "but {} done".format(
-            num_performed == 1 and "1 was" or "%d were" % (num_performed,)
-        ),
+        "but {} done".format(num_performed == 1 and "1 was" or f"{num_performed} were"),
     )
     if info:
-        msg += "\n{}".format(info)
+        msg += f"\n{info}"
     if verbose:
         sqls = (q["sql"] for q in context.captured_queries)
-        msg += "\n\nQueries:\n========\n\n%s" % "\n\n".join(sqls)
+        msg += "\n\nQueries:\n========\n\n{}".format("\n\n".join(sqls))
     else:
         msg += " (add -v option to show queries)"
     pytest.fail(msg)
+
+
+@pytest.fixture(scope="session")
+def initialize_test_telemetry():
+    initialize_telemetry()
+
+
+@pytest.fixture
+def trace_context_propagation(initialize_test_telemetry):
+    tracer._tracer._inject_context = True
+    yield
+    tracer._tracer._inject_context = False
+
+
+@pytest.fixture
+def get_test_spans(initialize_test_telemetry):
+    # Clear any existing spans from the buffer before test execution
+    tracer._tracer.span_exporter.clear()
+    yield tracer._tracer.span_exporter.get_finished_spans
+    # Clean up by clearing the buffer after test completion
+    tracer._tracer.span_exporter.clear()
+
+
+@pytest.fixture
+def get_test_metrics_data(initialize_test_telemetry):
+    # Clear any existing metrics data from the buffer before test execution
+    meter._meter.metric_reader.get_metrics_data()
+    yield meter._meter.metric_reader.get_metrics_data
+    # Clean up by clearing the buffer after test completion
+    meter._meter.metric_reader.get_metrics_data()
+
+
+@pytest.fixture(autouse=True)
+def clear_telemetry_data(initialize_test_telemetry):
+    """Clear telemetry data after each test.
+
+    Tests may execute code that produces metrics and/or traces. In our test suite
+    in-memory metric reader and in-memory span exporter are used. If they're not flushed
+    regularly we may end up with substantial amount of data stored in memory for no
+    reason.
+    """
+    yield
+    meter._meter.metric_reader.get_metrics_data()
+    tracer._tracer.span_exporter.clear()
 
 
 @pytest.fixture
@@ -173,9 +144,7 @@ def capture_queries(pytestconfig):
     cfg = pytestconfig
 
     @contextmanager
-    def _capture_queries(
-        num: Optional[int] = None, msg: Optional[str] = None, exact=False
-    ):
+    def _capture_queries(num: int | None = None, msg: str | None = None, exact=False):
         with CaptureQueriesContext(connection) as ctx:
             yield ctx
             if num is not None:
@@ -195,271 +164,6 @@ def assert_max_num_queries(capture_queries):
 
 
 @pytest.fixture
-def setup_vatlayer(settings, channel_USD):
-    settings.PLUGINS = ["saleor.plugins.vatlayer.plugin.VatlayerPlugin"]
-    data = {
-        "active": True,
-        "channel": channel_USD,
-        "configuration": [
-            {"name": "Access key", "value": "vatlayer_access_key"},
-        ],
-    }
-    PluginConfiguration.objects.create(identifier=VatlayerPlugin.PLUGIN_ID, **data)
-    return settings
-
-
-@pytest.fixture(autouse=True)
-def setup_dummy_gateways(settings):
-    settings.PLUGINS = [
-        "saleor.payment.gateways.dummy.plugin.DummyGatewayPlugin",
-        "saleor.payment.gateways.dummy_credit_card.plugin.DummyCreditCardGatewayPlugin",
-    ]
-    return settings
-
-
-@pytest.fixture
-def sample_gateway(settings):
-    settings.PLUGINS += [
-        "saleor.plugins.tests.sample_plugins.ActiveDummyPaymentGateway"
-    ]
-
-
-@pytest.fixture(autouse=True)
-def site_settings(db, settings) -> SiteSettings:
-    """Create a site and matching site settings.
-
-    This fixture is autouse because django.contrib.sites.models.Site and
-    saleor.site.models.SiteSettings have a one-to-one relationship and a site
-    should never exist without a matching settings object.
-    """
-    site = Site.objects.get_or_create(name="mirumee.com", domain="mirumee.com")[0]
-    obj = SiteSettings.objects.get_or_create(
-        site=site,
-        default_mail_sender_name="Mirumee Labs",
-        default_mail_sender_address="mirumee@example.com",
-    )[0]
-    settings.SITE_ID = site.pk
-
-    main_menu = Menu.objects.get_or_create(
-        name=settings.DEFAULT_MENUS["top_menu_name"],
-        slug=settings.DEFAULT_MENUS["top_menu_name"],
-    )[0]
-    secondary_menu = Menu.objects.get_or_create(
-        name=settings.DEFAULT_MENUS["bottom_menu_name"],
-        slug=settings.DEFAULT_MENUS["bottom_menu_name"],
-    )[0]
-    obj.top_menu = main_menu
-    obj.bottom_menu = secondary_menu
-    obj.save()
-    return obj
-
-
-@pytest.fixture
-def checkout(db, channel_USD):
-    checkout = Checkout.objects.create(
-        currency=channel_USD.currency_code, channel=channel_USD
-    )
-    checkout.set_country("US", commit=True)
-    return checkout
-
-
-@pytest.fixture
-def checkout_with_item(checkout, product):
-    variant = product.variants.get()
-    checkout_info = fetch_checkout_info(checkout, [], [], get_plugins_manager())
-    add_variant_to_checkout(checkout_info, variant, 3)
-    checkout.save()
-    return checkout
-
-
-@pytest.fixture
-def checkouts_list(channel_USD, channel_PLN):
-    checkouts_usd = Checkout.objects.bulk_create(
-        [
-            Checkout(currency=channel_USD.currency_code, channel=channel_USD),
-            Checkout(currency=channel_USD.currency_code, channel=channel_USD),
-            Checkout(currency=channel_USD.currency_code, channel=channel_USD),
-        ]
-    )
-    checkouts_pln = Checkout.objects.bulk_create(
-        [
-            Checkout(currency=channel_PLN.currency_code, channel=channel_PLN),
-            Checkout(currency=channel_PLN.currency_code, channel=channel_PLN),
-        ]
-    )
-    return [*checkouts_pln, *checkouts_usd]
-
-
-@pytest.fixture
-def checkouts_assigned_to_customer(channel_USD, channel_PLN, customer_user):
-    return Checkout.objects.bulk_create(
-        [
-            Checkout(
-                currency=channel_USD.currency_code,
-                channel=channel_USD,
-                user=customer_user,
-            ),
-            Checkout(
-                currency=channel_PLN.currency_code,
-                channel=channel_PLN,
-                user=customer_user,
-            ),
-        ]
-    )
-
-
-@pytest.fixture
-def checkout_ready_to_complete(checkout_with_item, address, shipping_method, gift_card):
-    checkout = checkout_with_item
-    checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
-    checkout.billing_address = address
-    checkout.store_value_in_metadata(items={"accepted": "true"})
-    checkout.store_value_in_private_metadata(items={"accepted": "false"})
-    checkout_with_item.gift_cards.add(gift_card)
-    checkout.save()
-    return checkout
-
-
-@pytest.fixture
-def checkout_with_digital_item(checkout, digital_content):
-    """Create a checkout with a digital line."""
-    variant = digital_content.product_variant
-    checkout_info = fetch_checkout_info(checkout, [], [], get_plugins_manager())
-    add_variant_to_checkout(checkout_info, variant, 1)
-    checkout.email = "customer@example.com"
-    checkout.save()
-    return checkout
-
-
-@pytest.fixture
-def checkout_with_shipping_required(checkout_with_item, product):
-    checkout = checkout_with_item
-    variant = product.variants.get()
-    checkout_info = fetch_checkout_info(checkout, [], [], get_plugins_manager())
-    add_variant_to_checkout(checkout_info, variant, 3)
-    checkout.save()
-    return checkout
-
-
-@pytest.fixture
-def other_shipping_method(shipping_zone, channel_USD):
-    method = ShippingMethod.objects.create(
-        name="DPD",
-        type=ShippingMethodType.PRICE_BASED,
-        shipping_zone=shipping_zone,
-    )
-    ShippingMethodChannelListing.objects.create(
-        channel=channel_USD,
-        shipping_method=method,
-        minimum_order_price=Money(0, "USD"),
-        price=Money(9, "USD"),
-    )
-    return method
-
-
-@pytest.fixture
-def checkout_without_shipping_required(checkout, product_without_shipping):
-    variant = product_without_shipping.variants.get()
-    checkout_info = fetch_checkout_info(checkout, [], [], get_plugins_manager())
-    add_variant_to_checkout(checkout_info, variant, 1)
-    checkout.save()
-    return checkout
-
-
-@pytest.fixture
-def checkout_with_single_item(checkout, product):
-    variant = product.variants.get()
-    checkout_info = fetch_checkout_info(checkout, [], [], get_plugins_manager())
-    add_variant_to_checkout(checkout_info, variant, 1)
-    checkout.save()
-    return checkout
-
-
-@pytest.fixture
-def checkout_with_variant_without_inventory_tracking(
-    checkout, variant_without_inventory_tracking, address, shipping_method
-):
-    variant = variant_without_inventory_tracking
-    checkout_info = fetch_checkout_info(checkout, [], [], get_plugins_manager())
-    add_variant_to_checkout(checkout_info, variant, 1)
-    checkout.shipping_address = address
-    checkout.shipping_method = shipping_method
-    checkout.billing_address = address
-    checkout.store_value_in_metadata(items={"accepted": "true"})
-    checkout.store_value_in_private_metadata(items={"accepted": "false"})
-    checkout.save()
-    return checkout
-
-
-@pytest.fixture
-def checkout_with_items(checkout, product_list, product):
-    variant = product.variants.get()
-    checkout_info = fetch_checkout_info(checkout, [], [], get_plugins_manager())
-    add_variant_to_checkout(checkout_info, variant, 1)
-    for prod in product_list:
-        variant = prod.variants.get()
-        add_variant_to_checkout(checkout_info, variant, 1)
-    checkout.refresh_from_db()
-    return checkout
-
-
-@pytest.fixture
-def checkout_with_voucher(checkout, product, voucher):
-    variant = product.variants.get()
-    checkout_info = fetch_checkout_info(checkout, [], [], get_plugins_manager())
-    add_variant_to_checkout(checkout_info, variant, 3)
-    checkout.voucher_code = voucher.code
-    checkout.discount = Money("20.00", "USD")
-    checkout.save()
-    return checkout
-
-
-@pytest.fixture
-def checkout_with_voucher_percentage(checkout, product, voucher_percentage):
-    variant = product.variants.get()
-    checkout_info = fetch_checkout_info(checkout, [], [], get_plugins_manager())
-    add_variant_to_checkout(checkout_info, variant, 3)
-    checkout.voucher_code = voucher_percentage.code
-    checkout.discount = Money("3.00", "USD")
-    checkout.save()
-    return checkout
-
-
-@pytest.fixture
-def checkout_with_gift_card(checkout_with_item, gift_card):
-    checkout_with_item.gift_cards.add(gift_card)
-    checkout_with_item.save()
-    return checkout_with_item
-
-
-@pytest.fixture
-def checkout_with_voucher_percentage_and_shipping(
-    checkout_with_voucher_percentage, shipping_method, address
-):
-    checkout = checkout_with_voucher_percentage
-    checkout.shipping_method = shipping_method
-    checkout.shipping_address = address
-    checkout.save()
-    return checkout
-
-
-@pytest.fixture
-def checkout_with_payments(checkout):
-    Payment.objects.bulk_create(
-        [
-            Payment(
-                gateway="mirumee.payments.dummy", is_active=True, checkout=checkout
-            ),
-            Payment(
-                gateway="mirumee.payments.dummy", is_active=False, checkout=checkout
-            ),
-        ]
-    )
-    return checkout
-
-
-@pytest.fixture
 def address(db):  # pylint: disable=W0613
     return Address.objects.create(
         first_name="John",
@@ -470,6 +174,22 @@ def address(db):  # pylint: disable=W0613
         postal_code="53-601",
         country="PL",
         phone="+48713988102",
+    )
+
+
+@pytest.fixture
+def address_with_areas(db):
+    return Address.objects.create(
+        first_name="John",
+        last_name="Doe",
+        company_name="Mirumee Software",
+        street_address_1="Tęczowa 7",
+        city="WROCŁAW",
+        postal_code="53-601",
+        country="PL",
+        phone="+48713988102",
+        country_area="test_country_area",
+        city_area="test_city_area",
     )
 
 
@@ -513,753 +233,14 @@ def graphql_address_data():
         "city": "Wrocław",
         "countryArea": "",
         "phone": "+48321321888",
+        "metadata": [{"key": "public", "value": "public_value"}],
     }
 
 
 @pytest.fixture
-def customer_user(address):  # pylint: disable=W0613
-    default_address = address.get_copy()
-    user = User.objects.create_user(
-        "test@example.com",
-        "password",
-        default_billing_address=default_address,
-        default_shipping_address=default_address,
-        first_name="Leslie",
-        last_name="Wade",
-    )
-    user.addresses.add(default_address)
-    user._password = "password"
-    return user
-
-
-@pytest.fixture
-def user_checkout(customer_user, channel_USD):
-    checkout = Checkout.objects.create(
-        user=customer_user,
-        channel=channel_USD,
-        billing_address=customer_user.default_billing_address,
-        shipping_address=customer_user.default_shipping_address,
-        note="Test notes",
-        currency="USD",
-    )
-    return checkout
-
-
-@pytest.fixture
-def user_checkout_PLN(customer_user, channel_PLN):
-    checkout = Checkout.objects.create(
-        user=customer_user,
-        channel=channel_PLN,
-        billing_address=customer_user.default_billing_address,
-        shipping_address=customer_user.default_shipping_address,
-        note="Test notes",
-        currency="PLN",
-    )
-    return checkout
-
-
-@pytest.fixture
-def user_checkout_with_items(user_checkout, product_list):
-    checkout_info = fetch_checkout_info(user_checkout, [], [], get_plugins_manager())
-    for product in product_list:
-        variant = product.variants.get()
-        add_variant_to_checkout(checkout_info, variant, 1)
-    user_checkout.refresh_from_db()
-    return user_checkout
-
-
-@pytest.fixture
-def order(customer_user, channel_USD):
-    address = customer_user.default_billing_address.get_copy()
-    return Order.objects.create(
-        billing_address=address,
-        channel=channel_USD,
-        currency=channel_USD.currency_code,
-        shipping_address=address,
-        user_email=customer_user.email,
-        user=customer_user,
-        origin=OrderOrigin.CHECKOUT,
-    )
-
-
-@pytest.fixture
-def order_unconfirmed(order):
-    order.status = OrderStatus.UNCONFIRMED
-    order.save(update_fields=["status"])
-    return order
-
-
-@pytest.fixture
-def admin_user(db):
-    """Return a Django admin user."""
-    return User.objects.create_superuser("admin@example.com", "password")
-
-
-@pytest.fixture
-def staff_user(db):
-    """Return a staff member."""
-    return User.objects.create_user(
-        email="staff_test@example.com",
-        password="password",
-        is_staff=True,
-        is_active=True,
-    )
-
-
-@pytest.fixture
-def staff_users(staff_user):
-    """Return a staff members."""
-    staff_users = User.objects.bulk_create(
-        [
-            User(
-                email="staff1_test@example.com",
-                password="password",
-                is_staff=True,
-                is_active=True,
-            ),
-            User(
-                email="staff2_test@example.com",
-                password="password",
-                is_staff=True,
-                is_active=True,
-            ),
-        ]
-    )
-    return [staff_user] + staff_users
-
-
-@pytest.fixture
-def shipping_zone(db, channel_USD):  # pylint: disable=W0613
-    shipping_zone = ShippingZone.objects.create(
-        name="Europe", countries=[code for code, name in countries]
-    )
-    shipping_zone.channels.add(channel_USD)
-    method = shipping_zone.shipping_methods.create(
-        name="DHL",
-        type=ShippingMethodType.PRICE_BASED,
-        shipping_zone=shipping_zone,
-    )
-    ShippingMethodChannelListing.objects.create(
-        channel=channel_USD,
-        currency=channel_USD.currency_code,
-        shipping_method=method,
-        minimum_order_price=Money(0, channel_USD.currency_code),
-        price=Money(10, channel_USD.currency_code),
-    )
-    return shipping_zone
-
-
-@pytest.fixture
-def shipping_zones(db, channel_USD, channel_PLN):
-    shipping_zone_poland, shipping_zone_usa = ShippingZone.objects.bulk_create(
-        [
-            ShippingZone(name="Poland", countries=["PL"]),
-            ShippingZone(name="USA", countries=["US"]),
-        ]
-    )
-
-    shipping_zone_poland.channels.add(channel_PLN, channel_USD)
-    shipping_zone_usa.channels.add(channel_PLN, channel_USD)
-
-    method = shipping_zone_poland.shipping_methods.create(
-        name="DHL",
-        type=ShippingMethodType.PRICE_BASED,
-        shipping_zone=shipping_zone,
-    )
-    second_method = shipping_zone_usa.shipping_methods.create(
-        name="DHL",
-        type=ShippingMethodType.PRICE_BASED,
-        shipping_zone=shipping_zone,
-    )
-    ShippingMethodChannelListing.objects.bulk_create(
-        [
-            ShippingMethodChannelListing(
-                channel=channel_USD,
-                shipping_method=method,
-                minimum_order_price=Money(0, "USD"),
-                price=Money(10, "USD"),
-                currency=channel_USD.currency_code,
-            ),
-            ShippingMethodChannelListing(
-                channel=channel_USD,
-                shipping_method=second_method,
-                minimum_order_price=Money(0, "USD"),
-                currency=channel_USD.currency_code,
-            ),
-            ShippingMethodChannelListing(
-                channel=channel_PLN,
-                shipping_method=method,
-                minimum_order_price=Money(0, "PLN"),
-                price=Money(40, "PLN"),
-                currency=channel_PLN.currency_code,
-            ),
-            ShippingMethodChannelListing(
-                channel=channel_PLN,
-                shipping_method=second_method,
-                minimum_order_price=Money(0, "PLN"),
-                currency=channel_PLN.currency_code,
-            ),
-        ]
-    )
-    return [shipping_zone_poland, shipping_zone_usa]
-
-
-@pytest.fixture
-def shipping_zones_with_different_channels(db, channel_USD, channel_PLN):
-    shipping_zone_poland, shipping_zone_usa = ShippingZone.objects.bulk_create(
-        [
-            ShippingZone(name="Poland", countries=["PL"]),
-            ShippingZone(name="USA", countries=["US"]),
-        ]
-    )
-
-    shipping_zone_poland.channels.add(channel_PLN, channel_USD)
-    shipping_zone_usa.channels.add(channel_USD)
-
-    method = shipping_zone_poland.shipping_methods.create(
-        name="DHL",
-        type=ShippingMethodType.PRICE_BASED,
-        shipping_zone=shipping_zone,
-    )
-    second_method = shipping_zone_usa.shipping_methods.create(
-        name="DHL",
-        type=ShippingMethodType.PRICE_BASED,
-        shipping_zone=shipping_zone,
-    )
-    ShippingMethodChannelListing.objects.bulk_create(
-        [
-            ShippingMethodChannelListing(
-                channel=channel_USD,
-                shipping_method=method,
-                minimum_order_price=Money(0, "USD"),
-                price=Money(10, "USD"),
-                currency=channel_USD.currency_code,
-            ),
-            ShippingMethodChannelListing(
-                channel=channel_USD,
-                shipping_method=second_method,
-                minimum_order_price=Money(0, "USD"),
-                currency=channel_USD.currency_code,
-            ),
-            ShippingMethodChannelListing(
-                channel=channel_PLN,
-                shipping_method=method,
-                minimum_order_price=Money(0, "PLN"),
-                price=Money(40, "PLN"),
-                currency=channel_PLN.currency_code,
-            ),
-            ShippingMethodChannelListing(
-                channel=channel_PLN,
-                shipping_method=second_method,
-                minimum_order_price=Money(0, "PLN"),
-                currency=channel_PLN.currency_code,
-            ),
-        ]
-    )
-    return [shipping_zone_poland, shipping_zone_usa]
-
-
-@pytest.fixture
-def shipping_zone_without_countries(db, channel_USD):  # pylint: disable=W0613
-    shipping_zone = ShippingZone.objects.create(name="Europe", countries=[])
-    method = shipping_zone.shipping_methods.create(
-        name="DHL",
-        type=ShippingMethodType.PRICE_BASED,
-        shipping_zone=shipping_zone,
-    )
-    ShippingMethodChannelListing.objects.create(
-        channel=channel_USD,
-        shipping_method=method,
-        minimum_order_price=Money(0, "USD"),
-        price=Money(10, "USD"),
-    )
-    return shipping_zone
-
-
-@pytest.fixture
-def shipping_method(shipping_zone, channel_USD):
-    method = ShippingMethod.objects.create(
-        name="DHL",
-        type=ShippingMethodType.PRICE_BASED,
-        shipping_zone=shipping_zone,
-        maximum_delivery_days=10,
-        minimum_delivery_days=5,
-    )
-    ShippingMethodChannelListing.objects.create(
-        shipping_method=method,
-        channel=channel_USD,
-        minimum_order_price=Money(0, "USD"),
-        price=Money(10, "USD"),
-    )
-    return method
-
-
-@pytest.fixture
-def shipping_method_weight_based(shipping_zone, channel_USD):
-    method = ShippingMethod.objects.create(
-        name="weight based method",
-        type=ShippingMethodType.WEIGHT_BASED,
-        shipping_zone=shipping_zone,
-        maximum_delivery_days=10,
-        minimum_delivery_days=5,
-    )
-    ShippingMethodChannelListing.objects.create(
-        shipping_method=method,
-        channel=channel_USD,
-        minimum_order_price=Money(0, "USD"),
-        price=Money(10, "USD"),
-    )
-    return method
-
-
-@pytest.fixture
-def shipping_method_excluded_by_postal_code(shipping_method):
-    shipping_method.postal_code_rules.create(start="HB2", end="HB6")
-    return shipping_method
-
-
-@pytest.fixture
-def shipping_method_channel_PLN(shipping_zone, channel_PLN):
-    method = ShippingMethod.objects.create(
-        name="DHL",
-        type=ShippingMethodType.PRICE_BASED,
-        shipping_zone=shipping_zone,
-    )
-    ShippingMethodChannelListing.objects.create(
-        shipping_method=method,
-        channel=channel_PLN,
-        minimum_order_price=Money(0, channel_PLN.currency_code),
-        price=Money(10, channel_PLN.currency_code),
-        currency=channel_PLN.currency_code,
-    )
-    return method
-
-
-@pytest.fixture
-def color_attribute(db):
-    attribute = Attribute.objects.create(
-        slug="color",
-        name="Color",
-        type=AttributeType.PRODUCT_TYPE,
-        filterable_in_storefront=True,
-        filterable_in_dashboard=True,
-        available_in_grid=True,
-    )
-    AttributeValue.objects.create(attribute=attribute, name="Red", slug="red")
-    AttributeValue.objects.create(attribute=attribute, name="Blue", slug="blue")
-    return attribute
-
-
-@pytest.fixture
-def date_attribute(db):
-    attribute = Attribute.objects.create(
-        slug="release-date",
-        name="Release date",
-        type=AttributeType.PRODUCT_TYPE,
-        input_type=AttributeInputType.DATE,
-        filterable_in_storefront=True,
-        filterable_in_dashboard=True,
-        available_in_grid=True,
-    )
-    AttributeValue.objects.bulk_create(
-        [
-            AttributeValue(
-                attribute=attribute,
-                name=f"{attribute.name}: {value.date()}",
-                slug=f"{value.date()}_{attribute.id}",
-                date_time=value,
-            )
-            for value in [
-                datetime.datetime(2020, 10, 5, tzinfo=pytz.utc),
-                datetime.datetime(2020, 11, 5, tzinfo=pytz.utc),
-            ]
-        ]
-    )
-
-    return attribute
-
-
-@pytest.fixture
-def date_time_attribute(db):
-    attribute = Attribute.objects.create(
-        slug="release-date-time",
-        name="Release date time",
-        type=AttributeType.PRODUCT_TYPE,
-        input_type=AttributeInputType.DATE_TIME,
-        filterable_in_storefront=True,
-        filterable_in_dashboard=True,
-        available_in_grid=True,
-    )
-
-    AttributeValue.objects.bulk_create(
-        [
-            AttributeValue(
-                attribute=attribute,
-                name=f"{attribute.name}: {value.date()}",
-                slug=f"{value.date()}_{attribute.id}",
-                date_time=value,
-            )
-            for value in [
-                datetime.datetime(2020, 10, 5, tzinfo=pytz.utc),
-                datetime.datetime(2020, 11, 5, tzinfo=pytz.utc),
-            ]
-        ]
-    )
-
-    return attribute
-
-
-@pytest.fixture
-def attribute_choices_for_sorting(db):
-    attribute = Attribute.objects.create(
-        slug="sorting",
-        name="Sorting",
-        type=AttributeType.PRODUCT_TYPE,
-        filterable_in_storefront=True,
-        filterable_in_dashboard=True,
-        available_in_grid=True,
-    )
-    AttributeValue.objects.create(attribute=attribute, name="Global", slug="summer")
-    AttributeValue.objects.create(attribute=attribute, name="Apex", slug="zet")
-    AttributeValue.objects.create(attribute=attribute, name="Police", slug="absorb")
-    return attribute
-
-
-@pytest.fixture
-def boolean_attribute(db):
-    attribute = Attribute.objects.create(
-        slug="boolean",
-        name="Boolean",
-        type=AttributeType.PRODUCT_TYPE,
-        input_type=AttributeInputType.BOOLEAN,
-        filterable_in_storefront=True,
-        filterable_in_dashboard=True,
-        available_in_grid=True,
-    )
-    AttributeValue.objects.create(
-        attribute=attribute,
-        name=f"{attribute.name}: Yes",
-        slug=f"{attribute.id}_true",
-        boolean=True,
-    )
-    AttributeValue.objects.create(
-        attribute=attribute,
-        name=f"{attribute.name}: No",
-        slug=f"{attribute.id}_false",
-        boolean=False,
-    )
-    return attribute
-
-
-@pytest.fixture
-def rich_text_attribute(db):
-    attribute = Attribute.objects.create(
-        slug="text",
-        name="Text",
-        type=AttributeType.PRODUCT_TYPE,
-        input_type=AttributeInputType.RICH_TEXT,
-        filterable_in_storefront=False,
-        filterable_in_dashboard=False,
-        available_in_grid=False,
-    )
-    text = "Rich text attribute content."
-    AttributeValue.objects.create(
-        attribute=attribute,
-        name=truncatechars(clean_editor_js(dummy_editorjs(text), to_string=True), 50),
-        slug=f"instance_{attribute.id}",
-        rich_text=dummy_editorjs(text),
-    )
-    return attribute
-
-
-@pytest.fixture
-def rich_text_attribute_page_type(db):
-    attribute = Attribute.objects.create(
-        slug="text",
-        name="Text",
-        type=AttributeType.PAGE_TYPE,
-        input_type=AttributeInputType.RICH_TEXT,
-        filterable_in_storefront=False,
-        filterable_in_dashboard=False,
-        available_in_grid=False,
-    )
-    text = "Rich text attribute content."
-    AttributeValue.objects.create(
-        attribute=attribute,
-        name=truncatechars(clean_editor_js(dummy_editorjs(text), to_string=True), 50),
-        slug=f"instance_{attribute.id}",
-        rich_text=dummy_editorjs(text),
-    )
-    return attribute
-
-
-@pytest.fixture
-def rich_text_attribute_with_many_values(rich_text_attribute):
-    attribute = rich_text_attribute
-    values = []
-    for i in range(5):
-        text = f"Rich text attribute content{i}."
-        values.append(
-            AttributeValue(
-                attribute=attribute,
-                name=truncatechars(
-                    clean_editor_js(dummy_editorjs(text), to_string=True), 50
-                ),
-                slug=f"instance_{attribute.id}_{i}",
-                rich_text=dummy_editorjs(text),
-            )
-        )
-    AttributeValue.objects.bulk_create(values)
-    return rich_text_attribute
-
-
-@pytest.fixture
-def color_attribute_without_values(db):  # pylint: disable=W0613
-    return Attribute.objects.create(
-        slug="color",
-        name="Color",
-        type=AttributeType.PRODUCT_TYPE,
-        filterable_in_storefront=True,
-        filterable_in_dashboard=True,
-        available_in_grid=True,
-    )
-
-
-@pytest.fixture
-def pink_attribute_value(color_attribute):  # pylint: disable=W0613
-    value = AttributeValue.objects.create(
-        slug="pink", name="Pink", attribute=color_attribute, value="#FF69B4"
-    )
-    return value
-
-
-@pytest.fixture
-def size_attribute(db):  # pylint: disable=W0613
-    attribute = Attribute.objects.create(
-        slug="size",
-        name="Size",
-        type=AttributeType.PRODUCT_TYPE,
-        filterable_in_storefront=True,
-        filterable_in_dashboard=True,
-        available_in_grid=True,
-    )
-    AttributeValue.objects.create(attribute=attribute, name="Small", slug="small")
-    AttributeValue.objects.create(attribute=attribute, name="Big", slug="big")
-    return attribute
-
-
-@pytest.fixture
-def weight_attribute(db):
-    attribute = Attribute.objects.create(
-        slug="material",
-        name="Material",
-        type=AttributeType.PRODUCT_TYPE,
-        filterable_in_storefront=True,
-        filterable_in_dashboard=True,
-        available_in_grid=True,
-    )
-    AttributeValue.objects.create(attribute=attribute, name="Cotton", slug="cotton")
-    AttributeValue.objects.create(
-        attribute=attribute, name="Poliester", slug="poliester"
-    )
-    return attribute
-
-
-@pytest.fixture
-def numeric_attribute(db):
-    attribute = Attribute.objects.create(
-        slug="length",
-        name="Length",
-        type=AttributeType.PRODUCT_TYPE,
-        input_type=AttributeInputType.NUMERIC,
-        unit=MeasurementUnits.CM,
-        filterable_in_storefront=True,
-        filterable_in_dashboard=True,
-        available_in_grid=True,
-    )
-    AttributeValue.objects.create(attribute=attribute, name="10", slug="10")
-    AttributeValue.objects.create(attribute=attribute, name="15", slug="15")
-    return attribute
-
-
-@pytest.fixture
-def file_attribute(db):
-    attribute = Attribute.objects.create(
-        slug="image",
-        name="Image",
-        type=AttributeType.PRODUCT_TYPE,
-        input_type=AttributeInputType.FILE,
-    )
-    AttributeValue.objects.create(
-        attribute=attribute,
-        name="test_file.txt",
-        slug="test_filetxt",
-        file_url="test_file.txt",
-        content_type="text/plain",
-    )
-    AttributeValue.objects.create(
-        attribute=attribute,
-        name="test_file.jpeg",
-        slug="test_filejpeg",
-        file_url="test_file.jpeg",
-        content_type="image/jpeg",
-    )
-    return attribute
-
-
-@pytest.fixture
-def file_attribute_with_file_input_type_without_values(db):
-    return Attribute.objects.create(
-        slug="image",
-        name="Image",
-        type=AttributeType.PRODUCT_TYPE,
-        input_type=AttributeInputType.FILE,
-    )
-
-
-@pytest.fixture
-def product_type_page_reference_attribute(db):
-    return Attribute.objects.create(
-        slug="page-reference",
-        name="Page reference",
-        type=AttributeType.PRODUCT_TYPE,
-        input_type=AttributeInputType.REFERENCE,
-        entity_type=AttributeEntityType.PAGE,
-    )
-
-
-@pytest.fixture
-def page_type_page_reference_attribute(db):
-    return Attribute.objects.create(
-        slug="page-reference",
-        name="Page reference",
-        type=AttributeType.PAGE_TYPE,
-        input_type=AttributeInputType.REFERENCE,
-        entity_type=AttributeEntityType.PAGE,
-    )
-
-
-@pytest.fixture
-def product_type_product_reference_attribute(db):
-    return Attribute.objects.create(
-        slug="product-reference",
-        name="Product reference",
-        type=AttributeType.PRODUCT_TYPE,
-        input_type=AttributeInputType.REFERENCE,
-        entity_type=AttributeEntityType.PRODUCT,
-    )
-
-
-@pytest.fixture
-def page_type_product_reference_attribute(db):
-    return Attribute.objects.create(
-        slug="product-reference",
-        name="Product reference",
-        type=AttributeType.PAGE_TYPE,
-        input_type=AttributeInputType.REFERENCE,
-        entity_type=AttributeEntityType.PRODUCT,
-    )
-
-
-@pytest.fixture
-def size_page_attribute(db):
-    attribute = Attribute.objects.create(
-        slug="page-size",
-        name="Page size",
-        type=AttributeType.PAGE_TYPE,
-        filterable_in_storefront=True,
-        filterable_in_dashboard=True,
-        available_in_grid=True,
-    )
-    AttributeValue.objects.create(attribute=attribute, name="10", slug="10")
-    AttributeValue.objects.create(attribute=attribute, name="15", slug="15")
-    return attribute
-
-
-@pytest.fixture
-def tag_page_attribute(db):
-    attribute = Attribute.objects.create(
-        slug="tag",
-        name="tag",
-        type=AttributeType.PAGE_TYPE,
-        filterable_in_storefront=True,
-        filterable_in_dashboard=True,
-        available_in_grid=True,
-    )
-    AttributeValue.objects.create(attribute=attribute, name="About", slug="about")
-    AttributeValue.objects.create(attribute=attribute, name="Help", slug="help")
-    return attribute
-
-
-@pytest.fixture
-def author_page_attribute(db):
-    attribute = Attribute.objects.create(
-        slug="author", name="author", type=AttributeType.PAGE_TYPE
-    )
-    AttributeValue.objects.create(
-        attribute=attribute, name="Test author 1", slug="test-author-1"
-    )
-    AttributeValue.objects.create(
-        attribute=attribute, name="Test author 2", slug="test-author-2"
-    )
-    return attribute
-
-
-@pytest.fixture
-def page_file_attribute(db):
-    attribute = Attribute.objects.create(
-        slug="image",
-        name="Image",
-        type=AttributeType.PAGE_TYPE,
-        input_type=AttributeInputType.FILE,
-    )
-    AttributeValue.objects.create(
-        attribute=attribute,
-        name="test_file.txt",
-        slug="test_filetxt",
-        file_url="test_file.txt",
-        content_type="text/plain",
-    )
-    AttributeValue.objects.create(
-        attribute=attribute,
-        name="test_file.jpeg",
-        slug="test_filejpeg",
-        file_url="test_file.jpeg",
-        content_type="image/jpeg",
-    )
-    return attribute
-
-
-@pytest.fixture
-def product_type_attribute_list() -> List[Attribute]:
-    return list(
-        Attribute.objects.bulk_create(
-            [
-                Attribute(slug="size", name="Size", type=AttributeType.PRODUCT_TYPE),
-                Attribute(
-                    slug="weight", name="Weight", type=AttributeType.PRODUCT_TYPE
-                ),
-                Attribute(
-                    slug="thickness", name="Thickness", type=AttributeType.PRODUCT_TYPE
-                ),
-            ]
-        )
-    )
-
-
-@pytest.fixture
-def page_type_attribute_list() -> List[Attribute]:
-    return list(
-        Attribute.objects.bulk_create(
-            [
-                Attribute(slug="size", name="Size", type=AttributeType.PAGE_TYPE),
-                Attribute(slug="font", name="Weight", type=AttributeType.PAGE_TYPE),
-                Attribute(
-                    slug="margin", name="Thickness", type=AttributeType.PAGE_TYPE
-                ),
-            ]
-        )
-    )
+def graphql_address_data_skipped_validation(graphql_address_data):
+    graphql_address_data["skipValidation"] = True
+    return graphql_address_data
 
 
 @pytest.fixture
@@ -1268,6 +249,14 @@ def image():
     image = Image.new("RGB", size=(1, 1))
     image.save(img_data, format="JPEG")
     return SimpleUploadedFile("product.jpg", img_data.getvalue())
+
+
+@pytest.fixture
+def icon_image():
+    img_data = BytesIO()
+    image = Image.new("RGB", size=(1, 1))
+    image.save(img_data, format="PNG")
+    return SimpleUploadedFile("logo.png", img_data.getvalue())
 
 
 @pytest.fixture
@@ -1286,1940 +275,21 @@ def image_list():
 
 
 @pytest.fixture
-def category(db):  # pylint: disable=W0613
-    return Category.objects.create(name="Default", slug="default")
-
-
-@pytest.fixture
-def category_with_image(db, image, media_root):  # pylint: disable=W0613
-    return Category.objects.create(
-        name="Default", slug="default", background_image=image
-    )
-
-
-@pytest.fixture
-def categories_tree(db, product_type, channel_USD):  # pylint: disable=W0613
-    parent = Category.objects.create(name="Parent", slug="parent")
-    parent.children.create(name="Child", slug="child")
-    child = parent.children.first()
-
-    product_attr = product_type.product_attributes.first()
-    attr_value = product_attr.values.first()
-
-    product = Product.objects.create(
-        name="Test product",
-        slug="test-product-10",
-        product_type=product_type,
-        category=child,
-    )
-    ProductChannelListing.objects.create(
-        product=product,
-        channel=channel_USD,
-        is_published=True,
-        visible_in_listings=True,
-    )
-
-    associate_attribute_values_to_instance(product, product_attr, attr_value)
-    return parent
-
-
-@pytest.fixture
-def categories_tree_with_published_products(
-    categories_tree, product, channel_USD, channel_PLN
-):
-    parent = categories_tree
-    parent_product = product
-    parent_product.category = parent
-
-    child = parent.children.first()
-    child_product = child.products.first()
-
-    product_list = [child_product, parent_product]
-
-    ProductChannelListing.objects.filter(product__in=product_list).delete()
-    product_channel_listings = []
-    for product in product_list:
-        product.save()
-        product_channel_listings.append(
-            ProductChannelListing(
-                product=product,
-                channel=channel_USD,
-                publication_date=datetime.date.today(),
-                is_published=True,
-            )
-        )
-        product_channel_listings.append(
-            ProductChannelListing(
-                product=product,
-                channel=channel_PLN,
-                publication_date=datetime.date.today(),
-                is_published=True,
-            )
-        )
-    ProductChannelListing.objects.bulk_create(product_channel_listings)
-    return parent
-
-
-@pytest.fixture
-def non_default_category(db):  # pylint: disable=W0613
-    return Category.objects.create(name="Not default", slug="not-default")
-
-
-@pytest.fixture
-def permission_manage_discounts():
-    return Permission.objects.get(codename="manage_discounts")
-
-
-@pytest.fixture
-def permission_manage_gift_card():
-    return Permission.objects.get(codename="manage_gift_card")
-
-
-@pytest.fixture
-def permission_manage_orders():
-    return Permission.objects.get(codename="manage_orders")
-
-
-@pytest.fixture
-def permission_manage_checkouts():
-    return Permission.objects.get(codename="manage_checkouts")
-
-
-@pytest.fixture
-def permission_manage_plugins():
-    return Permission.objects.get(codename="manage_plugins")
-
-
-@pytest.fixture
-def permission_manage_apps():
-    return Permission.objects.get(codename="manage_apps")
-
-
-@pytest.fixture
-def product_type(color_attribute, size_attribute):
-    product_type = ProductType.objects.create(
-        name="Default Type",
-        slug="default-type",
-        has_variants=True,
-        is_shipping_required=True,
-    )
-    product_type.product_attributes.add(color_attribute)
-    product_type.variant_attributes.add(size_attribute)
-    return product_type
-
-
-@pytest.fixture
-def product_type_with_rich_text_attribute(
-    rich_text_attribute, color_attribute, size_attribute
-):
-    product_type = ProductType.objects.create(
-        name="Default Type",
-        slug="default-type",
-        has_variants=True,
-        is_shipping_required=True,
-    )
-    product_type.product_attributes.add(rich_text_attribute)
-    product_type.variant_attributes.add(rich_text_attribute)
-    return product_type
-
-
-@pytest.fixture
-def product_type_without_variant():
-    product_type = ProductType.objects.create(
-        name="Type", slug="type", has_variants=False, is_shipping_required=True
-    )
-    return product_type
-
-
-@pytest.fixture
-def product(product_type, category, warehouse, channel_USD):
-    product_attr = product_type.product_attributes.first()
-    product_attr_value = product_attr.values.first()
-
-    product = Product.objects.create(
-        name="Test product",
-        slug="test-product-11",
-        product_type=product_type,
-        category=category,
-    )
-    ProductChannelListing.objects.create(
-        product=product,
-        channel=channel_USD,
-        is_published=True,
-        discounted_price_amount="10.00",
-        currency=channel_USD.currency_code,
-        visible_in_listings=True,
-        available_for_purchase=datetime.date(1999, 1, 1),
-    )
-
-    associate_attribute_values_to_instance(product, product_attr, product_attr_value)
-
-    variant_attr = product_type.variant_attributes.first()
-    variant_attr_value = variant_attr.values.first()
-
-    variant = ProductVariant.objects.create(product=product, sku="123")
-    ProductVariantChannelListing.objects.create(
-        variant=variant,
-        channel=channel_USD,
-        price_amount=Decimal(10),
-        cost_price_amount=Decimal(1),
-        currency=channel_USD.currency_code,
-    )
-    Stock.objects.create(warehouse=warehouse, product_variant=variant, quantity=10)
-
-    associate_attribute_values_to_instance(variant, variant_attr, variant_attr_value)
-    return product
-
-
-@pytest.fixture
-def product_with_rich_text_attribute(
-    product_type_with_rich_text_attribute, category, warehouse, channel_USD
-):
-    product_attr = product_type_with_rich_text_attribute.product_attributes.first()
-    product_attr_value = product_attr.values.first()
-
-    product = Product.objects.create(
-        name="Test product",
-        slug="test-product-11",
-        product_type=product_type_with_rich_text_attribute,
-        category=category,
-    )
-    ProductChannelListing.objects.create(
-        product=product,
-        channel=channel_USD,
-        is_published=True,
-        discounted_price_amount="10.00",
-        currency=channel_USD.currency_code,
-        visible_in_listings=True,
-        available_for_purchase=datetime.date(1999, 1, 1),
-    )
-
-    associate_attribute_values_to_instance(product, product_attr, product_attr_value)
-
-    variant_attr = product_type_with_rich_text_attribute.variant_attributes.first()
-    variant_attr_value = variant_attr.values.first()
-
-    variant = ProductVariant.objects.create(product=product, sku="123")
-    ProductVariantChannelListing.objects.create(
-        variant=variant,
-        channel=channel_USD,
-        price_amount=Decimal(10),
-        cost_price_amount=Decimal(1),
-        currency=channel_USD.currency_code,
-    )
-    Stock.objects.create(warehouse=warehouse, product_variant=variant, quantity=10)
-
-    associate_attribute_values_to_instance(variant, variant_attr, variant_attr_value)
-    return [product, variant]
-
-
-@pytest.fixture
-def product_with_collections(
-    product, published_collection, unpublished_collection, collection
-):
-    product.collections.add(*[published_collection, unpublished_collection, collection])
-    return product
-
-
-@pytest.fixture
-def product_available_in_many_channels(product, channel_PLN, channel_USD):
-    ProductChannelListing.objects.create(
-        product=product,
-        channel=channel_PLN,
-        is_published=True,
-    )
-    variant = product.variants.get()
-    ProductVariantChannelListing.objects.create(
-        variant=variant,
-        channel=channel_PLN,
-        price_amount=Decimal(50),
-        cost_price_amount=Decimal(1),
-        currency=channel_PLN.currency_code,
-    )
-    return product
-
-
-@pytest.fixture
-def product_with_single_variant(product_type, category, warehouse, channel_USD):
-    product = Product.objects.create(
-        name="Test product with single variant",
-        slug="test-product-with-single-variant",
-        product_type=product_type,
-        category=category,
-    )
-    ProductChannelListing.objects.create(
-        product=product,
-        channel=channel_USD,
-        is_published=True,
-        visible_in_listings=True,
-        available_for_purchase=datetime.date(1999, 1, 1),
-    )
-    variant = ProductVariant.objects.create(product=product, sku="SKU_SINGLE_VARIANT")
-    ProductVariantChannelListing.objects.create(
-        variant=variant,
-        channel=channel_USD,
-        price_amount=Decimal(1.99),
-        cost_price_amount=Decimal(1),
-        currency=channel_USD.currency_code,
-    )
-    Stock.objects.create(product_variant=variant, warehouse=warehouse, quantity=101)
-    return product
-
-
-@pytest.fixture
-def product_with_two_variants(product_type, category, warehouse, channel_USD):
-    product = Product.objects.create(
-        name="Test product with two variants",
-        slug="test-product-with-two-variant",
-        product_type=product_type,
-        category=category,
-    )
-
-    ProductChannelListing.objects.create(
-        product=product,
-        channel=channel_USD,
-        is_published=True,
-        visible_in_listings=True,
-        available_for_purchase=datetime.date(1999, 1, 1),
-    )
-
-    variants = [
-        ProductVariant(
-            product=product,
-            sku=f"Product variant #{i}",
-        )
-        for i in (1, 2)
-    ]
-    ProductVariant.objects.bulk_create(variants)
-    variants_channel_listing = [
-        ProductVariantChannelListing(
-            variant=variant,
-            channel=channel_USD,
-            price_amount=Decimal(10),
-            cost_price_amount=Decimal(1),
-            currency=channel_USD.currency_code,
-        )
-        for variant in variants
-    ]
-    ProductVariantChannelListing.objects.bulk_create(variants_channel_listing)
-    Stock.objects.bulk_create(
-        [
-            Stock(
-                warehouse=warehouse,
-                product_variant=variant,
-                quantity=10,
-            )
-            for variant in variants
-        ]
-    )
-
-    return product
-
-
-@pytest.fixture
-def product_with_variant_with_two_attributes(
-    color_attribute, size_attribute, category, warehouse, channel_USD
-):
-    product_type = ProductType.objects.create(
-        name="Type with two variants",
-        slug="two-variants",
-        has_variants=True,
-        is_shipping_required=True,
-    )
-    product_type.variant_attributes.add(color_attribute)
-    product_type.variant_attributes.add(size_attribute)
-
-    product = Product.objects.create(
-        name="Test product with two variants",
-        slug="test-product-with-two-variant",
-        product_type=product_type,
-        category=category,
-    )
-    ProductChannelListing.objects.create(
-        product=product,
-        channel=channel_USD,
-        is_published=True,
-        currency=channel_USD.currency_code,
-        visible_in_listings=True,
-        available_for_purchase=datetime.date(1999, 1, 1),
-    )
-
-    variant = ProductVariant.objects.create(product=product, sku="prodVar1")
-    ProductVariantChannelListing.objects.create(
-        variant=variant,
-        channel=channel_USD,
-        price_amount=Decimal(10),
-        cost_price_amount=Decimal(1),
-        currency=channel_USD.currency_code,
-    )
-
-    associate_attribute_values_to_instance(
-        variant, color_attribute, color_attribute.values.first()
-    )
-    associate_attribute_values_to_instance(
-        variant, size_attribute, size_attribute.values.first()
-    )
-
-    return product
-
-
-@pytest.fixture
-def product_with_variant_with_external_media(
-    color_attribute,
-    size_attribute,
-    category,
-    warehouse,
-    channel_USD,
-):
-    product_type = ProductType.objects.create(
-        name="Type with two variants",
-        slug="two-variants",
-        has_variants=True,
-        is_shipping_required=True,
-    )
-    product_type.variant_attributes.add(color_attribute)
-    product_type.variant_attributes.add(size_attribute)
-
-    product = Product.objects.create(
-        name="Test product with two variants",
-        slug="test-product-with-two-variant",
-        product_type=product_type,
-        category=category,
-    )
-    media_obj = ProductMedia.objects.create(
-        product=product,
-        external_url="https://www.youtube.com/watch?v=di8_dJ3Clyo",
-        alt="video_1",
-        type=ProductMediaTypes.VIDEO,
-        oembed_data="{}",
-    )
-    product.media.add(media_obj)
-
-    ProductChannelListing.objects.create(
-        product=product,
-        channel=channel_USD,
-        is_published=True,
-        currency=channel_USD.currency_code,
-        visible_in_listings=True,
-        available_for_purchase=datetime.date(1999, 1, 1),
-    )
-
-    variant = ProductVariant.objects.create(product=product, sku="prodVar1")
-    variant.media.add(media_obj)
-    ProductVariantChannelListing.objects.create(
-        variant=variant,
-        channel=channel_USD,
-        price_amount=Decimal(10),
-        cost_price_amount=Decimal(1),
-        currency=channel_USD.currency_code,
-    )
-
-    associate_attribute_values_to_instance(
-        variant, color_attribute, color_attribute.values.first()
-    )
-    associate_attribute_values_to_instance(
-        variant, size_attribute, size_attribute.values.first()
-    )
-
-    return product
-
-
-@pytest.fixture
-def product_with_variant_with_file_attribute(
-    color_attribute, file_attribute, category, warehouse, channel_USD
-):
-    product_type = ProductType.objects.create(
-        name="Type with variant and file attribute",
-        slug="type-with-file-attribute",
-        has_variants=True,
-        is_shipping_required=True,
-    )
-    product_type.variant_attributes.add(file_attribute)
-
-    product = Product.objects.create(
-        name="Test product with variant and file attribute",
-        slug="test-product-with-variant-and-file-attribute",
-        product_type=product_type,
-        category=category,
-    )
-    ProductChannelListing.objects.create(
-        product=product,
-        channel=channel_USD,
-        is_published=True,
-        currency=channel_USD.currency_code,
-        visible_in_listings=True,
-        available_for_purchase=datetime.date(1999, 1, 1),
-    )
-
-    variant = ProductVariant.objects.create(
-        product=product,
-        sku="prodVarTest",
-    )
-    ProductVariantChannelListing.objects.create(
-        variant=variant,
-        channel=channel_USD,
-        price_amount=Decimal(10),
-        cost_price_amount=Decimal(1),
-        currency=channel_USD.currency_code,
-    )
-
-    associate_attribute_values_to_instance(
-        variant, file_attribute, file_attribute.values.first()
-    )
-
-    return product
-
-
-@pytest.fixture
-def product_with_multiple_values_attributes(product, product_type, category) -> Product:
-
-    attribute = Attribute.objects.create(
-        slug="modes",
-        name="Available Modes",
-        input_type=AttributeInputType.MULTISELECT,
-        type=AttributeType.PRODUCT_TYPE,
-    )
-
-    attr_val_1 = AttributeValue.objects.create(
-        attribute=attribute, name="Eco Mode", slug="eco"
-    )
-    attr_val_2 = AttributeValue.objects.create(
-        attribute=attribute, name="Performance Mode", slug="power"
-    )
-
-    product_type.product_attributes.clear()
-    product_type.product_attributes.add(attribute)
-
-    associate_attribute_values_to_instance(product, attribute, attr_val_1, attr_val_2)
-    return product
-
-
-@pytest.fixture
-def product_with_default_variant(
-    product_type_without_variant, category, warehouse, channel_USD
-):
-    product = Product.objects.create(
-        name="Test product",
-        slug="test-product-3",
-        product_type=product_type_without_variant,
-        category=category,
-    )
-    ProductChannelListing.objects.create(
-        product=product,
-        channel=channel_USD,
-        is_published=True,
-        visible_in_listings=True,
-        available_for_purchase=datetime.date(1999, 1, 1),
-    )
-    variant = ProductVariant.objects.create(
-        product=product, sku="1234", track_inventory=True
-    )
-    ProductVariantChannelListing.objects.create(
-        variant=variant,
-        channel=channel_USD,
-        price_amount=Decimal(10),
-        cost_price_amount=Decimal(1),
-        currency=channel_USD.currency_code,
-    )
-    Stock.objects.create(warehouse=warehouse, product_variant=variant, quantity=100)
-    return product
-
-
-@pytest.fixture
-def variant_without_inventory_tracking(
-    product_type_without_variant, category, warehouse, channel_USD
-):
-    product = Product.objects.create(
-        name="Test product without inventory tracking",
-        slug="test-product-without-tracking",
-        product_type=product_type_without_variant,
-        category=category,
-    )
-    ProductChannelListing.objects.create(
-        product=product,
-        channel=channel_USD,
-        is_published=True,
-        visible_in_listings=True,
-        available_for_purchase=datetime.date.today(),
-    )
-    variant = ProductVariant.objects.create(
-        product=product,
-        sku="tracking123",
-        track_inventory=False,
-    )
-    ProductVariantChannelListing.objects.create(
-        variant=variant,
-        channel=channel_USD,
-        price_amount=Decimal(10),
-        cost_price_amount=Decimal(1),
-        currency=channel_USD.currency_code,
-    )
-    Stock.objects.create(warehouse=warehouse, product_variant=variant, quantity=0)
-    return variant
-
-
-@pytest.fixture
-def variant(product, channel_USD) -> ProductVariant:
-    product_variant = ProductVariant.objects.create(product=product, sku="SKU_A")
-    ProductVariantChannelListing.objects.create(
-        variant=product_variant,
-        channel=channel_USD,
-        price_amount=Decimal(10),
-        cost_price_amount=Decimal(1),
-        currency=channel_USD.currency_code,
-    )
-    return product_variant
-
-
-@pytest.fixture
-def variant_with_image(variant, image_list, media_root):
-    media = ProductMedia.objects.create(product=variant.product, image=image_list[0])
-    VariantMedia.objects.create(variant=variant, media=media)
-    return variant
-
-
-@pytest.fixture
-def variant_with_many_stocks(variant, warehouses_with_shipping_zone):
-    warehouses = warehouses_with_shipping_zone
-    Stock.objects.bulk_create(
-        [
-            Stock(warehouse=warehouses[0], product_variant=variant, quantity=4),
-            Stock(warehouse=warehouses[1], product_variant=variant, quantity=3),
-        ]
-    )
-    return variant
-
-
-@pytest.fixture
-def variant_with_many_stocks_different_shipping_zones(
-    variant, warehouses_with_different_shipping_zone
-):
-    warehouses = warehouses_with_different_shipping_zone
-    Stock.objects.bulk_create(
-        [
-            Stock(warehouse=warehouses[0], product_variant=variant, quantity=4),
-            Stock(warehouse=warehouses[1], product_variant=variant, quantity=3),
-        ]
-    )
-    return variant
-
-
-@pytest.fixture
-def product_variant_list(product, channel_USD, channel_PLN):
-    variants = list(
-        ProductVariant.objects.bulk_create(
-            [
-                ProductVariant(product=product, sku="1"),
-                ProductVariant(product=product, sku="2"),
-                ProductVariant(product=product, sku="3"),
-            ]
-        )
-    )
-    ProductVariantChannelListing.objects.bulk_create(
-        [
-            ProductVariantChannelListing(
-                variant=variants[0],
-                channel=channel_USD,
-                cost_price_amount=Decimal(1),
-                price_amount=Decimal(10),
-                currency=channel_USD.currency_code,
-            ),
-            ProductVariantChannelListing(
-                variant=variants[1],
-                channel=channel_USD,
-                cost_price_amount=Decimal(1),
-                price_amount=Decimal(10),
-                currency=channel_USD.currency_code,
-            ),
-            ProductVariantChannelListing(
-                variant=variants[2],
-                channel=channel_PLN,
-                cost_price_amount=Decimal(1),
-                price_amount=Decimal(10),
-                currency=channel_PLN.currency_code,
-            ),
-        ]
-    )
-    return variants
-
-
-@pytest.fixture
-def product_without_shipping(category, warehouse, channel_USD):
-    product_type = ProductType.objects.create(
-        name="Type with no shipping",
-        slug="no-shipping",
-        has_variants=False,
-        is_shipping_required=False,
-    )
-    product = Product.objects.create(
-        name="Test product",
-        slug="test-product-4",
-        product_type=product_type,
-        category=category,
-    )
-    ProductChannelListing.objects.create(
-        product=product,
-        channel=channel_USD,
-        is_published=True,
-        visible_in_listings=True,
-    )
-    variant = ProductVariant.objects.create(product=product, sku="SKU_B")
-    ProductVariantChannelListing.objects.create(
-        variant=variant,
-        channel=channel_USD,
-        price_amount=Decimal(10),
-        cost_price_amount=Decimal(1),
-        currency=channel_USD.currency_code,
-    )
-    Stock.objects.create(product_variant=variant, warehouse=warehouse, quantity=1)
-    return product
-
-
-@pytest.fixture
-def product_without_category(product):
-    product.category = None
-    product.save()
-    product.channel_listings.all().update(is_published=False)
-    return product
-
-
-@pytest.fixture
-def product_list(product_type, category, warehouse, channel_USD, channel_PLN):
-    product_attr = product_type.product_attributes.first()
-    attr_value = product_attr.values.first()
-
-    products = list(
-        Product.objects.bulk_create(
-            [
-                Product(
-                    name="Test product 1",
-                    slug="test-product-a",
-                    description_plaintext="big blue product",
-                    category=category,
-                    product_type=product_type,
-                ),
-                Product(
-                    name="Test product 2",
-                    slug="test-product-b",
-                    description_plaintext="big orange product",
-                    category=category,
-                    product_type=product_type,
-                ),
-                Product(
-                    name="Test product 3",
-                    slug="test-product-c",
-                    description_plaintext="small red",
-                    category=category,
-                    product_type=product_type,
-                ),
-            ]
-        )
-    )
-    ProductChannelListing.objects.bulk_create(
-        [
-            ProductChannelListing(
-                product=products[0],
-                channel=channel_USD,
-                is_published=True,
-                discounted_price_amount=10,
-                currency=channel_USD.currency_code,
-                visible_in_listings=True,
-            ),
-            ProductChannelListing(
-                product=products[1],
-                channel=channel_USD,
-                is_published=True,
-                discounted_price_amount=20,
-                currency=channel_USD.currency_code,
-                visible_in_listings=True,
-            ),
-            ProductChannelListing(
-                product=products[2],
-                channel=channel_USD,
-                is_published=True,
-                discounted_price_amount=30,
-                currency=channel_USD.currency_code,
-                visible_in_listings=True,
-            ),
-        ]
-    )
-    variants = list(
-        ProductVariant.objects.bulk_create(
-            [
-                ProductVariant(
-                    product=products[0],
-                    sku=str(uuid.uuid4()).replace("-", ""),
-                    track_inventory=True,
-                ),
-                ProductVariant(
-                    product=products[1],
-                    sku=str(uuid.uuid4()).replace("-", ""),
-                    track_inventory=True,
-                ),
-                ProductVariant(
-                    product=products[2],
-                    sku=str(uuid.uuid4()).replace("-", ""),
-                    track_inventory=True,
-                ),
-            ]
-        )
-    )
-    ProductVariantChannelListing.objects.bulk_create(
-        [
-            ProductVariantChannelListing(
-                variant=variants[0],
-                channel=channel_USD,
-                cost_price_amount=Decimal(1),
-                price_amount=Decimal(10),
-                currency=channel_USD.currency_code,
-            ),
-            ProductVariantChannelListing(
-                variant=variants[1],
-                channel=channel_USD,
-                cost_price_amount=Decimal(1),
-                price_amount=Decimal(20),
-                currency=channel_USD.currency_code,
-            ),
-            ProductVariantChannelListing(
-                variant=variants[2],
-                channel=channel_USD,
-                cost_price_amount=Decimal(1),
-                price_amount=Decimal(30),
-                currency=channel_USD.currency_code,
-            ),
-        ]
-    )
-    stocks = []
-    for variant in variants:
-        stocks.append(Stock(warehouse=warehouse, product_variant=variant, quantity=100))
-    Stock.objects.bulk_create(stocks)
-
-    for product in products:
-        associate_attribute_values_to_instance(product, product_attr, attr_value)
-
-    return products
-
-
-@pytest.fixture
-def product_list_with_variants_many_channel(
-    product_type, category, channel_USD, channel_PLN
-):
-    products = list(
-        Product.objects.bulk_create(
-            [
-                Product(
-                    name="Test product 1",
-                    slug="test-product-a",
-                    category=category,
-                    product_type=product_type,
-                ),
-                Product(
-                    name="Test product 2",
-                    slug="test-product-b",
-                    category=category,
-                    product_type=product_type,
-                ),
-                Product(
-                    name="Test product 3",
-                    slug="test-product-c",
-                    category=category,
-                    product_type=product_type,
-                ),
-            ]
-        )
-    )
-    ProductChannelListing.objects.bulk_create(
-        [
-            # Channel: USD
-            ProductChannelListing(
-                product=products[0],
-                channel=channel_USD,
-                is_published=True,
-                currency=channel_USD.currency_code,
-                visible_in_listings=True,
-            ),
-            # Channel: PLN
-            ProductChannelListing(
-                product=products[1],
-                channel=channel_PLN,
-                is_published=True,
-                currency=channel_PLN.currency_code,
-                visible_in_listings=True,
-            ),
-            ProductChannelListing(
-                product=products[2],
-                channel=channel_PLN,
-                is_published=True,
-                currency=channel_PLN.currency_code,
-                visible_in_listings=True,
-            ),
-        ]
-    )
-    variants = list(
-        ProductVariant.objects.bulk_create(
-            [
-                ProductVariant(
-                    product=products[0],
-                    sku=str(uuid.uuid4()).replace("-", ""),
-                    track_inventory=True,
-                ),
-                ProductVariant(
-                    product=products[1],
-                    sku=str(uuid.uuid4()).replace("-", ""),
-                    track_inventory=True,
-                ),
-                ProductVariant(
-                    product=products[2],
-                    sku=str(uuid.uuid4()).replace("-", ""),
-                    track_inventory=True,
-                ),
-            ]
-        )
-    )
-    ProductVariantChannelListing.objects.bulk_create(
-        [
-            # Channel: USD
-            ProductVariantChannelListing(
-                variant=variants[0],
-                channel=channel_USD,
-                cost_price_amount=Decimal(1),
-                price_amount=Decimal(10),
-                currency=channel_USD.currency_code,
-            ),
-            # Channel: PLN
-            ProductVariantChannelListing(
-                variant=variants[1],
-                channel=channel_PLN,
-                cost_price_amount=Decimal(1),
-                price_amount=Decimal(20),
-                currency=channel_PLN.currency_code,
-            ),
-            ProductVariantChannelListing(
-                variant=variants[2],
-                channel=channel_PLN,
-                cost_price_amount=Decimal(1),
-                price_amount=Decimal(30),
-                currency=channel_PLN.currency_code,
-            ),
-        ]
-    )
-
-
-@pytest.fixture
-def product_list_with_many_channels(product_list, channel_PLN):
-    ProductChannelListing.objects.bulk_create(
-        [
-            ProductChannelListing(
-                product=product_list[0],
-                channel=channel_PLN,
-                is_published=True,
-            ),
-            ProductChannelListing(
-                product=product_list[1],
-                channel=channel_PLN,
-                is_published=True,
-            ),
-            ProductChannelListing(
-                product=product_list[2],
-                channel=channel_PLN,
-                is_published=True,
-            ),
-        ]
-    )
-    return product_list
-
-
-@pytest.fixture
-def product_list_unpublished(product_list, channel_USD):
-    products = Product.objects.filter(pk__in=[product.pk for product in product_list])
-    ProductChannelListing.objects.filter(
-        product__in=products, channel=channel_USD
-    ).update(is_published=False)
-    return products
-
-
-@pytest.fixture
-def product_list_published(product_list, channel_USD):
-    products = Product.objects.filter(pk__in=[product.pk for product in product_list])
-    ProductChannelListing.objects.filter(
-        product__in=products, channel=channel_USD
-    ).update(is_published=True)
-    return products
-
-
-@pytest.fixture
-def order_list(customer_user, channel_USD):
-    address = customer_user.default_billing_address.get_copy()
-    data = {
-        "billing_address": address,
-        "user": customer_user,
-        "user_email": customer_user.email,
-        "channel": channel_USD,
-        "origin": OrderOrigin.CHECKOUT,
-    }
-    order = Order.objects.create(**data)
-    order1 = Order.objects.create(**data)
-    order2 = Order.objects.create(**data)
-
-    return [order, order1, order2]
-
-
-@pytest.fixture
-def product_with_image(product, image, media_root):
-    ProductMedia.objects.create(product=product, image=image)
-    return product
-
-
-@pytest.fixture
-def unavailable_product(product_type, category, channel_USD):
-    product = Product.objects.create(
-        name="Test product",
-        slug="test-product-5",
-        product_type=product_type,
-        category=category,
-    )
-    ProductChannelListing.objects.create(
-        product=product,
-        channel=channel_USD,
-        is_published=False,
-        visible_in_listings=False,
-    )
-    return product
-
-
-@pytest.fixture
-def unavailable_product_with_variant(product_type, category, warehouse, channel_USD):
-    product = Product.objects.create(
-        name="Test product",
-        slug="test-product-6",
-        product_type=product_type,
-        category=category,
-    )
-    ProductChannelListing.objects.create(
-        product=product,
-        channel=channel_USD,
-        is_published=False,
-        visible_in_listings=False,
-    )
-
-    variant_attr = product_type.variant_attributes.first()
-    variant_attr_value = variant_attr.values.first()
-
-    variant = ProductVariant.objects.create(
-        product=product,
-        sku="123",
-    )
-    ProductVariantChannelListing.objects.create(
-        variant=variant,
-        channel=channel_USD,
-        price_amount=Decimal(10),
-        cost_price_amount=Decimal(1),
-        currency=channel_USD.currency_code,
-    )
-    Stock.objects.create(product_variant=variant, warehouse=warehouse, quantity=10)
-
-    associate_attribute_values_to_instance(variant, variant_attr, variant_attr_value)
-    return product
-
-
-@pytest.fixture
-def product_with_images(product_type, category, media_root, channel_USD):
-    product = Product.objects.create(
-        name="Test product",
-        slug="test-product-7",
-        product_type=product_type,
-        category=category,
-    )
-    ProductChannelListing.objects.create(
-        product=product,
-        channel=channel_USD,
-        is_published=True,
-        visible_in_listings=True,
-    )
-    file_mock_0 = MagicMock(spec=File, name="FileMock0")
-    file_mock_0.name = "image0.jpg"
-    file_mock_1 = MagicMock(spec=File, name="FileMock1")
-    file_mock_1.name = "image1.jpg"
-    product.media.create(image=file_mock_0)
-    product.media.create(image=file_mock_1)
-    return product
-
-
-@pytest.fixture
-def voucher_without_channel(db):
-    return Voucher.objects.create(code="mirumee")
-
-
-@pytest.fixture
-def voucher(voucher_without_channel, channel_USD):
-    VoucherChannelListing.objects.create(
-        voucher=voucher_without_channel,
-        channel=channel_USD,
-        discount=Money(20, channel_USD.currency_code),
-    )
-    return voucher_without_channel
-
-
-@pytest.fixture
-def voucher_with_many_channels(voucher, channel_PLN):
-    VoucherChannelListing.objects.create(
-        voucher=voucher,
-        channel=channel_PLN,
-        discount=Money(80, channel_PLN.currency_code),
-    )
-    return voucher
-
-
-@pytest.fixture
-def voucher_percentage(channel_USD):
-    voucher = Voucher.objects.create(
-        code="saleor",
-        discount_value_type=DiscountValueType.PERCENTAGE,
-    )
-    VoucherChannelListing.objects.create(
-        voucher=voucher,
-        channel=channel_USD,
-        discount_value=10,
-        currency=channel_USD.currency_code,
-    )
-    return voucher
-
-
-@pytest.fixture
-def voucher_specific_product_type(voucher_percentage):
-    voucher_percentage.type = VoucherType.SPECIFIC_PRODUCT
-    voucher_percentage.save()
-    return voucher_percentage
-
-
-@pytest.fixture
-def voucher_with_high_min_spent_amount(channel_USD):
-    voucher = Voucher.objects.create(code="mirumee")
-    VoucherChannelListing.objects.create(
-        voucher=voucher,
-        channel=channel_USD,
-        discount=Money(10, channel_USD.currency_code),
-        min_spent_amount=1_000_000,
-    )
-    return voucher
-
-
-@pytest.fixture
-def voucher_shipping_type(channel_USD):
-    voucher = Voucher.objects.create(
-        code="mirumee", type=VoucherType.SHIPPING, countries="IS"
-    )
-    VoucherChannelListing.objects.create(
-        voucher=voucher,
-        channel=channel_USD,
-        discount=Money(10, channel_USD.currency_code),
-    )
-    return voucher
-
-
-@pytest.fixture
-def voucher_free_shipping(voucher_percentage, channel_USD):
-    voucher_percentage.type = VoucherType.SHIPPING
-    voucher_percentage.name = "Free shipping"
-    voucher_percentage.save()
-    voucher_percentage.channel_listings.filter(channel=channel_USD).update(
-        discount_value=100
-    )
-    return voucher_percentage
-
-
-@pytest.fixture
-def voucher_customer(voucher, customer_user):
-    email = customer_user.email
-    return VoucherCustomer.objects.create(voucher=voucher, customer_email=email)
-
-
-@pytest.fixture
-def order_line(order, variant):
-    product = variant.product
-    channel = order.channel
-    channel_listing = variant.channel_listings.get(channel=channel)
-    net = variant.get_price(product, [], channel, channel_listing)
-    currency = net.currency
-    gross = Money(amount=net.amount * Decimal(1.23), currency=currency)
-    quantity = 3
-    unit_price = TaxedMoney(net=net, gross=gross)
-    return order.lines.create(
-        product_name=str(product),
-        variant_name=str(variant),
-        product_sku=variant.sku,
-        is_shipping_required=variant.is_shipping_required(),
-        quantity=quantity,
-        variant=variant,
-        unit_price=unit_price,
-        total_price=unit_price * quantity,
-        undiscounted_unit_price=unit_price,
-        undiscounted_total_price=unit_price * quantity,
-        tax_rate=Decimal("0.23"),
-    )
-
-
-@pytest.fixture
-def order_line_with_allocation_in_many_stocks(
-    customer_user, variant_with_many_stocks, channel_USD
-):
-    address = customer_user.default_billing_address.get_copy()
-    variant = variant_with_many_stocks
-    stocks = variant.stocks.all().order_by("pk")
-
-    order = Order.objects.create(
-        billing_address=address,
-        user_email=customer_user.email,
-        user=customer_user,
-        channel=channel_USD,
-        origin=OrderOrigin.CHECKOUT,
-    )
-
-    product = variant.product
-    channel_listing = variant.channel_listings.get(channel=channel_USD)
-    net = variant.get_price(product, [], channel_USD, channel_listing)
-    currency = net.currency
-    gross = Money(amount=net.amount * Decimal(1.23), currency=currency)
-    quantity = 3
-    unit_price = TaxedMoney(net=net, gross=gross)
-    order_line = order.lines.create(
-        product_name=str(product),
-        variant_name=str(variant),
-        product_sku=variant.sku,
-        is_shipping_required=variant.is_shipping_required(),
-        quantity=quantity,
-        variant=variant,
-        unit_price=unit_price,
-        total_price=unit_price * quantity,
-        undiscounted_unit_price=unit_price,
-        undiscounted_total_price=unit_price * quantity,
-        tax_rate=Decimal("0.23"),
-    )
-
-    Allocation.objects.bulk_create(
-        [
-            Allocation(order_line=order_line, stock=stocks[0], quantity_allocated=2),
-            Allocation(order_line=order_line, stock=stocks[1], quantity_allocated=1),
-        ]
-    )
-
-    return order_line
-
-
-@pytest.fixture
-def order_line_with_one_allocation(
-    customer_user, variant_with_many_stocks, channel_USD
-):
-    address = customer_user.default_billing_address.get_copy()
-    variant = variant_with_many_stocks
-    stocks = variant.stocks.all().order_by("pk")
-
-    order = Order.objects.create(
-        billing_address=address,
-        user_email=customer_user.email,
-        user=customer_user,
-        channel=channel_USD,
-        origin=OrderOrigin.CHECKOUT,
-    )
-
-    product = variant.product
-    channel_listing = variant.channel_listings.get(channel=channel_USD)
-    net = variant.get_price(product, [], channel_USD, channel_listing)
-    currency = net.currency
-    gross = Money(amount=net.amount * Decimal(1.23), currency=currency)
-    quantity = 2
-    unit_price = TaxedMoney(net=net, gross=gross)
-    order_line = order.lines.create(
-        product_name=str(product),
-        variant_name=str(variant),
-        product_sku=variant.sku,
-        is_shipping_required=variant.is_shipping_required(),
-        quantity=quantity,
-        variant=variant,
-        unit_price=unit_price,
-        total_price=unit_price * quantity,
-        undiscounted_unit_price=unit_price,
-        undiscounted_total_price=unit_price * quantity,
-        tax_rate=Decimal("0.23"),
-    )
-
-    Allocation.objects.create(
-        order_line=order_line, stock=stocks[0], quantity_allocated=1
-    )
-
-    return order_line
-
-
-@pytest.fixture
-def gift_card(customer_user):
-    return GiftCard.objects.create(
-        code="never_expiry",
-        created_by=customer_user,
-        created_by_email=customer_user.email,
-        initial_balance=Money(10, "USD"),
-        current_balance=Money(10, "USD"),
-        expiry_type=GiftCardExpiryType.NEVER_EXPIRE,
-        tag="test-tag",
-    )
-
-
-@pytest.fixture
-def gift_card_expiry_period(customer_user):
-    return GiftCard.objects.create(
-        code="expiry_period",
-        created_by=customer_user,
-        created_by_email=customer_user.email,
-        initial_balance=Money(10, "USD"),
-        current_balance=Money(10, "USD"),
-        expiry_type=GiftCardExpiryType.EXPIRY_PERIOD,
-        expiry_period_type=TimePeriodType.YEAR,
-        expiry_period=2,
-        tag="another-tag",
-    )
-
-
-@pytest.fixture
-def gift_card_expiry_date(customer_user):
-    return GiftCard.objects.create(
-        code="expiry_date",
-        created_by=customer_user,
-        created_by_email=customer_user.email,
-        initial_balance=Money(10, "USD"),
-        current_balance=Money(10, "USD"),
-        expiry_type=GiftCardExpiryType.EXPIRY_DATE,
-        expiry_date=datetime.date.today() + datetime.timedelta(days=100),
-        tag="another-tag",
-    )
-
-
-@pytest.fixture
-def gift_card_used(staff_user, customer_user):
-    return GiftCard.objects.create(
-        code="giftcard_used",
-        created_by=staff_user,
-        used_by=customer_user,
-        created_by_email=staff_user.email,
-        used_by_email=customer_user.email,
-        initial_balance=Money(100, "USD"),
-        current_balance=Money(100, "USD"),
-        expiry_type=GiftCardExpiryType.NEVER_EXPIRE,
-        tag="tag",
-    )
-
-
-@pytest.fixture
-def gift_card_created_by_staff(staff_user):
-    return GiftCard.objects.create(
-        code="created_by_staff",
-        created_by=staff_user,
-        created_by_email=staff_user.email,
-        initial_balance=Money(10, "USD"),
-        current_balance=Money(10, "USD"),
-        expiry_type=GiftCardExpiryType.EXPIRY_PERIOD,
-        expiry_period_type=TimePeriodType.YEAR,
-        expiry_period=2,
-        tag="test-tag",
-    )
-
-
-@pytest.fixture
-def gift_card_event(gift_card, order, app, staff_user):
-    parameters = {
-        "message": "test message",
-        "email": "testemail@email.com",
-        "order_id": order.pk,
-        "tag": "test tag",
-        "old_tag": "test old tag",
-        "balance": {
-            "currency": "USD",
-            "initial_balance": 10,
-            "old_initial_balance": 20,
-            "current_balance": 10,
-            "old_current_balance": 5,
-        },
-        "expiry": {
-            "expiry_type": GiftCardExpiryType.EXPIRY_PERIOD,
-            "old_expiry_type": GiftCardExpiryType.EXPIRY_DATE,
-            "expiry_period_type": TimePeriodType.MONTH,
-            "expiry_period": 10,
-            "expiry_date": datetime.date(2050, 1, 1),
-        },
-    }
-    return GiftCardEvent.objects.create(
-        user=staff_user,
-        app=app,
-        gift_card=gift_card,
-        type=GiftCardEvents.UPDATED,
-        parameters=parameters,
-        date=timezone.now() + datetime.timedelta(days=10),
-    )
-
-
-@pytest.fixture
-def order_with_lines(
-    order, product_type, category, shipping_zone, warehouse, channel_USD
-):
-    product = Product.objects.create(
-        name="Test product",
-        slug="test-product-8",
-        product_type=product_type,
-        category=category,
-    )
-    ProductChannelListing.objects.create(
-        product=product,
-        channel=channel_USD,
-        is_published=True,
-        visible_in_listings=True,
-        available_for_purchase=datetime.date.today(),
-    )
-    variant = ProductVariant.objects.create(product=product, sku="SKU_AA")
-    channel_listing = ProductVariantChannelListing.objects.create(
-        variant=variant,
-        channel=channel_USD,
-        price_amount=Decimal(10),
-        cost_price_amount=Decimal(1),
-        currency=channel_USD.currency_code,
-    )
-    stock = Stock.objects.create(
-        warehouse=warehouse, product_variant=variant, quantity=5
-    )
-    net = variant.get_price(product, [], channel_USD, channel_listing)
-    currency = net.currency
-    gross = Money(amount=net.amount * Decimal(1.23), currency=currency)
-    quantity = 3
-    unit_price = TaxedMoney(net=net, gross=gross)
-    line = order.lines.create(
-        product_name=str(variant.product),
-        variant_name=str(variant),
-        product_sku=variant.sku,
-        is_shipping_required=variant.is_shipping_required(),
-        quantity=quantity,
-        variant=variant,
-        unit_price=unit_price,
-        total_price=unit_price * quantity,
-        undiscounted_unit_price=unit_price,
-        undiscounted_total_price=unit_price * quantity,
-        tax_rate=Decimal("0.23"),
-    )
-    Allocation.objects.create(
-        order_line=line, stock=stock, quantity_allocated=line.quantity
-    )
-
-    product = Product.objects.create(
-        name="Test product 2",
-        slug="test-product-9",
-        product_type=product_type,
-        category=category,
-    )
-    ProductChannelListing.objects.create(
-        product=product,
-        channel=channel_USD,
-        is_published=True,
-        visible_in_listings=True,
-        available_for_purchase=datetime.date.today(),
-    )
-    variant = ProductVariant.objects.create(product=product, sku="SKU_B")
-    channel_listing = ProductVariantChannelListing.objects.create(
-        variant=variant,
-        channel=channel_USD,
-        price_amount=Decimal(20),
-        cost_price_amount=Decimal(2),
-        currency=channel_USD.currency_code,
-    )
-    stock = Stock.objects.create(
-        product_variant=variant, warehouse=warehouse, quantity=2
-    )
-
-    net = variant.get_price(product, [], channel_USD, channel_listing)
-    currency = net.currency
-    gross = Money(amount=net.amount * Decimal(1.23), currency=currency)
-    unit_price = TaxedMoney(net=net, gross=gross)
-    quantity = 2
-    line = order.lines.create(
-        product_name=str(variant.product),
-        variant_name=str(variant),
-        product_sku=variant.sku,
-        is_shipping_required=variant.is_shipping_required(),
-        quantity=quantity,
-        variant=variant,
-        unit_price=unit_price,
-        total_price=unit_price * quantity,
-        undiscounted_unit_price=unit_price,
-        undiscounted_total_price=unit_price * quantity,
-        tax_rate=Decimal("0.23"),
-    )
-    Allocation.objects.create(
-        order_line=line, stock=stock, quantity_allocated=line.quantity
-    )
-
-    order.shipping_address = order.billing_address.get_copy()
-    order.channel = channel_USD
-    shipping_method = shipping_zone.shipping_methods.first()
-    shipping_price = shipping_method.channel_listings.get(channel_id=channel_USD.id)
-    order.shipping_method_name = shipping_method.name
-    order.shipping_method = shipping_method
-
-    net = shipping_price.get_total()
-    gross = Money(amount=net.amount * Decimal(1.23), currency=net.currency)
-    order.shipping_price = TaxedMoney(net=net, gross=gross)
-    order.save()
-
-    recalculate_order(order)
-
-    order.refresh_from_db()
-    return order
-
-
-@pytest.fixture
-def lines_info(order_with_lines):
-    return [
-        OrderLineData(
-            line=line,
-            quantity=line.quantity,
-            variant=line.variant,
-            warehouse_pk=line.allocations.first().stock.warehouse.pk,
-        )
-        for line in order_with_lines.lines.all()
-    ]
-
-
-@pytest.fixture
-def order_with_lines_and_events(order_with_lines, staff_user):
-    events = []
-    for event_type, _ in OrderEvents.CHOICES:
-        events.append(
-            OrderEvent(
-                type=event_type,
-                order=order_with_lines,
-                user=staff_user,
-            )
-        )
-    OrderEvent.objects.bulk_create(events)
-    fulfillment_refunded_event(
-        order=order_with_lines,
-        user=staff_user,
-        app=None,
-        refunded_lines=[(1, order_with_lines.lines.first())],
-        amount=Decimal("10.0"),
-        shipping_costs_included=False,
-    )
-    order_added_products_event(
-        order=order_with_lines,
-        user=staff_user,
-        app=None,
-        order_lines=[(1, order_with_lines.lines.first())],
-    )
-    return order_with_lines
-
-
-@pytest.fixture
-def order_with_lines_channel_PLN(
-    customer_user,
-    product_type,
-    category,
-    shipping_method_channel_PLN,
-    warehouse,
-    channel_PLN,
-):
-    address = customer_user.default_billing_address.get_copy()
-    order = Order.objects.create(
-        billing_address=address,
-        channel=channel_PLN,
-        shipping_address=address,
-        user_email=customer_user.email,
-        user=customer_user,
-        origin=OrderOrigin.CHECKOUT,
-    )
-    product = Product.objects.create(
-        name="Test product in PLN channel",
-        slug="test-product-8-pln",
-        product_type=product_type,
-        category=category,
-    )
-    ProductChannelListing.objects.create(
-        product=product,
-        channel=channel_PLN,
-        is_published=True,
-        visible_in_listings=True,
-        available_for_purchase=datetime.date.today(),
-    )
-    variant = ProductVariant.objects.create(product=product, sku="SKU_A_PLN")
-    channel_listing = ProductVariantChannelListing.objects.create(
-        variant=variant,
-        channel=channel_PLN,
-        price_amount=Decimal(10),
-        cost_price_amount=Decimal(1),
-        currency=channel_PLN.currency_code,
-    )
-    stock = Stock.objects.create(
-        warehouse=warehouse, product_variant=variant, quantity=5
-    )
-    net = variant.get_price(product, [], channel_PLN, channel_listing)
-    currency = net.currency
-    gross = Money(amount=net.amount * Decimal(1.23), currency=currency)
-    quantity = 3
-    unit_price = TaxedMoney(net=net, gross=gross)
-    line = order.lines.create(
-        product_name=str(variant.product),
-        variant_name=str(variant),
-        product_sku=variant.sku,
-        is_shipping_required=variant.is_shipping_required(),
-        quantity=quantity,
-        variant=variant,
-        unit_price=unit_price,
-        total_price=unit_price * quantity,
-        undiscounted_unit_price=unit_price,
-        undiscounted_total_price=unit_price * quantity,
-        tax_rate=Decimal("0.23"),
-    )
-    Allocation.objects.create(
-        order_line=line, stock=stock, quantity_allocated=line.quantity
-    )
-
-    product = Product.objects.create(
-        name="Test product 2 in PLN channel",
-        slug="test-product-9-pln",
-        product_type=product_type,
-        category=category,
-    )
-    ProductChannelListing.objects.create(
-        product=product,
-        channel=channel_PLN,
-        is_published=True,
-        visible_in_listings=True,
-        available_for_purchase=datetime.date.today(),
-    )
-    variant = ProductVariant.objects.create(product=product, sku="SKU_B_PLN")
-    channel_listing = ProductVariantChannelListing.objects.create(
-        variant=variant,
-        channel=channel_PLN,
-        price_amount=Decimal(20),
-        cost_price_amount=Decimal(2),
-        currency=channel_PLN.currency_code,
-    )
-    stock = Stock.objects.create(
-        product_variant=variant, warehouse=warehouse, quantity=2
-    )
-
-    net = variant.get_price(product, [], channel_PLN, channel_listing, None)
-    currency = net.currency
-    gross = Money(amount=net.amount * Decimal(1.23), currency=currency)
-    quantity = 2
-    unit_price = TaxedMoney(net=net, gross=gross)
-    line = order.lines.create(
-        product_name=str(variant.product),
-        variant_name=str(variant),
-        product_sku=variant.sku,
-        is_shipping_required=variant.is_shipping_required(),
-        quantity=quantity,
-        variant=variant,
-        unit_price=unit_price,
-        total_price=unit_price * quantity,
-        undiscounted_unit_price=unit_price,
-        undiscounted_total_price=unit_price * quantity,
-        tax_rate=Decimal("0.23"),
-    )
-    Allocation.objects.create(
-        order_line=line, stock=stock, quantity_allocated=line.quantity
-    )
-
-    order.shipping_address = order.billing_address.get_copy()
-    order.channel = channel_PLN
-    shipping_method = shipping_method_channel_PLN
-    shipping_price = shipping_method.channel_listings.get(
-        channel_id=channel_PLN.id,
-    )
-    order.shipping_method_name = shipping_method.name
-    order.shipping_method = shipping_method
-
-    net = shipping_price.get_total()
-    gross = Money(amount=net.amount * Decimal(1.23), currency=net.currency)
-    order.shipping_price = TaxedMoney(net=net, gross=gross)
-    order.save()
-
-    recalculate_order(order)
-
-    order.refresh_from_db()
-    return order
-
-
-@pytest.fixture
-def order_with_line_without_inventory_tracking(
-    order, variant_without_inventory_tracking
-):
-    variant = variant_without_inventory_tracking
-    product = variant.product
-    channel = order.channel
-    channel_listing = variant.channel_listings.get(channel=channel)
-    net = variant.get_price(product, [], channel, channel_listing)
-    currency = net.currency
-    gross = Money(amount=net.amount * Decimal(1.23), currency=currency)
-    quantity = 3
-    unit_price = TaxedMoney(net=net, gross=gross)
-    line = order.lines.create(
-        product_name=str(variant.product),
-        variant_name=str(variant),
-        product_sku=variant.sku,
-        is_shipping_required=variant.is_shipping_required(),
-        quantity=quantity,
-        variant=variant,
-        unit_price=unit_price,
-        total_price=unit_price * quantity,
-        undiscounted_unit_price=unit_price,
-        undiscounted_total_price=unit_price * quantity,
-        tax_rate=Decimal("0.23"),
-    )
-
-    recalculate_order(order)
-
-    order.refresh_from_db()
-    return order
-
-
-@pytest.fixture
-def order_events(order):
-    for event_type, _ in OrderEvents.CHOICES:
-        OrderEvent.objects.create(type=event_type, order=order)
-
-
-@pytest.fixture
-def fulfilled_order(order_with_lines):
-    order = order_with_lines
-    invoice = order.invoices.create(
-        url="http://www.example.com/invoice.pdf",
-        number="01/12/2020/TEST",
-        created=datetime.datetime.now(tz=pytz.utc),
-        status=JobStatus.SUCCESS,
-    )
-    fulfillment = order.fulfillments.create(tracking_number="123")
-    line_1 = order.lines.first()
-    stock_1 = line_1.allocations.get().stock
-    warehouse_1_pk = stock_1.warehouse.pk
-    line_2 = order.lines.last()
-    stock_2 = line_2.allocations.get().stock
-    warehouse_2_pk = stock_2.warehouse.pk
-    fulfillment.lines.create(order_line=line_1, quantity=line_1.quantity, stock=stock_1)
-    fulfillment.lines.create(order_line=line_2, quantity=line_2.quantity, stock=stock_2)
-    fulfill_order_lines(
-        [
-            OrderLineData(
-                line=line_1, quantity=line_1.quantity, warehouse_pk=warehouse_1_pk
-            ),
-            OrderLineData(
-                line=line_2, quantity=line_2.quantity, warehouse_pk=warehouse_2_pk
-            ),
-        ],
-    )
-    order.status = OrderStatus.FULFILLED
-    order.save(update_fields=["status"])
-    return order
-
-
-@pytest.fixture
-def fulfilled_order_without_inventory_tracking(
-    order_with_line_without_inventory_tracking,
-):
-    order = order_with_line_without_inventory_tracking
-    fulfillment = order.fulfillments.create(tracking_number="123")
-    line = order.lines.first()
-    stock = line.variant.stocks.get()
-    warehouse_pk = stock.warehouse.pk
-    fulfillment.lines.create(order_line=line, quantity=line.quantity, stock=stock)
-    fulfill_order_lines(
-        [OrderLineData(line=line, quantity=line.quantity, warehouse_pk=warehouse_pk)]
-    )
-    order.status = OrderStatus.FULFILLED
-    order.save(update_fields=["status"])
-    return order
-
-
-@pytest.fixture
-def fulfilled_order_with_cancelled_fulfillment(fulfilled_order):
-    fulfillment = fulfilled_order.fulfillments.create()
-    line_1 = fulfilled_order.lines.first()
-    line_2 = fulfilled_order.lines.last()
-    fulfillment.lines.create(order_line=line_1, quantity=line_1.quantity)
-    fulfillment.lines.create(order_line=line_2, quantity=line_2.quantity)
-    fulfillment.status = FulfillmentStatus.CANCELED
-    fulfillment.save()
-    return fulfilled_order
-
-
-@pytest.fixture
-def fulfilled_order_with_all_cancelled_fulfillments(
-    fulfilled_order, staff_user, warehouse
-):
-    fulfillment = fulfilled_order.fulfillments.get()
-    cancel_fulfillment(fulfillment, staff_user, None, warehouse, get_plugins_manager())
-    return fulfilled_order
-
-
-@pytest.fixture
-def fulfillment(fulfilled_order):
-    return fulfilled_order.fulfillments.first()
-
-
-@pytest.fixture
-def draft_order(order_with_lines):
-    Allocation.objects.filter(order_line__order=order_with_lines).delete()
-    order_with_lines.status = OrderStatus.DRAFT
-    order_with_lines.origin = OrderOrigin.DRAFT
-    order_with_lines.save(update_fields=["status", "origin"])
-    return order_with_lines
-
-
-@pytest.fixture
-def draft_order_with_fixed_discount_order(draft_order):
-    value = Decimal("20")
-    discount = partial(fixed_discount, discount=Money(value, draft_order.currency))
-    draft_order.undiscounted_total = draft_order.total
-    draft_order.total = discount(draft_order.total)
-    draft_order.discounts.create(
-        value_type=DiscountValueType.FIXED,
-        value=value,
-        reason="Discount reason",
-        amount=(draft_order.undiscounted_total - draft_order.total).gross,  # type: ignore
-    )
-    draft_order.save()
-    return draft_order
-
-
-@pytest.fixture
-def draft_order_without_inventory_tracking(order_with_line_without_inventory_tracking):
-    order_with_line_without_inventory_tracking.status = OrderStatus.DRAFT
-    order_with_line_without_inventory_tracking.origin = OrderStatus.DRAFT
-    order_with_line_without_inventory_tracking.save(update_fields=["status", "origin"])
-    return order_with_line_without_inventory_tracking
-
-
-@pytest.fixture
-def payment_txn_preauth(order_with_lines, payment_dummy):
-    order = order_with_lines
-    payment = payment_dummy
-    payment.order = order
-    payment.save()
-
-    payment.transactions.create(
-        amount=payment.total,
-        currency=payment.currency,
-        kind=TransactionKind.AUTH,
-        gateway_response={},
-        is_success=True,
-    )
-    return payment
-
-
-@pytest.fixture
-def payment_txn_captured(order_with_lines, payment_dummy):
-    order = order_with_lines
-    payment = payment_dummy
-    payment.order = order
-    payment.charge_status = ChargeStatus.FULLY_CHARGED
-    payment.captured_amount = payment.total
-    payment.save()
-
-    payment.transactions.create(
-        amount=payment.total,
-        currency=payment.currency,
-        kind=TransactionKind.CAPTURE,
-        gateway_response={},
-        is_success=True,
-    )
-    return payment
-
-
-@pytest.fixture
-def payment_txn_capture_failed(order_with_lines, payment_dummy):
-    order = order_with_lines
-    payment = payment_dummy
-    payment.order = order
-    payment.charge_status = ChargeStatus.REFUSED
-    payment.save()
-
-    payment.transactions.create(
-        amount=payment.total,
-        currency=payment.currency,
-        kind=TransactionKind.CAPTURE_FAILED,
-        gateway_response={
-            "status": 403,
-            "errorCode": "901",
-            "message": "Invalid Merchant Account",
-            "errorType": "security",
-        },
-        error="invalid",
-        is_success=False,
-    )
-    return payment
-
-
-@pytest.fixture
-def payment_txn_to_confirm(order_with_lines, payment_dummy):
-    order = order_with_lines
-    payment = payment_dummy
-    payment.order = order
-    payment.to_confirm = True
-    payment.save()
-
-    payment.transactions.create(
-        amount=payment.total,
-        currency=payment.currency,
-        kind=TransactionKind.ACTION_TO_CONFIRM,
-        gateway_response={},
-        is_success=True,
-        action_required=True,
-    )
-    return payment
-
-
-@pytest.fixture
-def payment_txn_refunded(order_with_lines, payment_dummy):
-    order = order_with_lines
-    payment = payment_dummy
-    payment.order = order
-    payment.charge_status = ChargeStatus.FULLY_REFUNDED
-    payment.is_active = False
-    payment.save()
-
-    payment.transactions.create(
-        amount=payment.total,
-        currency=payment.currency,
-        kind=TransactionKind.REFUND,
-        gateway_response={},
-        is_success=True,
-    )
-    return payment
-
-
-@pytest.fixture
-def payment_not_authorized(payment_dummy):
-    payment_dummy.is_active = False
-    payment_dummy.save()
-    return payment_dummy
-
-
-@pytest.fixture
-def dummy_gateway_config():
-    return GatewayConfig(
-        gateway_name="Dummy",
-        auto_capture=True,
-        supported_currencies="USD",
-        connection_params={"secret-key": "nobodylikesspanishinqusition"},
-    )
-
-
-@pytest.fixture
-def dummy_payment_data(payment_dummy):
-    return PaymentData(
-        gateway=payment_dummy.gateway,
-        amount=Decimal(10),
-        currency="USD",
-        graphql_payment_id=graphene.Node.to_global_id("Payment", payment_dummy.pk),
-        payment_id=payment_dummy.pk,
-        billing=None,
-        shipping=None,
-        order_id=None,
-        customer_ip_address=None,
-        customer_email="example@test.com",
+def dummy_address_data(address):
+    return AddressData(
+        first_name=address.first_name,
+        last_name=address.last_name,
+        company_name=address.company_name,
+        street_address_1=address.street_address_1,
+        street_address_2=address.street_address_2,
+        city=address.city,
+        city_area=address.city_area,
+        postal_code=address.postal_code,
+        country=address.country,
+        country_area=address.country_area,
+        phone=address.phone,
+        metadata=address.metadata,
+        private_metadata=address.private_metadata,
     )
 
 
@@ -3230,134 +300,92 @@ def dummy_webhook_app_payment_data(dummy_payment_data, payment_app):
 
 
 @pytest.fixture
-def new_sale(category, channel_USD):
-    sale = Sale.objects.create(name="Sale")
-    SaleChannelListing.objects.create(
-        sale=sale,
-        channel=channel_USD,
-        discount_value=5,
-        currency=channel_USD.currency_code,
+def promotion_events(catalogue_promotion, staff_user):
+    promotion = catalogue_promotion
+    rule_id = promotion.rules.first().pk
+    events = PromotionEvent.objects.bulk_create(
+        [
+            PromotionEvent(
+                type=PromotionEvents.PROMOTION_CREATED,
+                user=staff_user,
+                promotion=promotion,
+            ),
+            PromotionEvent(
+                type=PromotionEvents.PROMOTION_UPDATED,
+                user=staff_user,
+                promotion=promotion,
+            ),
+            PromotionEvent(
+                type=PromotionEvents.RULE_CREATED,
+                user=staff_user,
+                promotion=promotion,
+                parameters={"rule_id": rule_id},
+            ),
+            PromotionEvent(
+                type=PromotionEvents.RULE_UPDATED,
+                user=staff_user,
+                promotion=promotion,
+                parameters={"rule_id": rule_id},
+            ),
+            PromotionEvent(
+                type=PromotionEvents.RULE_DELETED,
+                user=staff_user,
+                promotion=promotion,
+                parameters={"rule_id": rule_id},
+            ),
+            PromotionEvent(
+                type=PromotionEvents.PROMOTION_STARTED,
+                user=staff_user,
+                promotion=promotion,
+            ),
+            PromotionEvent(
+                type=PromotionEvents.PROMOTION_ENDED,
+                user=staff_user,
+                promotion=promotion,
+            ),
+        ]
     )
-    return sale
+    return events
 
 
 @pytest.fixture
-def sale(product, category, collection, channel_USD):
-    sale = Sale.objects.create(name="Sale")
-    SaleChannelListing.objects.create(
-        sale=sale,
-        channel=channel_USD,
-        discount_value=5,
-        currency=channel_USD.currency_code,
+def permission_group_manage_discounts(permission_manage_discounts, staff_users):
+    group = Group.objects.create(
+        name="Manage discounts group.", restricted_access_to_channels=False
     )
-    sale.products.add(product)
-    sale.categories.add(category)
-    sale.collections.add(collection)
-    return sale
+    group.permissions.add(permission_manage_discounts)
+
+    group.user_set.add(staff_users[1])
+    return group
 
 
 @pytest.fixture
-def sale_with_many_channels(product, category, collection, channel_USD, channel_PLN):
-    sale = Sale.objects.create(name="Sale")
-    SaleChannelListing.objects.create(
-        sale=sale,
-        channel=channel_USD,
-        discount_value=5,
-        currency=channel_USD.currency_code,
+def permission_group_manage_orders(permission_manage_orders, staff_users):
+    group = Group.objects.create(
+        name="Manage orders group.", restricted_access_to_channels=False
     )
-    SaleChannelListing.objects.create(
-        sale=sale,
-        channel=channel_PLN,
-        discount_value=5,
-        currency=channel_PLN.currency_code,
+    group.permissions.add(permission_manage_orders)
+
+    group.user_set.add(staff_users[1])
+    return group
+
+
+@pytest.fixture
+def permission_group_manage_shipping(permission_manage_shipping, staff_users):
+    group = Group.objects.create(
+        name="Manage shipping group.", restricted_access_to_channels=False
     )
-    sale.products.add(product)
-    sale.categories.add(category)
-    sale.collections.add(collection)
-    return sale
+    group.permissions.add(permission_manage_shipping)
 
-
-@pytest.fixture
-def discount_info(category, collection, sale, channel_USD):
-    sale_channel_listing = sale.channel_listings.get(channel=channel_USD)
-
-    return DiscountInfo(
-        sale=sale,
-        channel_listings={channel_USD.slug: sale_channel_listing},
-        product_ids=set(),
-        category_ids={category.id},  # assumes this category does not have children
-        collection_ids={collection.id},
-    )
-
-
-@pytest.fixture
-def permission_manage_staff():
-    return Permission.objects.get(codename="manage_staff")
-
-
-@pytest.fixture
-def permission_manage_products():
-    return Permission.objects.get(codename="manage_products")
-
-
-@pytest.fixture
-def permission_manage_product_types_and_attributes():
-    return Permission.objects.get(codename="manage_product_types_and_attributes")
-
-
-@pytest.fixture
-def permission_manage_shipping():
-    return Permission.objects.get(codename="manage_shipping")
-
-
-@pytest.fixture
-def permission_manage_users():
-    return Permission.objects.get(codename="manage_users")
-
-
-@pytest.fixture
-def permission_manage_settings():
-    return Permission.objects.get(codename="manage_settings")
-
-
-@pytest.fixture
-def permission_manage_menus():
-    return Permission.objects.get(codename="manage_menus")
-
-
-@pytest.fixture
-def permission_manage_pages():
-    return Permission.objects.get(codename="manage_pages")
-
-
-@pytest.fixture
-def permission_manage_page_types_and_attributes():
-    return Permission.objects.get(codename="manage_page_types_and_attributes")
-
-
-@pytest.fixture
-def permission_manage_translations():
-    return Permission.objects.get(codename="manage_translations")
-
-
-@pytest.fixture
-def permission_manage_webhooks():
-    return Permission.objects.get(codename="manage_webhooks")
-
-
-@pytest.fixture
-def permission_manage_channels():
-    return Permission.objects.get(codename="manage_channels")
-
-
-@pytest.fixture
-def permission_manage_payments():
-    return Permission.objects.get(codename="handle_payments")
+    group.user_set.add(staff_users[1])
+    return group
 
 
 @pytest.fixture
 def permission_group_manage_users(permission_manage_users, staff_users):
-    group = Group.objects.create(name="Manage user groups.")
+    group = Group.objects.create(
+        name="Manage user group.", restricted_access_to_channels=False
+    )
     group.permissions.add(permission_manage_users)
 
     group.user_set.add(staff_users[1])
@@ -3365,339 +393,108 @@ def permission_group_manage_users(permission_manage_users, staff_users):
 
 
 @pytest.fixture
-def collection(db):
-    collection = Collection.objects.create(
-        name="Collection",
-        slug="collection",
-        description=dummy_editorjs("Test description."),
+def permission_group_manage_staff(permission_manage_staff, staff_users):
+    group = Group.objects.create(
+        name="Manage staff group.", restricted_access_to_channels=False
     )
-    return collection
+    group.permissions.add(permission_manage_staff)
+
+    group.user_set.add(staff_users[1])
+    return group
 
 
 @pytest.fixture
-def published_collection(db, channel_USD):
-    collection = Collection.objects.create(
-        name="Collection USD",
-        slug="collection-usd",
-        description=dummy_editorjs("Test description."),
+def permission_group_manage_apps(permission_manage_apps, staff_users):
+    group = Group.objects.create(
+        name="Manage apps group.", restricted_access_to_channels=False
     )
-    CollectionChannelListing.objects.create(
-        channel=channel_USD,
-        collection=collection,
-        is_published=True,
-        publication_date=datetime.date.today(),
-    )
-    return collection
+    group.permissions.add(permission_manage_apps)
+
+    group.user_set.add(staff_users[1])
+    return group
 
 
 @pytest.fixture
-def published_collection_PLN(db, channel_PLN):
-    collection = Collection.objects.create(
-        name="Collection PLN",
-        slug="collection-pln",
-        description=dummy_editorjs("Test description."),
+def permission_group_handle_payments(permission_manage_payments, staff_users):
+    group = Group.objects.create(
+        name="Manage apps group.", restricted_access_to_channels=False
     )
-    CollectionChannelListing.objects.create(
-        channel=channel_PLN,
-        collection=collection,
-        is_published=True,
-        publication_date=datetime.date.today(),
+    group.permissions.add(permission_manage_payments)
+
+    group.user_set.add(staff_users[1])
+    return group
+
+
+@pytest.fixture
+def permission_group_all_perms_all_channels(
+    permission_manage_users, staff_users, channel_USD, channel_PLN
+):
+    group = Group.objects.create(
+        name="All permissions for all channels.",
+        restricted_access_to_channels=False,
     )
-    return collection
+    permissions = get_permissions()
+    group.permissions.add(*permissions)
+
+    group.user_set.add(staff_users[1])
+    return group
 
 
 @pytest.fixture
-def unpublished_collection(db, channel_USD):
-    collection = Collection.objects.create(
-        name="Unpublished Collection",
-        slug="unpublished-collection",
-        description=dummy_editorjs("Test description."),
+def permission_group_no_perms_all_channels(staff_users, channel_USD, channel_PLN):
+    group = Group.objects.create(
+        name="All permissions for all channels.",
+        restricted_access_to_channels=False,
     )
-    CollectionChannelListing.objects.create(
-        channel=channel_USD, collection=collection, is_published=False
+    group.user_set.add(staff_users[1])
+    return group
+
+
+@pytest.fixture
+def permission_group_all_perms_channel_USD_only(
+    permission_manage_users, staff_users, channel_USD, channel_PLN
+):
+    group = Group.objects.create(
+        name="All permissions for USD channel only.",
+        restricted_access_to_channels=True,
     )
-    return collection
+    permissions = get_permissions()
+    group.permissions.add(*permissions)
+
+    group.channels.add(channel_USD)
+
+    group.user_set.add(staff_users[1])
+    return group
 
 
 @pytest.fixture
-def unpublished_collection_PLN(db, channel_PLN):
-    collection = Collection.objects.create(
-        name="Collection",
-        slug="collection",
-        description=dummy_editorjs("Test description."),
+def permission_group_all_perms_without_any_channel(
+    permission_manage_users, staff_users, channel_USD, channel_PLN
+):
+    group = Group.objects.create(
+        name="All permissions without any channel access.",
+        restricted_access_to_channels=True,
     )
-    CollectionChannelListing.objects.create(
-        channel=channel_PLN, collection=collection, is_published=False
-    )
-    return collection
+    permissions = get_permissions()
+    group.permissions.add(*permissions)
+    return group
 
 
 @pytest.fixture
-def collection_with_products(db, published_collection, product_list_published):
-    published_collection.products.set(list(product_list_published))
-    return product_list_published
-
-
-@pytest.fixture
-def collection_with_image(db, image, media_root, channel_USD):
-    collection = Collection.objects.create(
-        name="Collection",
-        slug="collection",
-        description=dummy_editorjs("Test description."),
-        background_image=image,
-    )
-    CollectionChannelListing.objects.create(
-        channel=channel_USD, collection=collection, is_published=False
-    )
-    return collection
-
-
-@pytest.fixture
-def collection_list(db, channel_USD):
-    collections = Collection.objects.bulk_create(
-        [
-            Collection(name="Collection 1", slug="collection-1"),
-            Collection(name="Collection 2", slug="collection-2"),
-            Collection(name="Collection 3", slug="collection-3"),
-        ]
-    )
-    CollectionChannelListing.objects.bulk_create(
-        [
-            CollectionChannelListing(
-                channel=channel_USD, collection=collection, is_published=True
-            )
-            for collection in collections
-        ]
-    )
-    return collections
-
-
-@pytest.fixture
-def page(db, page_type):
-    data = {
-        "slug": "test-url",
-        "title": "Test page",
-        "content": dummy_editorjs("Test content."),
-        "is_published": True,
-        "page_type": page_type,
-    }
-    page = Page.objects.create(**data)
-
-    # associate attribute value
-    page_attr = page_type.page_attributes.first()
-    page_attr_value = page_attr.values.first()
-
-    associate_attribute_values_to_instance(page, page_attr, page_attr_value)
-
-    return page
-
-
-@pytest.fixture
-def page_with_rich_text_attribute(db, page_type_with_rich_text_attribute):
-    data = {
-        "slug": "test-url",
-        "title": "Test page",
-        "content": dummy_editorjs("Test content."),
-        "is_published": True,
-        "page_type": page_type_with_rich_text_attribute,
-    }
-    page = Page.objects.create(**data)
-
-    # associate attribute value
-    page_attr = page_type_with_rich_text_attribute.page_attributes.first()
-    page_attr_value = page_attr.values.first()
-
-    associate_attribute_values_to_instance(page, page_attr, page_attr_value)
-
-    return page
-
-
-@pytest.fixture
-def page_list(db, page_type):
-    data_1 = {
-        "slug": "test-url",
-        "title": "Test page",
-        "content": dummy_editorjs("Test content."),
-        "is_published": True,
-        "page_type": page_type,
-    }
-    data_2 = {
-        "slug": "test-url-2",
-        "title": "Test page",
-        "content": dummy_editorjs("Test content."),
-        "is_published": True,
-        "page_type": page_type,
-    }
-    pages = Page.objects.bulk_create([Page(**data_1), Page(**data_2)])
-    return pages
-
-
-@pytest.fixture
-def page_list_unpublished(db, page_type):
-    pages = Page.objects.bulk_create(
-        [
-            Page(
-                slug="page-1", title="Page 1", is_published=False, page_type=page_type
-            ),
-            Page(
-                slug="page-2", title="Page 2", is_published=False, page_type=page_type
-            ),
-            Page(
-                slug="page-3", title="Page 3", is_published=False, page_type=page_type
-            ),
-        ]
-    )
-    return pages
-
-
-@pytest.fixture
-def page_type(db, size_page_attribute, tag_page_attribute):
-    page_type = PageType.objects.create(name="Test page type", slug="test-page-type")
-    page_type.page_attributes.add(size_page_attribute)
-    page_type.page_attributes.add(tag_page_attribute)
-
-    return page_type
-
-
-@pytest.fixture
-def page_type_with_rich_text_attribute(db, rich_text_attribute_page_type):
-    page_type = PageType.objects.create(name="Test page type", slug="test-page-type")
-    page_type.page_attributes.add(rich_text_attribute_page_type)
-    return page_type
-
-
-@pytest.fixture
-def page_type_list(db, tag_page_attribute):
-    page_types = list(
-        PageType.objects.bulk_create(
-            [
-                PageType(name="Test page type 1", slug="test-page-type-1"),
-                PageType(name="Example page type 2", slug="page-type-2"),
-                PageType(name="Example page type 3", slug="page-type-3"),
-            ]
-        )
-    )
-
-    for i, page_type in enumerate(page_types):
-        page_type.page_attributes.add(tag_page_attribute)
-        Page.objects.create(
-            title=f"Test page {i}",
-            slug=f"test-url-{i}",
-            is_published=True,
-            page_type=page_type,
-        )
-
-    return page_types
-
-
-@pytest.fixture
-def model_form_class():
-    mocked_form_class = MagicMock(name="test", spec=ModelForm)
-    mocked_form_class._meta = Mock(name="_meta")
-    mocked_form_class._meta.model = "test_model"
-    mocked_form_class._meta.fields = "test_field"
-    return mocked_form_class
-
-
-@pytest.fixture
-def menu(db):
-    return Menu.objects.get_or_create(name="test-navbar", slug="test-navbar")[0]
-
-
-@pytest.fixture
-def menu_item(menu):
-    return MenuItem.objects.create(menu=menu, name="Link 1", url="http://example.com/")
-
-
-@pytest.fixture
-def menu_item_list(menu):
-    menu_item_1 = MenuItem.objects.create(menu=menu, name="Link 1")
-    menu_item_2 = MenuItem.objects.create(menu=menu, name="Link 2")
-    menu_item_3 = MenuItem.objects.create(menu=menu, name="Link 3")
-    return menu_item_1, menu_item_2, menu_item_3
-
-
-@pytest.fixture
-def menu_with_items(menu, category, published_collection):
-    menu.items.create(name="Link 1", url="http://example.com/")
-    menu_item = menu.items.create(name="Link 2", url="http://example.com/")
-    menu.items.create(name=category.name, category=category, parent=menu_item)
-    menu.items.create(
-        name=published_collection.name,
-        collection=published_collection,
-        parent=menu_item,
-    )
-    return menu
-
-
-@pytest.fixture
-def translated_variant_fr(product):
-    attribute = product.product_type.variant_attributes.first()
-    return AttributeTranslation.objects.create(
-        language_code="fr", attribute=attribute, name="Name tranlsated to french"
-    )
-
-
-@pytest.fixture
-def translated_attribute(product):
-    attribute = product.product_type.product_attributes.first()
-    return AttributeTranslation.objects.create(
-        language_code="fr", attribute=attribute, name="French attribute name"
-    )
-
-
-@pytest.fixture
-def translated_attribute_value(pink_attribute_value):
-    return AttributeValueTranslation.objects.create(
-        language_code="fr",
-        attribute_value=pink_attribute_value,
-        name="French attribute value name",
-    )
-
-
-@pytest.fixture
-def translated_page_unique_attribute_value(page, rich_text_attribute_page_type):
-    page_type = page.page_type
-    page_type.page_attributes.add(rich_text_attribute_page_type)
-    attribute_value = rich_text_attribute_page_type.values.first()
-    associate_attribute_values_to_instance(
-        page, rich_text_attribute_page_type, attribute_value
-    )
-    return AttributeValueTranslation.objects.create(
-        language_code="fr",
-        attribute_value=attribute_value,
-        rich_text=dummy_editorjs("French description."),
-    )
-
-
-@pytest.fixture
-def translated_product_unique_attribute_value(product, rich_text_attribute):
-    product_type = product.product_type
-    product_type.product_attributes.add(rich_text_attribute)
-    attribute_value = rich_text_attribute.values.first()
-    associate_attribute_values_to_instance(
-        product, rich_text_attribute, attribute_value
-    )
-    return AttributeValueTranslation.objects.create(
-        language_code="fr",
-        attribute_value=attribute_value,
-        rich_text=dummy_editorjs("French description."),
-    )
-
-
-@pytest.fixture
-def translated_variant_unique_attribute_value(variant, rich_text_attribute):
-    product_type = variant.product.product_type
-    product_type.variant_attributes.add(rich_text_attribute)
-    attribute_value = rich_text_attribute.values.first()
-    associate_attribute_values_to_instance(
-        variant, rich_text_attribute, attribute_value
-    )
-    return AttributeValueTranslation.objects.create(
-        language_code="fr",
-        attribute_value=attribute_value,
-        rich_text=dummy_editorjs("French description."),
-    )
+def shop_permissions(
+    permission_manage_products,
+    permission_manage_channels,
+    permission_manage_shipping,
+    permission_manage_taxes,
+    permission_manage_settings,
+):
+    return [
+        permission_manage_products,
+        permission_manage_channels,
+        permission_manage_shipping,
+        permission_manage_taxes,
+        permission_manage_settings,
+    ]
 
 
 @pytest.fixture
@@ -3730,6 +527,7 @@ def collection_translation_fr(published_collection):
         language_code="fr",
         collection=published_collection,
         name="French collection name",
+        slug="french-collection-name",
         description=dummy_editorjs("French description."),
     )
 
@@ -3745,153 +543,62 @@ def category_translation_fr(category):
 
 
 @pytest.fixture
-def page_translation_fr(page):
-    return PageTranslation.objects.create(
-        language_code="fr",
-        page=page,
-        title="French page title",
-        content=dummy_editorjs("French page content."),
-    )
-
-
-@pytest.fixture
-def shipping_method_translation_fr(shipping_method):
-    return ShippingMethodTranslation.objects.create(
-        language_code="fr",
-        shipping_method=shipping_method,
-        name="French shipping method name",
-    )
-
-
-@pytest.fixture
-def sale_translation_fr(sale):
-    return SaleTranslation.objects.create(
-        language_code="fr", sale=sale, name="French sale name"
-    )
-
-
-@pytest.fixture
-def menu_item_translation_fr(menu_item):
-    return MenuItemTranslation.objects.create(
-        language_code="fr", menu_item=menu_item, name="French manu item name"
-    )
-
-
-@pytest.fixture
-def payment_dummy(db, order_with_lines):
-    return Payment.objects.create(
-        gateway="mirumee.payments.dummy",
-        order=order_with_lines,
-        is_active=True,
-        cc_first_digits="4111",
-        cc_last_digits="1111",
-        cc_brand="visa",
-        cc_exp_month=12,
-        cc_exp_year=2027,
-        total=order_with_lines.total.gross.amount,
-        currency=order_with_lines.currency,
-        billing_first_name=order_with_lines.billing_address.first_name,
-        billing_last_name=order_with_lines.billing_address.last_name,
-        billing_company_name=order_with_lines.billing_address.company_name,
-        billing_address_1=order_with_lines.billing_address.street_address_1,
-        billing_address_2=order_with_lines.billing_address.street_address_2,
-        billing_city=order_with_lines.billing_address.city,
-        billing_postal_code=order_with_lines.billing_address.postal_code,
-        billing_country_code=order_with_lines.billing_address.country.code,
-        billing_country_area=order_with_lines.billing_address.country_area,
-        billing_email=order_with_lines.user_email,
-    )
-
-
-@pytest.fixture
-def payment_dummy_fully_charged(payment_dummy):
-    payment_dummy.captured_amount = payment_dummy.total
-    payment_dummy.charge_status = ChargeStatus.FULLY_CHARGED
-    payment_dummy.save()
-    return payment_dummy
-
-
-@pytest.fixture
-def payment_dummy_credit_card(db, order_with_lines):
-    return Payment.objects.create(
-        gateway="mirumee.payments.dummy_credit_card",
-        order=order_with_lines,
-        is_active=True,
-        cc_first_digits="4111",
-        cc_last_digits="1111",
-        cc_brand="visa",
-        cc_exp_month=12,
-        cc_exp_year=2027,
-        total=order_with_lines.total.gross.amount,
-        currency=order_with_lines.total.gross.currency,
-        billing_first_name=order_with_lines.billing_address.first_name,
-        billing_last_name=order_with_lines.billing_address.last_name,
-        billing_company_name=order_with_lines.billing_address.company_name,
-        billing_address_1=order_with_lines.billing_address.street_address_1,
-        billing_address_2=order_with_lines.billing_address.street_address_2,
-        billing_city=order_with_lines.billing_address.city,
-        billing_postal_code=order_with_lines.billing_address.postal_code,
-        billing_country_code=order_with_lines.billing_address.country.code,
-        billing_country_area=order_with_lines.billing_address.country_area,
-        billing_email=order_with_lines.user_email,
-    )
-
-
-@pytest.fixture
-def digital_content(category, media_root, warehouse, channel_USD) -> DigitalContent:
-    product_type = ProductType.objects.create(
-        name="Digital Type",
-        slug="digital-type",
-        has_variants=True,
-        is_shipping_required=False,
-        is_digital=True,
-    )
-    product = Product.objects.create(
-        name="Test digital product",
-        slug="test-digital-product",
-        product_type=product_type,
+def category_translation_with_slug_pl(category):
+    return CategoryTranslation.objects.create(
+        language_code="pl",
         category=category,
+        name="Polish category name",
+        slug="polish-category-name",
+        description=dummy_editorjs("Polish category description."),
     )
-    ProductChannelListing.objects.create(
-        product=product,
-        channel=channel_USD,
-        is_published=True,
-        visible_in_listings=True,
-        available_for_purchase=datetime.date(1999, 1, 1),
-    )
-    product_variant = ProductVariant.objects.create(product=product, sku="SKU_554")
-    ProductVariantChannelListing.objects.create(
-        variant=product_variant,
-        channel=channel_USD,
-        price_amount=Decimal(10),
-        cost_price_amount=Decimal(1),
-        currency=channel_USD.currency_code,
-    )
-    Stock.objects.create(
-        product_variant=product_variant,
-        warehouse=warehouse,
-        quantity=5,
-    )
-
-    assert product_variant.is_digital()
-
-    image_file, image_name = create_image()
-    d_content = DigitalContent.objects.create(
-        content_file=image_file,
-        product_variant=product_variant,
-        use_default_settings=True,
-    )
-    return d_content
 
 
 @pytest.fixture
-def digital_content_url(digital_content, order_line):
-    return DigitalContentUrl.objects.create(content=digital_content, line=order_line)
+def promotion_translation_fr(catalogue_promotion):
+    return PromotionTranslation.objects.create(
+        language_code="fr",
+        promotion=catalogue_promotion,
+        name="French promotion name",
+        description=dummy_editorjs("French promotion description."),
+    )
+
+
+@pytest.fixture
+def promotion_converted_from_sale_translation_fr(promotion_converted_from_sale):
+    return PromotionTranslation.objects.create(
+        language_code="fr",
+        promotion=promotion_converted_from_sale,
+        name="French sale name",
+        description=dummy_editorjs("French sale description."),
+    )
+
+
+@pytest.fixture
+def promotion_rule_translation_fr(promotion_rule):
+    return PromotionRuleTranslation.objects.create(
+        language_code="fr",
+        promotion_rule=promotion_rule,
+        name="French promotion rule name",
+        description=dummy_editorjs("French promotion rule description."),
+    )
 
 
 @pytest.fixture
 def media_root(tmpdir, settings):
-    settings.MEDIA_ROOT = str(tmpdir.mkdir("media"))
+    root = str(tmpdir.mkdir("media"))
+    settings.MEDIA_ROOT = root
+    return root
+
+
+@pytest.fixture(scope="session", autouse=True)
+def private_media_root(tmpdir_factory):
+    return str(tmpdir_factory.mktemp("private-media"))
+
+
+@pytest.fixture(autouse=True)
+def private_media_setting(private_media_root, settings):
+    settings.PRIVATE_MEDIA_ROOT = private_media_root
+    return private_media_root
 
 
 @pytest.fixture
@@ -3902,9 +609,10 @@ def description_json():
                 "key": "",
                 "data": {
                     "text": "E-commerce for the PWA era",
+                    "level": 2,
                 },
                 "text": "E-commerce for the PWA era",
-                "type": "header-two",
+                "type": "header",
                 "depth": 0,
                 "entityRanges": [],
                 "inlineStyleRanges": [],
@@ -3917,11 +625,7 @@ def description_json():
                         "built with GraphQL, Django, and ReactJS."
                     )
                 },
-                "text": (
-                    "A modular, high performance e-commerce storefront "
-                    "built with GraphQL, Django, and ReactJS."
-                ),
-                "type": "unstyled",
+                "type": "paragraph",
                 "depth": 0,
                 "entityRanges": [],
                 "inlineStyleRanges": [],
@@ -3930,7 +634,7 @@ def description_json():
                 "key": "",
                 "data": {},
                 "text": "",
-                "type": "unstyled",
+                "type": "paragraph",
                 "depth": 0,
                 "entityRanges": [],
                 "inlineStyleRanges": [],
@@ -3948,16 +652,7 @@ def description_json():
                         "open source e-commerce."
                     ),
                 },
-                "text": (
-                    "Saleor is a rapidly-growing open source e-commerce platform "
-                    "that has served high-volume companies from branches "
-                    "like publishing and apparel since 2012. Based on Python "
-                    "and Django, the latest major update introduces a modular "
-                    "front end with a GraphQL API and storefront and dashboard "
-                    "written in React to make Saleor a full-functionality "
-                    "open source e-commerce."
-                ),
-                "type": "unstyled",
+                "type": "paragraph",
                 "depth": 0,
                 "entityRanges": [],
                 "inlineStyleRanges": [],
@@ -3965,8 +660,7 @@ def description_json():
             {
                 "key": "",
                 "data": {"text": ""},
-                "text": "",
-                "type": "unstyled",
+                "type": "paragraph",
                 "depth": 0,
                 "entityRanges": [],
                 "inlineStyleRanges": [],
@@ -3976,8 +670,7 @@ def description_json():
                 "data": {
                     "text": "Get Saleor today!",
                 },
-                "text": "Get Saleor today!",
-                "type": "unstyled",
+                "type": "paragraph",
                 "depth": 0,
                 "entityRanges": [{"key": 0, "length": 17, "offset": 0}],
                 "inlineStyleRanges": [],
@@ -4000,10 +693,13 @@ def other_description_json():
             {
                 "key": "",
                 "data": {
-                    "text": "A GRAPHQL-FIRST <b>ECOMMERCE</b> PLATFORM FOR PERFECTIONISTS",
+                    "text": (
+                        "A GRAPHQL-FIRST <b>ECOMMERCE</b> PLATFORM FOR PERFECTIONISTS"
+                    ),
+                    "level": 2,
                 },
                 "text": "A GRAPHQL-FIRST ECOMMERCE PLATFORM FOR PERFECTIONISTS",
-                "type": "header-two",
+                "type": "header",
                 "depth": 0,
                 "entityRanges": [],
                 "inlineStyleRanges": [],
@@ -4016,11 +712,7 @@ def other_description_json():
                         "top of Python 3 and a Django 2 framework."
                     ),
                 },
-                "text": (
-                    "Saleor is powered by a GraphQL server running on "
-                    "top of Python 3 and a Django 2 framework."
-                ),
-                "type": "unstyled",
+                "type": "paragraph",
                 "depth": 0,
                 "entityRanges": [],
                 "inlineStyleRanges": [],
@@ -4031,58 +723,45 @@ def other_description_json():
 
 
 @pytest.fixture
-def app(db):
-    app = App.objects.create(name="Sample app objects", is_active=True)
-    app.tokens.create(name="Default")
-    return app
+def tax_line_data_response():
+    return {
+        "id": "1234",
+        "currency": "PLN",
+        "unit_net_amount": 12.34,
+        "unit_gross_amount": 12.34,
+        "total_gross_amount": 12.34,
+        "total_net_amount": 12.34,
+        "tax_rate": 23,
+    }
 
 
 @pytest.fixture
-def payment_app(db, permission_manage_payments):
-    app = App.objects.create(name="Payment App", is_active=True)
-    app.tokens.create(name="Default")
-    app.permissions.add(permission_manage_payments)
-
-    webhook = Webhook.objects.create(
-        name="payment-webhook-1",
-        app=app,
-        target_url="https://payment-gateway.com/api/",
-    )
-    webhook.events.bulk_create(
-        [
-            WebhookEvent(event_type=event_type, webhook=webhook)
-            for event_type in WebhookEventType.PAYMENT_EVENTS
-        ]
-    )
-    return app
+def tax_data_response(tax_data_response_factory):
+    return tax_data_response_factory()
 
 
 @pytest.fixture
-def external_app(db):
-    app = App.objects.create(
-        name="External App",
-        is_active=True,
-        type=AppType.THIRDPARTY,
-        identifier="mirumee.app.sample",
-        about_app="About app text.",
-        data_privacy="Data privacy text.",
-        data_privacy_url="http://www.example.com/privacy/",
-        homepage_url="http://www.example.com/homepage/",
-        support_url="http://www.example.com/support/contact/",
-        configuration_url="http://www.example.com/app-configuration/",
-        app_url="http://www.example.com/app/",
-    )
-    app.tokens.create(name="Default")
-    return app
+def tax_data_response_factory(tax_line_data_response):
+    def factory(
+        shipping_price_gross_amount=12.34,
+        shipping_price_net_amount=12.34,
+        shipping_tax_rate=23,
+        lines_length=5,
+    ):
+        lines = [tax_line_data_response] * lines_length
+        return {
+            "currency": "PLN",
+            "total_net_amount": 12.34,
+            "total_gross_amount": 12.34,
+            "subtotal_net_amount": 12.34,
+            "subtotal_gross_amount": 12.34,
+            "shipping_price_gross_amount": shipping_price_gross_amount,
+            "shipping_price_net_amount": shipping_price_net_amount,
+            "shipping_tax_rate": shipping_tax_rate,
+            "lines": lines,
+        }
 
-
-@pytest.fixture
-def webhook(app):
-    webhook = Webhook.objects.create(
-        name="Simple webhook", app=app, target_url="http://www.example.com/test"
-    )
-    webhook.events.create(event_type=WebhookEventType.ORDER_CREATED)
-    return webhook
+    return factory
 
 
 @pytest.fixture
@@ -4095,174 +774,13 @@ def staff_notification_recipient(db, staff_user):
     return StaffNotificationRecipient.objects.create(active=True, user=staff_user)
 
 
-@pytest.fixture
-def customer_wishlist(customer_user):
-    return Wishlist.objects.create(user=customer_user)
-
-
-@pytest.fixture
-def customer_wishlist_item(customer_wishlist, product_with_single_variant):
-    product = product_with_single_variant
-    assert product.variants.count() == 1
-    variant = product.variants.first()
-    item = customer_wishlist.add_variant(variant)
-    return item
-
-
-@pytest.fixture
-def customer_wishlist_item_with_two_variants(
-    customer_wishlist, product_with_two_variants
-):
-    product = product_with_two_variants
-    assert product.variants.count() == 2
-    [variant_1, variant_2] = product.variants.all()
-    item = customer_wishlist.add_variant(variant_1)
-    item.variants.add(variant_2)
-    return item
-
-
-@pytest.fixture
-def warehouse(address, shipping_zone):
-    warehouse = Warehouse.objects.create(
-        address=address,
-        name="Example Warehouse",
-        slug="example-warehouse",
-        email="test@example.com",
-    )
-    warehouse.shipping_zones.add(shipping_zone)
-    warehouse.save()
-    return warehouse
-
-
-@pytest.fixture
-def warehouses(address, address_usa):
-    return Warehouse.objects.bulk_create(
-        [
-            Warehouse(
-                address=address.get_copy(),
-                name="Warehouse PL",
-                slug="warehouse1",
-                email="warehouse1@example.com",
-            ),
-            Warehouse(
-                address=address_usa.get_copy(),
-                name="Warehouse USA",
-                slug="warehouse2",
-                email="warehouse2@example.com",
-            ),
-        ]
-    )
-
-
-@pytest.fixture
-def warehouses_with_shipping_zone(warehouses, shipping_zone):
-    warehouses[0].shipping_zones.add(shipping_zone)
-    warehouses[1].shipping_zones.add(shipping_zone)
-    return warehouses
-
-
-@pytest.fixture
-def warehouses_with_different_shipping_zone(warehouses, shipping_zones):
-    warehouses[0].shipping_zones.add(shipping_zones[0])
-    warehouses[1].shipping_zones.add(shipping_zones[1])
-    return warehouses
-
-
-@pytest.fixture
-def warehouse_no_shipping_zone(address):
-    warehouse = Warehouse.objects.create(
-        address=address,
-        name="Warehouse without shipping zone",
-        slug="warehouse-no-shipping-zone",
-        email="test2@example.com",
-    )
-    return warehouse
-
-
-@pytest.fixture
-def stock(variant, warehouse):
-    return Stock.objects.create(
-        product_variant=variant, warehouse=warehouse, quantity=15
-    )
-
-
-@pytest.fixture
-def allocation(order_line, stock):
-    return Allocation.objects.create(
-        order_line=order_line, stock=stock, quantity_allocated=order_line.quantity
-    )
-
-
-@pytest.fixture
-def allocations(order_list, stock, channel_USD):
-    variant = stock.product_variant
-    product = variant.product
-    channel_listing = variant.channel_listings.get(channel=channel_USD)
-    net = variant.get_price(product, [], channel_USD, channel_listing)
-    gross = Money(amount=net.amount * Decimal(1.23), currency=net.currency)
-    price = TaxedMoney(net=net, gross=gross)
-    lines = OrderLine.objects.bulk_create(
-        [
-            OrderLine(
-                order=order_list[0],
-                variant=variant,
-                quantity=1,
-                product_name=str(variant.product),
-                variant_name=str(variant),
-                product_sku=variant.sku,
-                is_shipping_required=variant.is_shipping_required(),
-                unit_price=price,
-                total_price=price,
-                tax_rate=Decimal("0.23"),
-            ),
-            OrderLine(
-                order=order_list[1],
-                variant=variant,
-                quantity=2,
-                product_name=str(variant.product),
-                variant_name=str(variant),
-                product_sku=variant.sku,
-                is_shipping_required=variant.is_shipping_required(),
-                unit_price=price,
-                total_price=price,
-                tax_rate=Decimal("0.23"),
-            ),
-            OrderLine(
-                order=order_list[2],
-                variant=variant,
-                quantity=4,
-                product_name=str(variant.product),
-                variant_name=str(variant),
-                product_sku=variant.sku,
-                is_shipping_required=variant.is_shipping_required(),
-                unit_price=price,
-                total_price=price,
-                tax_rate=Decimal("0.23"),
-            ),
-        ]
-    )
-    return Allocation.objects.bulk_create(
-        [
-            Allocation(
-                order_line=lines[0], stock=stock, quantity_allocated=lines[0].quantity
-            ),
-            Allocation(
-                order_line=lines[1], stock=stock, quantity_allocated=lines[1].quantity
-            ),
-            Allocation(
-                order_line=lines[2], stock=stock, quantity_allocated=lines[2].quantity
-            ),
-        ]
-    )
-
-
-@pytest.fixture
-def app_installation():
-    app_installation = AppInstallation.objects.create(
-        app_name="External App",
-        manifest_url="http://localhost:3000/manifest",
-    )
-    return app_installation
+@pytest.fixture(params=["warehouse_for_cc", "shipping_method"])
+def delivery_method(request, warehouse_for_cc, shipping_method):
+    if request.param == "warehouse":
+        return warehouse_for_cc
+    if request.param == "shipping_method":
+        return shipping_method
+    return None
 
 
 @pytest.fixture
@@ -4274,6 +792,12 @@ def user_export_file(staff_user):
 @pytest.fixture
 def app_export_file(app):
     job = ExportFile.objects.create(app=app)
+    return job
+
+
+@pytest.fixture
+def removed_app_export_file(removed_app):
+    job = ExportFile.objects.create(app=removed_app)
     return job
 
 
@@ -4299,12 +823,8 @@ def export_file_list(staff_user):
         )
     )
 
-    updated_date = datetime.datetime(
-        2019, 4, 18, tzinfo=timezone.get_current_timezone()
-    )
-    created_date = datetime.datetime(
-        2019, 4, 10, tzinfo=timezone.get_current_timezone()
-    )
+    updated_date = datetime.datetime(2019, 4, 18, tzinfo=datetime.UTC)
+    created_date = datetime.datetime(2019, 4, 10, tzinfo=datetime.UTC)
     new_created_and_updated_dates = [
         (created_date, updated_date),
         (created_date, updated_date + datetime.timedelta(hours=2)),
@@ -4346,3 +866,874 @@ def app_export_event(app_export_file):
         app=app_export_file.app,
         parameters={"message": "Example error message"},
     )
+
+
+@pytest.fixture
+def removed_app_export_event(removed_app_export_file):
+    return ExportEvent.objects.create(
+        type=ExportEvents.EXPORT_FAILED,
+        export_file=removed_app_export_file,
+        app=removed_app_export_file.app,
+        parameters={"message": "Example error message"},
+    )
+
+
+@pytest.fixture
+def app_manifest():
+    return {
+        "name": "Sample Saleor App",
+        "version": "0.1",
+        "about": "Sample Saleor App serving as an example.",
+        "dataPrivacy": "",
+        "dataPrivacyUrl": "",
+        "homepageUrl": "http://172.17.0.1:5000/homepageUrl",
+        "supportUrl": "http://172.17.0.1:5000/supportUrl",
+        "id": "saleor-complex-sample",
+        "permissions": ["MANAGE_PRODUCTS", "MANAGE_USERS"],
+        "appUrl": "",
+        "configurationUrl": "http://127.0.0.1:5000/configuration/",
+        "tokenTargetUrl": "http://127.0.0.1:5000/configuration/install",
+    }
+
+
+@pytest.fixture
+def app_manifest_webhook():
+    return {
+        "name": "webhook",
+        "asyncEvents": [
+            "ORDER_CREATED",
+            "ORDER_FULLY_PAID",
+            "CUSTOMER_CREATED",
+            "FULFILLMENT_CREATED",
+        ],
+        "query": """
+            subscription {
+                event {
+                    ... on OrderCreated {
+                        order {
+                            id
+                        }
+                    }
+                    ... on OrderFullyPaid {
+                        order {
+                            id
+                        }
+                    }
+                    ... on CustomerCreated {
+                        user {
+                            id
+                        }
+                    }
+                    ... on FulfillmentCreated {
+                        fulfillment {
+                            id
+                        }
+                    }
+                }
+            }
+        """,
+        "targetUrl": "https://app.example/api/webhook",
+    }
+
+
+@pytest.fixture
+def event_payload():
+    """Return event payload."""
+    return EventPayload.objects.create_with_payload_file(
+        payload='{"payload_key": "payload_value"}'
+    )
+
+
+@pytest.fixture
+def event_delivery(event_payload, webhook, app):
+    """Return an event delivery object."""
+    return EventDelivery.objects.create(
+        event_type=WebhookEventAsyncType.ANY,
+        payload=event_payload,
+        webhook=webhook,
+    )
+
+
+@pytest.fixture
+def event_delivery_removed_app(event_payload, webhook_removed_app):
+    return EventDelivery.objects.create(
+        event_type=WebhookEventAsyncType.ANY,
+        payload=event_payload,
+        webhook=webhook_removed_app,
+    )
+
+
+@pytest.fixture
+def event_attempt(event_delivery):
+    """Return an event delivery attempt object."""
+    return EventDeliveryAttempt.objects.create(
+        delivery=event_delivery,
+        task_id="example_task_id",
+        duration=None,
+        response="example_response",
+        response_headers=None,
+        request_headers=None,
+    )
+
+
+@pytest.fixture
+def event_payload_in_database():
+    """Return event payload with payload in database."""
+    return EventPayload.objects.create(payload='{"payload_key": "payload_value"}')
+
+
+@pytest.fixture
+def event_delivery_payload_in_database(event_payload_in_database, webhook, app):
+    """Return an event delivery object."""
+    return EventDelivery.objects.create(
+        event_type=WebhookEventAsyncType.ANY,
+        payload=event_payload_in_database,
+        webhook=webhook,
+    )
+
+
+@pytest.fixture
+def event_attempt_payload_in_database(event_delivery_payload_in_database):
+    """Return an event delivery attempt object."""
+    return EventDeliveryAttempt.objects.create(
+        delivery=event_delivery_payload_in_database,
+        task_id="example_task_id",
+        duration=None,
+        response="example_response",
+        response_headers=None,
+        request_headers=None,
+    )
+
+
+@pytest.fixture
+def webhook_list_stored_payment_methods_response():
+    return {
+        "paymentMethods": [
+            {
+                "id": "method-1",
+                "supportedPaymentFlows": ["INTERACTIVE"],
+                "type": "Credit Card",
+                "creditCardInfo": {
+                    "brand": "visa",
+                    "lastDigits": "1234",
+                    "expMonth": 1,
+                    "expYear": 2023,
+                    "firstDigits": "123456",
+                },
+                "name": "***1234",
+                "data": {"some": "data"},
+            }
+        ]
+    }
+
+
+@pytest.fixture
+def event_attempt_removed_app(event_delivery_removed_app):
+    """Return event delivery attempt object"""  # noqa: D400, D415
+    return EventDeliveryAttempt.objects.create(
+        delivery=event_delivery_removed_app,
+        task_id="example_task_id",
+        duration=None,
+        response="example_response",
+        response_headers=None,
+        request_headers=None,
+    )
+
+
+@pytest.fixture
+def check_payment_balance_input():
+    return {
+        "gatewayId": "mirumee.payments.gateway",
+        "channel": "channel_default",
+        "method": "givex",
+        "card": {
+            "cvc": "9891",
+            "code": "12345678910",
+            "money": {"currency": "GBP", "amount": 100.0},
+        },
+    }
+
+
+@pytest.fixture
+def delivery_attempts(event_delivery):
+    """Return consecutive delivery attempt IDs."""
+    with freeze_time("2020-03-18 12:00:00"):
+        attempt_1 = EventDeliveryAttempt.objects.create(
+            delivery=event_delivery,
+            task_id="example_task_id_1",
+            duration=None,
+            response="example_response",
+            response_headers=None,
+            request_headers=None,
+        )
+
+    with freeze_time("2020-03-18 13:00:00"):
+        attempt_2 = EventDeliveryAttempt.objects.create(
+            delivery=event_delivery,
+            task_id="example_task_id_2",
+            duration=None,
+            response="example_response",
+            response_headers=None,
+            request_headers=None,
+        )
+
+    with freeze_time("2020-03-18 14:00:00"):
+        attempt_3 = EventDeliveryAttempt.objects.create(
+            delivery=event_delivery,
+            task_id="example_task_id_3",
+            duration=None,
+            response="example_response",
+            response_headers=None,
+            request_headers=None,
+        )
+
+    attempt_1 = graphene.Node.to_global_id("EventDeliveryAttempt", attempt_1.pk)
+    attempt_2 = graphene.Node.to_global_id("EventDeliveryAttempt", attempt_2.pk)
+    attempt_3 = graphene.Node.to_global_id("EventDeliveryAttempt", attempt_3.pk)
+    webhook_id = graphene.Node.to_global_id("Webhook", event_delivery.webhook.pk)
+
+    return {
+        "webhook_id": webhook_id,
+        "attempt_1_id": attempt_1,
+        "attempt_2_id": attempt_2,
+        "attempt_3_id": attempt_3,
+    }
+
+
+@pytest.fixture
+def event_deliveries(event_payload, webhook, app):
+    """Return consecutive event delivery IDs."""
+    delivery_1 = EventDelivery.objects.create(
+        event_type=WebhookEventAsyncType.ANY,
+        payload=event_payload,
+        webhook=webhook,
+    )
+    delivery_2 = EventDelivery.objects.create(
+        event_type=WebhookEventAsyncType.ANY,
+        payload=event_payload,
+        webhook=webhook,
+    )
+    delivery_3 = EventDelivery.objects.create(
+        event_type=WebhookEventAsyncType.ANY,
+        payload=event_payload,
+        webhook=webhook,
+    )
+    webhook_id = graphene.Node.to_global_id("Webhook", webhook.pk)
+    delivery_1 = graphene.Node.to_global_id("EventDelivery", delivery_1.pk)
+    delivery_2 = graphene.Node.to_global_id("EventDelivery", delivery_2.pk)
+    delivery_3 = graphene.Node.to_global_id("EventDelivery", delivery_3.pk)
+
+    return {
+        "webhook_id": webhook_id,
+        "delivery_1_id": delivery_1,
+        "delivery_2_id": delivery_2,
+        "delivery_3_id": delivery_3,
+    }
+
+
+@pytest.fixture
+def transaction_session_response():
+    return {
+        "pspReference": "psp-123",
+        "data": {"some-json": "data"},
+        "result": "CHARGE_SUCCESS",
+        "amount": "10.00",
+        "time": "2022-11-18T13:25:58.169685+00:00",
+        "externalUrl": "http://127.0.0.1:9090/external-reference",
+        "message": "Message related to the payment",
+    }
+
+
+class Info:
+    def __init__(self, request):
+        self.context = request
+
+
+@pytest.fixture
+def dummy_info(request):
+    return Info(request)
+
+
+@pytest.fixture
+def async_subscription_webhooks_with_root_objects(
+    subscription_account_deleted_webhook,
+    subscription_account_confirmed_webhook,
+    subscription_account_email_changed_webhook,
+    subscription_account_set_password_requested_webhook,
+    subscription_account_confirmation_requested_webhook,
+    subscription_account_delete_requested_webhook,
+    subscription_account_change_email_requested_webhook,
+    subscription_staff_set_password_requested_webhook,
+    subscription_address_created_webhook,
+    subscription_address_updated_webhook,
+    subscription_address_deleted_webhook,
+    subscription_app_installed_webhook,
+    subscription_app_updated_webhook,
+    subscription_app_deleted_webhook,
+    subscription_app_status_changed_webhook,
+    subscription_attribute_created_webhook,
+    subscription_attribute_updated_webhook,
+    subscription_attribute_deleted_webhook,
+    subscription_attribute_value_created_webhook,
+    subscription_attribute_value_updated_webhook,
+    subscription_attribute_value_deleted_webhook,
+    subscription_category_created_webhook,
+    subscription_category_updated_webhook,
+    subscription_category_deleted_webhook,
+    subscription_channel_created_webhook,
+    subscription_channel_updated_webhook,
+    subscription_channel_deleted_webhook,
+    subscription_channel_status_changed_webhook,
+    subscription_gift_card_created_webhook,
+    subscription_gift_card_updated_webhook,
+    subscription_gift_card_deleted_webhook,
+    subscription_gift_card_sent_webhook,
+    subscription_gift_card_status_changed_webhook,
+    subscription_gift_card_metadata_updated_webhook,
+    subscription_gift_card_export_completed_webhook,
+    subscription_menu_created_webhook,
+    subscription_menu_updated_webhook,
+    subscription_menu_deleted_webhook,
+    subscription_menu_item_created_webhook,
+    subscription_menu_item_updated_webhook,
+    subscription_menu_item_deleted_webhook,
+    subscription_shipping_price_created_webhook,
+    subscription_shipping_price_updated_webhook,
+    subscription_shipping_price_deleted_webhook,
+    subscription_shipping_zone_created_webhook,
+    subscription_shipping_zone_updated_webhook,
+    subscription_shipping_zone_deleted_webhook,
+    subscription_shipping_zone_metadata_updated_webhook,
+    subscription_product_updated_webhook,
+    subscription_product_created_webhook,
+    subscription_product_deleted_webhook,
+    subscription_product_export_completed_webhook,
+    subscription_product_media_updated_webhook,
+    subscription_product_media_created_webhook,
+    subscription_product_media_deleted_webhook,
+    subscription_product_metadata_updated_webhook,
+    subscription_product_variant_created_webhook,
+    subscription_product_variant_updated_webhook,
+    subscription_product_variant_deleted_webhook,
+    subscription_product_variant_metadata_updated_webhook,
+    subscription_product_variant_out_of_stock_webhook,
+    subscription_product_variant_back_in_stock_webhook,
+    subscription_order_created_webhook,
+    subscription_order_updated_webhook,
+    subscription_order_confirmed_webhook,
+    subscription_order_fully_paid_webhook,
+    subscription_order_refunded_webhook,
+    subscription_order_fully_refunded_webhook,
+    subscription_order_paid_webhook,
+    subscription_order_cancelled_webhook,
+    subscription_order_expired_webhook,
+    subscription_order_fulfilled_webhook,
+    subscription_order_metadata_updated_webhook,
+    subscription_order_bulk_created_webhook,
+    subscription_draft_order_created_webhook,
+    subscription_draft_order_updated_webhook,
+    subscription_draft_order_deleted_webhook,
+    subscription_sale_created_webhook,
+    subscription_sale_updated_webhook,
+    subscription_sale_deleted_webhook,
+    subscription_sale_toggle_webhook,
+    subscription_invoice_requested_webhook,
+    subscription_invoice_deleted_webhook,
+    subscription_invoice_sent_webhook,
+    subscription_fulfillment_canceled_webhook,
+    subscription_fulfillment_created_webhook,
+    subscription_fulfillment_approved_webhook,
+    subscription_fulfillment_metadata_updated_webhook,
+    subscription_fulfillment_tracking_number_updated,
+    subscription_customer_created_webhook,
+    subscription_customer_updated_webhook,
+    subscription_customer_deleted_webhook,
+    subscription_customer_metadata_updated_webhook,
+    subscription_collection_created_webhook,
+    subscription_collection_updated_webhook,
+    subscription_collection_deleted_webhook,
+    subscription_collection_metadata_updated_webhook,
+    subscription_checkout_created_webhook,
+    subscription_checkout_updated_webhook,
+    subscription_checkout_fully_authorized_webhook,
+    subscription_checkout_fully_paid_webhook,
+    subscription_checkout_metadata_updated_webhook,
+    subscription_page_created_webhook,
+    subscription_page_updated_webhook,
+    subscription_page_deleted_webhook,
+    subscription_page_type_created_webhook,
+    subscription_page_type_updated_webhook,
+    subscription_page_type_deleted_webhook,
+    subscription_permission_group_created_webhook,
+    subscription_permission_group_updated_webhook,
+    subscription_permission_group_deleted_webhook,
+    subscription_product_created_multiple_events_webhook,
+    subscription_staff_created_webhook,
+    subscription_staff_updated_webhook,
+    subscription_staff_deleted_webhook,
+    subscription_transaction_item_metadata_updated_webhook,
+    subscription_translation_created_webhook,
+    subscription_translation_updated_webhook,
+    subscription_warehouse_created_webhook,
+    subscription_warehouse_updated_webhook,
+    subscription_warehouse_deleted_webhook,
+    subscription_warehouse_metadata_updated_webhook,
+    subscription_voucher_created_webhook,
+    subscription_voucher_updated_webhook,
+    subscription_voucher_deleted_webhook,
+    subscription_voucher_codes_created_webhook,
+    subscription_voucher_codes_deleted_webhook,
+    subscription_voucher_webhook_with_meta,
+    subscription_voucher_metadata_updated_webhook,
+    subscription_voucher_code_export_completed_webhook,
+    address,
+    app,
+    numeric_attribute,
+    category,
+    channel_PLN,
+    gift_card,
+    menu_item,
+    shipping_method,
+    product,
+    fulfilled_order,
+    fulfillment,
+    stock,
+    customer_user,
+    collection,
+    checkout,
+    page,
+    permission_group_manage_users,
+    shipping_zone,
+    staff_user,
+    voucher,
+    warehouse,
+    translated_attribute,
+    transaction_item_created_by_app,
+    product_media_image,
+    user_export_file,
+    promotion_converted_from_sale,
+):
+    events = WebhookEventAsyncType
+    attr = numeric_attribute
+    attr_value = attr.values.first()
+    menu = menu_item.menu
+    order = fulfilled_order
+    invoice = order.invoices.first()
+    page_type = page.page_type
+    transaction_item_created_by_app.use_old_id = True
+    transaction_item_created_by_app.save()
+    variant = product.variants.first()
+    voucher_code = voucher.codes.first()
+
+    return {
+        events.ACCOUNT_DELETED: [
+            subscription_account_deleted_webhook,
+            customer_user,
+        ],
+        events.ACCOUNT_EMAIL_CHANGED: [
+            subscription_account_email_changed_webhook,
+            customer_user,
+        ],
+        events.ACCOUNT_CONFIRMED: [
+            subscription_account_confirmed_webhook,
+            customer_user,
+        ],
+        events.ACCOUNT_DELETE_REQUESTED: [
+            subscription_account_delete_requested_webhook,
+            customer_user,
+        ],
+        events.ACCOUNT_SET_PASSWORD_REQUESTED: [
+            subscription_account_set_password_requested_webhook,
+            customer_user,
+        ],
+        events.ACCOUNT_CHANGE_EMAIL_REQUESTED: [
+            subscription_account_change_email_requested_webhook,
+            customer_user,
+        ],
+        events.ACCOUNT_CONFIRMATION_REQUESTED: [
+            subscription_account_confirmation_requested_webhook,
+            customer_user,
+        ],
+        events.STAFF_SET_PASSWORD_REQUESTED: [
+            subscription_staff_set_password_requested_webhook,
+            staff_user,
+        ],
+        events.ADDRESS_UPDATED: [subscription_address_updated_webhook, address],
+        events.ADDRESS_CREATED: [subscription_address_created_webhook, address],
+        events.ADDRESS_DELETED: [subscription_address_deleted_webhook, address],
+        events.APP_UPDATED: [subscription_app_updated_webhook, app],
+        events.APP_DELETED: [subscription_app_deleted_webhook, app],
+        events.APP_INSTALLED: [subscription_app_installed_webhook, app],
+        events.APP_STATUS_CHANGED: [subscription_app_status_changed_webhook, app],
+        events.ATTRIBUTE_CREATED: [subscription_attribute_created_webhook, attr],
+        events.ATTRIBUTE_UPDATED: [subscription_attribute_updated_webhook, attr],
+        events.ATTRIBUTE_DELETED: [subscription_attribute_deleted_webhook, attr],
+        events.ATTRIBUTE_VALUE_UPDATED: [
+            subscription_attribute_value_updated_webhook,
+            attr_value,
+        ],
+        events.ATTRIBUTE_VALUE_CREATED: [
+            subscription_attribute_value_created_webhook,
+            attr_value,
+        ],
+        events.ATTRIBUTE_VALUE_DELETED: [
+            subscription_attribute_value_deleted_webhook,
+            attr_value,
+        ],
+        events.CATEGORY_CREATED: [subscription_category_created_webhook, category],
+        events.CATEGORY_UPDATED: [subscription_category_updated_webhook, category],
+        events.CATEGORY_DELETED: [subscription_category_deleted_webhook, category],
+        events.CHANNEL_CREATED: [subscription_channel_created_webhook, channel_PLN],
+        events.CHANNEL_UPDATED: [subscription_channel_updated_webhook, channel_PLN],
+        events.CHANNEL_DELETED: [subscription_channel_deleted_webhook, channel_PLN],
+        events.CHANNEL_STATUS_CHANGED: [
+            subscription_channel_status_changed_webhook,
+            channel_PLN,
+        ],
+        events.GIFT_CARD_CREATED: [subscription_gift_card_created_webhook, gift_card],
+        events.GIFT_CARD_UPDATED: [subscription_gift_card_updated_webhook, gift_card],
+        events.GIFT_CARD_DELETED: [subscription_gift_card_deleted_webhook, gift_card],
+        events.GIFT_CARD_SENT: [subscription_gift_card_sent_webhook, gift_card],
+        events.GIFT_CARD_STATUS_CHANGED: [
+            subscription_gift_card_status_changed_webhook,
+            gift_card,
+        ],
+        events.GIFT_CARD_METADATA_UPDATED: [
+            subscription_gift_card_metadata_updated_webhook,
+            gift_card,
+        ],
+        events.GIFT_CARD_EXPORT_COMPLETED: [
+            subscription_gift_card_export_completed_webhook,
+            user_export_file,
+        ],
+        events.MENU_CREATED: [subscription_menu_created_webhook, menu],
+        events.MENU_UPDATED: [subscription_menu_updated_webhook, menu],
+        events.MENU_DELETED: [subscription_menu_deleted_webhook, menu],
+        events.MENU_ITEM_CREATED: [subscription_menu_item_created_webhook, menu_item],
+        events.MENU_ITEM_UPDATED: [subscription_menu_item_updated_webhook, menu_item],
+        events.MENU_ITEM_DELETED: [subscription_menu_item_deleted_webhook, menu_item],
+        events.ORDER_CREATED: [subscription_order_created_webhook, order],
+        events.ORDER_UPDATED: [subscription_order_updated_webhook, order],
+        events.ORDER_CONFIRMED: [subscription_order_confirmed_webhook, order],
+        events.ORDER_FULLY_PAID: [subscription_order_fully_paid_webhook, order],
+        events.ORDER_PAID: [subscription_order_paid_webhook, order],
+        events.ORDER_REFUNDED: [subscription_order_refunded_webhook, order],
+        events.ORDER_FULLY_REFUNDED: [subscription_order_fully_refunded_webhook, order],
+        events.ORDER_FULFILLED: [subscription_order_fulfilled_webhook, order],
+        events.ORDER_CANCELLED: [subscription_order_cancelled_webhook, order],
+        events.ORDER_EXPIRED: [subscription_order_expired_webhook, order],
+        events.ORDER_METADATA_UPDATED: [
+            subscription_order_metadata_updated_webhook,
+            order,
+        ],
+        events.ORDER_BULK_CREATED: [subscription_order_bulk_created_webhook, order],
+        events.DRAFT_ORDER_CREATED: [subscription_draft_order_created_webhook, order],
+        events.DRAFT_ORDER_UPDATED: [subscription_draft_order_updated_webhook, order],
+        events.DRAFT_ORDER_DELETED: [subscription_draft_order_deleted_webhook, order],
+        events.PRODUCT_CREATED: [subscription_product_created_webhook, product],
+        events.PRODUCT_UPDATED: [subscription_product_updated_webhook, product],
+        events.PRODUCT_DELETED: [subscription_product_deleted_webhook, product],
+        events.PRODUCT_EXPORT_COMPLETED: [
+            subscription_product_export_completed_webhook,
+            user_export_file,
+        ],
+        events.PRODUCT_MEDIA_CREATED: [
+            subscription_product_media_created_webhook,
+            product_media_image,
+        ],
+        events.PRODUCT_MEDIA_UPDATED: [
+            subscription_product_media_updated_webhook,
+            product_media_image,
+        ],
+        events.PRODUCT_MEDIA_DELETED: [
+            subscription_product_media_deleted_webhook,
+            product_media_image,
+        ],
+        events.PRODUCT_METADATA_UPDATED: [
+            subscription_product_metadata_updated_webhook,
+            product,
+        ],
+        events.PRODUCT_VARIANT_CREATED: [
+            subscription_product_variant_created_webhook,
+            variant,
+        ],
+        events.PRODUCT_VARIANT_UPDATED: [
+            subscription_product_variant_updated_webhook,
+            variant,
+        ],
+        events.PRODUCT_VARIANT_OUT_OF_STOCK: [
+            subscription_product_variant_out_of_stock_webhook,
+            stock,
+        ],
+        events.PRODUCT_VARIANT_BACK_IN_STOCK: [
+            subscription_product_variant_back_in_stock_webhook,
+            stock,
+        ],
+        events.PRODUCT_VARIANT_DELETED: [
+            subscription_product_variant_deleted_webhook,
+            variant,
+        ],
+        events.PRODUCT_VARIANT_METADATA_UPDATED: [
+            subscription_product_variant_metadata_updated_webhook,
+            variant,
+        ],
+        events.SALE_CREATED: [
+            subscription_sale_created_webhook,
+            promotion_converted_from_sale,
+        ],
+        events.SALE_UPDATED: [
+            subscription_sale_updated_webhook,
+            promotion_converted_from_sale,
+        ],
+        events.SALE_DELETED: [
+            subscription_sale_deleted_webhook,
+            promotion_converted_from_sale,
+        ],
+        events.SALE_TOGGLE: [
+            subscription_sale_toggle_webhook,
+            promotion_converted_from_sale,
+        ],
+        events.INVOICE_REQUESTED: [subscription_invoice_requested_webhook, invoice],
+        events.INVOICE_DELETED: [subscription_invoice_deleted_webhook, invoice],
+        events.INVOICE_SENT: [subscription_invoice_sent_webhook, invoice],
+        events.FULFILLMENT_CANCELED: [
+            subscription_fulfillment_canceled_webhook,
+            fulfillment,
+        ],
+        events.FULFILLMENT_CREATED: [
+            subscription_fulfillment_created_webhook,
+            fulfillment,
+        ],
+        events.FULFILLMENT_APPROVED: [
+            subscription_fulfillment_approved_webhook,
+            fulfillment,
+        ],
+        events.FULFILLMENT_METADATA_UPDATED: [
+            subscription_fulfillment_metadata_updated_webhook,
+            fulfillment,
+        ],
+        events.FULFILLMENT_TRACKING_NUMBER_UPDATED: [
+            subscription_fulfillment_tracking_number_updated,
+            fulfillment,
+        ],
+        events.CUSTOMER_CREATED: [subscription_customer_created_webhook, customer_user],
+        events.CUSTOMER_UPDATED: [subscription_customer_updated_webhook, customer_user],
+        events.CUSTOMER_METADATA_UPDATED: [
+            subscription_customer_metadata_updated_webhook,
+            customer_user,
+        ],
+        events.COLLECTION_CREATED: [
+            subscription_collection_created_webhook,
+            collection,
+        ],
+        events.COLLECTION_UPDATED: [
+            subscription_collection_updated_webhook,
+            collection,
+        ],
+        events.COLLECTION_DELETED: [
+            subscription_collection_deleted_webhook,
+            collection,
+        ],
+        events.COLLECTION_METADATA_UPDATED: [
+            subscription_collection_metadata_updated_webhook,
+            collection,
+        ],
+        events.CHECKOUT_CREATED: [subscription_checkout_created_webhook, checkout],
+        events.CHECKOUT_UPDATED: [subscription_checkout_updated_webhook, checkout],
+        events.CHECKOUT_FULLY_PAID: [
+            subscription_checkout_fully_paid_webhook,
+            checkout,
+        ],
+        events.CHECKOUT_FULLY_AUTHORIZED: [
+            subscription_checkout_fully_authorized_webhook,
+            checkout,
+        ],
+        events.CHECKOUT_METADATA_UPDATED: [
+            subscription_checkout_metadata_updated_webhook,
+            checkout,
+        ],
+        events.PAGE_CREATED: [subscription_page_created_webhook, page],
+        events.PAGE_UPDATED: [subscription_page_updated_webhook, page],
+        events.PAGE_DELETED: [subscription_page_deleted_webhook, page],
+        events.PAGE_TYPE_CREATED: [subscription_page_type_created_webhook, page_type],
+        events.PAGE_TYPE_UPDATED: [subscription_page_type_updated_webhook, page_type],
+        events.PAGE_TYPE_DELETED: [subscription_page_type_deleted_webhook, page_type],
+        events.PERMISSION_GROUP_CREATED: [
+            subscription_permission_group_created_webhook,
+            permission_group_manage_users,
+        ],
+        events.PERMISSION_GROUP_UPDATED: [
+            subscription_permission_group_updated_webhook,
+            permission_group_manage_users,
+        ],
+        events.PERMISSION_GROUP_DELETED: [
+            subscription_permission_group_deleted_webhook,
+            permission_group_manage_users,
+        ],
+        events.SHIPPING_PRICE_CREATED: [
+            subscription_shipping_price_created_webhook,
+            shipping_method,
+        ],
+        events.SHIPPING_PRICE_UPDATED: [
+            subscription_shipping_price_updated_webhook,
+            shipping_method,
+        ],
+        events.SHIPPING_PRICE_DELETED: [
+            subscription_shipping_price_deleted_webhook,
+            shipping_method,
+        ],
+        events.SHIPPING_ZONE_CREATED: [
+            subscription_shipping_zone_created_webhook,
+            shipping_zone,
+        ],
+        events.SHIPPING_ZONE_UPDATED: [
+            subscription_shipping_zone_updated_webhook,
+            shipping_zone,
+        ],
+        events.SHIPPING_ZONE_DELETED: [
+            subscription_shipping_zone_deleted_webhook,
+            shipping_zone,
+        ],
+        events.SHIPPING_ZONE_METADATA_UPDATED: [
+            subscription_shipping_zone_metadata_updated_webhook,
+            shipping_zone,
+        ],
+        events.STAFF_CREATED: [subscription_staff_created_webhook, staff_user],
+        events.STAFF_UPDATED: [subscription_staff_updated_webhook, staff_user],
+        events.STAFF_DELETED: [subscription_staff_deleted_webhook, staff_user],
+        events.TRANSACTION_ITEM_METADATA_UPDATED: [
+            subscription_transaction_item_metadata_updated_webhook,
+            transaction_item_created_by_app,
+        ],
+        events.TRANSLATION_CREATED: [
+            subscription_translation_created_webhook,
+            translated_attribute,
+        ],
+        events.TRANSLATION_UPDATED: [
+            subscription_translation_updated_webhook,
+            translated_attribute,
+        ],
+        events.VOUCHER_CREATED: [subscription_voucher_created_webhook, voucher],
+        events.VOUCHER_UPDATED: [subscription_voucher_updated_webhook, voucher],
+        events.VOUCHER_DELETED: [subscription_voucher_deleted_webhook, voucher],
+        events.VOUCHER_CODES_CREATED: [
+            subscription_voucher_codes_created_webhook,
+            voucher_code,
+        ],
+        events.VOUCHER_CODES_DELETED: [
+            subscription_voucher_codes_deleted_webhook,
+            voucher_code,
+        ],
+        events.VOUCHER_METADATA_UPDATED: [
+            subscription_voucher_metadata_updated_webhook,
+            voucher,
+        ],
+        events.VOUCHER_CODE_EXPORT_COMPLETED: [
+            subscription_voucher_code_export_completed_webhook,
+            user_export_file,
+        ],
+        events.WAREHOUSE_CREATED: [subscription_warehouse_created_webhook, warehouse],
+        events.WAREHOUSE_UPDATED: [subscription_warehouse_updated_webhook, warehouse],
+        events.WAREHOUSE_DELETED: [subscription_warehouse_deleted_webhook, warehouse],
+        events.WAREHOUSE_METADATA_UPDATED: [
+            subscription_warehouse_metadata_updated_webhook,
+            warehouse,
+        ],
+    }
+
+
+@pytest.fixture
+def setup_mock_for_cache():
+    """Mock cache backend.
+
+    To be used together with `cache_mock` and `dummy_cache`, where:
+    - `dummy_cache` is a dict the mock is write to, instead of real cache db
+    - `cache_mock` is a patch applied on real cache db
+
+    It supports following functions: `get`, `set`, `delete`, `incr` and `add`. If other
+    function is utilised in a tested codebase, this fixture should be extended.
+
+    Stores `key`, `value` and `ttl` in following format:
+    {key: {"value": value, "ttl": ttl}}
+    """
+
+    def _mocked_cache(dummy_cache, cache_mock):
+        def cache_get(key):
+            if data := dummy_cache.get(key):
+                return data["value"]
+            return None
+
+        def cache_set(key, value, timeout):
+            dummy_cache.update({key: {"value": value, "ttl": timeout}})
+
+        def cache_add(key, value, timeout):
+            if dummy_cache.get(key) is None:
+                dummy_cache.update({key: {"value": value, "ttl": timeout}})
+                return True
+            return False
+
+        def cache_delete(key):
+            dummy_cache.pop(key, None)
+
+        def cache_incr(key, delta):
+            if current_data := dummy_cache.get(key):
+                current_value = current_data["value"]
+                new_value = current_value + delta
+                dummy_cache.update(
+                    {key: {"value": new_value, "ttl": current_data["ttl"]}}
+                )
+                return new_value
+            return None
+
+        mocked_get_cache = MagicMock()
+        mocked_set_cache = MagicMock()
+        mocked_add_cache = MagicMock()
+        mocked_incr_cache = MagicMock()
+        mocked_delete_cache = MagicMock()
+
+        mocked_get_cache.side_effect = cache_get
+        mocked_set_cache.side_effect = cache_set
+        mocked_add_cache.side_effect = cache_add
+        mocked_incr_cache.side_effect = cache_incr
+        mocked_delete_cache.side_effect = cache_delete
+
+        cache_mock.get = mocked_get_cache
+        cache_mock.set = mocked_set_cache
+        cache_mock.add = mocked_add_cache
+        cache_mock.incr = mocked_incr_cache
+        cache_mock.delete = mocked_delete_cache
+
+    return _mocked_cache
+
+
+@pytest.fixture
+def tax_configuration_flat_rates(channel_USD):
+    tc = channel_USD.tax_configuration
+    tc.country_exceptions.all().delete()
+    tc.prices_entered_with_tax = False
+    tc.tax_calculation_strategy = TaxCalculationStrategy.FLAT_RATES
+    tc.tax_app_id = None
+    tc.save()
+    return tc
+
+
+@pytest.fixture
+def tax_configuration_tax_app(channel_USD):
+    tc = channel_USD.tax_configuration
+    tc.country_exceptions.all().delete()
+    tc.prices_entered_with_tax = False
+    tc.tax_calculation_strategy = TaxCalculationStrategy.TAX_APP
+    tc.tax_app_id = "avatax.app"
+    tc.save()
+    return tc
+
+
+@pytest.fixture
+def tax_configuration_avatax_plugin(channel_USD):
+    tc = channel_USD.tax_configuration
+    tc.country_exceptions.all().delete()
+    tc.prices_entered_with_tax = False
+    tc.tax_calculation_strategy = TaxCalculationStrategy.TAX_APP
+    tc.tax_app_id = "plugin:avatax"
+    tc.save()
+    return tc

@@ -17,7 +17,7 @@ def gateway_config():
 
 
 @pytest.mark.parametrize(
-    "supported_currencies, expected_currencies",
+    ("supported_currencies", "expected_currencies"),
     [
         ("PLN, USD, EUR", ["PLN", "USD", "EUR"]),
         ("PLN,EUR", ["PLN", "EUR"]),
@@ -47,7 +47,7 @@ def test_get_supported_currencies_not_configured(gateway_config):
             "Supported currencies not configured for Test, "
             "please configure supported currencies for this gateway."
         )
-        assert any([str(warning.message) == expected_warning for warning in warns])
+        assert any(str(warning.message) == expected_warning for warning in warns)
 
     # then
     assert currencies == []

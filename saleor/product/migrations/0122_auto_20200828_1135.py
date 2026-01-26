@@ -9,12 +9,12 @@ def set_all_published_products_as_searchable_and_available_for_purchase(
 ):
     Product = apps.get_model("product", "Product")
     Product.objects.filter(is_published=True).update(
-        visible_in_listings=True, available_for_purchase=datetime.datetime.today()
+        visible_in_listings=True,
+        available_for_purchase=datetime.datetime.now(tz=datetime.UTC).date(),
     )
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("product", "0121_auto_20200810_1415"),
     ]

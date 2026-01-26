@@ -1,6 +1,6 @@
 from collections import ChainMap
-from typing import Dict, List, Tuple
 
+from django.conf import settings
 from django.db.models import Value as V
 from django.db.models.functions import Concat
 
@@ -10,9 +10,9 @@ from ...warehouse.models import Warehouse
 from . import ProductExportFields
 
 
-def get_export_fields_and_headers_info(
-    export_info: Dict[str, list]
-) -> Tuple[List[str], List[str], List[str]]:
+def get_product_export_fields_and_headers_info(
+    export_info: dict[str, list],
+) -> tuple[list[str], list[str], list[str]]:
     """Get export fields, all headers and headers mapping.
 
     Based on export_info returns exported fields, fields to headers mapping and
@@ -32,8 +32,8 @@ def get_export_fields_and_headers_info(
 
 
 def get_product_export_fields_and_headers(
-    export_info: Dict[str, list]
-) -> Tuple[List[str], List[str]]:
+    export_info: dict[str, list],
+) -> tuple[list[str], list[str]]:
     """Get export fields from export info and prepare headers mapping.
 
     Based on given fields headers from export info, export fields set and
@@ -47,11 +47,7 @@ def get_product_export_fields_and_headers(
         return export_fields, file_headers
 
     fields_mapping = dict(
-        ChainMap(
-            *reversed(
-                ProductExportFields.HEADERS_TO_FIELDS_MAPPING.values()
-            )  # type: ignore
-        )
+        ChainMap(*reversed(ProductExportFields.HEADERS_TO_FIELDS_MAPPING.values()))
     )
 
     for field in fields:
@@ -62,7 +58,7 @@ def get_product_export_fields_and_headers(
     return export_fields, file_headers
 
 
-def get_attributes_headers(export_info: Dict[str, list]) -> List[str]:
+def get_attributes_headers(export_info: dict[str, list]) -> list[str]:
     """Get headers for exported attributes.
 
     Headers are build from slug and contains information if it's a product or variant
@@ -74,17 +70,23 @@ def get_attributes_headers(export_info: Dict[str, list]) -> List[str]:
     if not attribute_ids:
         return []
 
-    attributes = Attribute.objects.filter(pk__in=attribute_ids).order_by("slug")
+    attributes = (
+        Attribute.objects.using(settings.DATABASE_CONNECTION_REPLICA_NAME)
+        .filter(pk__in=attribute_ids)
+        .order_by("slug")
+    )
 
     products_headers = (
-        attributes.filter(product_types__isnull=False)
+        attributes.using(settings.DATABASE_CONNECTION_REPLICA_NAME)
+        .filter(product_types__isnull=False)
         .distinct()
         .annotate(header=Concat("slug", V(" (product attribute)")))
         .values_list("header", flat=True)
     )
 
     variant_headers = (
-        attributes.filter(product_variant_types__isnull=False)
+        attributes.using(settings.DATABASE_CONNECTION_REPLICA_NAME)
+        .filter(product_variant_types__isnull=False)
         .distinct()
         .annotate(header=Concat("slug", V(" (variant attribute)")))
         .values_list("header", flat=True)
@@ -93,7 +95,7 @@ def get_attributes_headers(export_info: Dict[str, list]) -> List[str]:
     return list(products_headers) + list(variant_headers)
 
 
-def get_warehouses_headers(export_info: Dict[str, list]) -> List[str]:
+def get_warehouses_headers(export_info: dict[str, list]) -> list[str]:
     """Get headers for exported warehouses.
 
     Headers are build from slug. Example: "slug-value (warehouse quantity)"
@@ -103,7 +105,8 @@ def get_warehouses_headers(export_info: Dict[str, list]) -> List[str]:
         return []
 
     warehouses_headers = (
-        Warehouse.objects.filter(pk__in=warehouse_ids)
+        Warehouse.objects.using(settings.DATABASE_CONNECTION_REPLICA_NAME)
+        .filter(pk__in=warehouse_ids)
         .order_by("slug")
         .annotate(header=Concat("slug", V(" (warehouse quantity)")))
         .values_list("header", flat=True)
@@ -112,7 +115,7 @@ def get_warehouses_headers(export_info: Dict[str, list]) -> List[str]:
     return list(warehouses_headers)
 
 
-def get_channels_headers(export_info: Dict[str, list]) -> List[str]:
+def get_channels_headers(export_info: dict[str, list]) -> list[str]:
     """Get headers for exported channels.
 
     Headers are build from slug and exported field.
@@ -128,7 +131,8 @@ def get_channels_headers(export_info: Dict[str, list]) -> List[str]:
         return []
 
     channels_slugs = (
-        Channel.objects.filter(pk__in=channel_ids)
+        Channel.objects.using(settings.DATABASE_CONNECTION_REPLICA_NAME)
+        .filter(pk__in=channel_ids)
         .order_by("slug")
         .values_list("slug", flat=True)
     )

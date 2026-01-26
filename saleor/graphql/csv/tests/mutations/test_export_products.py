@@ -37,9 +37,31 @@ EXPORT_PRODUCTS_MUTATION = """
     }
 """
 
+EXPORT_PRODUCTS_BY_APP_MUTATION = """
+    mutation ExportProducts($input: ExportProductsInput!){
+        exportProducts(input: $input){
+            exportFile {
+                id
+                status
+                createdAt
+                updatedAt
+                url
+                app {
+                    name
+                }
+            }
+            errors {
+                field
+                code
+                message
+            }
+        }
+    }
+"""
+
 
 @pytest.mark.parametrize(
-    "input, called_data",
+    ("input", "called_data"),
     [
         (
             {
@@ -60,7 +82,7 @@ EXPORT_PRODUCTS_MUTATION = """
         ),
     ],
 )
-@patch("saleor.graphql.csv.mutations.export_products_task.delay")
+@patch("saleor.graphql.csv.mutations.export_products.export_products_task.delay")
 def test_export_products_mutation(
     export_products_mock,
     staff_api_client,
@@ -70,16 +92,20 @@ def test_export_products_mutation(
     input,
     called_data,
 ):
+    # given
     query = EXPORT_PRODUCTS_MUTATION
     user = staff_api_client.user
     variables = {"input": input}
 
+    # when
     response = staff_api_client.post_graphql(
         query,
         variables=variables,
         permissions=[permission_manage_products, permission_manage_apps],
     )
     content = get_graphql_content(response)
+
+    # then
     data = content["data"]["exportProducts"]
     export_file_data = data["exportFile"]
 
@@ -97,16 +123,16 @@ def test_export_products_mutation(
     ).exists()
 
 
-@patch("saleor.graphql.csv.mutations.export_products_task.delay")
+@patch("saleor.graphql.csv.mutations.export_products.export_products_task.delay")
 def test_export_products_mutation_by_app(
     export_products_mock,
     app_api_client,
     product_list,
     permission_manage_products,
     permission_manage_apps,
-    permission_manage_staff,
 ):
-    query = EXPORT_PRODUCTS_MUTATION
+    # given
+    query = EXPORT_PRODUCTS_BY_APP_MUTATION
     app = app_api_client.app
     variables = {
         "input": {
@@ -116,16 +142,18 @@ def test_export_products_mutation_by_app(
         }
     }
 
+    # when
     response = app_api_client.post_graphql(
         query,
         variables=variables,
         permissions=[
             permission_manage_products,
             permission_manage_apps,
-            permission_manage_staff,
         ],
     )
     content = get_graphql_content(response)
+
+    # then
     data = content["data"]["exportProducts"]
     export_file_data = data["exportFile"]
 
@@ -136,14 +164,13 @@ def test_export_products_mutation_by_app(
     assert not data["errors"]
     assert data["exportFile"]["id"]
     assert export_file_data["createdAt"]
-    assert export_file_data["user"] is None
     assert export_file_data["app"]["name"] == app.name
     assert ExportEvent.objects.filter(
         user=None, app=app, type=ExportEvents.EXPORT_PENDING
     ).exists()
 
 
-@patch("saleor.graphql.csv.mutations.export_products_task.delay")
+@patch("saleor.graphql.csv.mutations.export_products.export_products_task.delay")
 def test_export_products_mutation_ids_scope(
     export_products_mock,
     staff_api_client,
@@ -151,6 +178,7 @@ def test_export_products_mutation_ids_scope(
     permission_manage_products,
     permission_manage_apps,
 ):
+    # given
     query = EXPORT_PRODUCTS_MUTATION
     user = staff_api_client.user
 
@@ -175,12 +203,15 @@ def test_export_products_mutation_ids_scope(
         }
     }
 
+    # when
     response = staff_api_client.post_graphql(
         query,
         variables=variables,
         permissions=[permission_manage_products, permission_manage_apps],
     )
     content = get_graphql_content(response)
+
+    # then
     data = content["data"]["exportProducts"]
     export_file_data = data["exportFile"]
 
@@ -204,7 +235,7 @@ def test_export_products_mutation_ids_scope(
     ).exists()
 
 
-@patch("saleor.graphql.csv.mutations.export_products_task.delay")
+@patch("saleor.graphql.csv.mutations.export_products.export_products_task.delay")
 def test_export_products_mutation_ids_scope_invalid_object_type(
     export_products_mock,
     staff_api_client,
@@ -212,6 +243,7 @@ def test_export_products_mutation_ids_scope_invalid_object_type(
     permission_manage_products,
     permission_manage_apps,
 ):
+    # given
     query = EXPORT_PRODUCTS_MUTATION
 
     products = product_list[:2]
@@ -233,12 +265,15 @@ def test_export_products_mutation_ids_scope_invalid_object_type(
         }
     }
 
+    # when
     response = staff_api_client.post_graphql(
         query,
         variables=variables,
         permissions=[permission_manage_products, permission_manage_apps],
     )
     content = get_graphql_content(response)
+
+    # then
     data = content["data"]["exportProducts"]
     errors = data["errors"]
     assert len(errors) == 1
@@ -249,7 +284,7 @@ def test_export_products_mutation_ids_scope_invalid_object_type(
     export_products_mock.assert_not_called()
 
 
-@patch("saleor.graphql.csv.mutations.export_products_task.delay")
+@patch("saleor.graphql.csv.mutations.export_products.export_products_task.delay")
 def test_export_products_mutation_with_warehouse_and_attribute_ids(
     export_products_mock,
     staff_api_client,
@@ -259,6 +294,7 @@ def test_export_products_mutation_with_warehouse_and_attribute_ids(
     permission_manage_products,
     permission_manage_apps,
 ):
+    # given
     query = EXPORT_PRODUCTS_MUTATION
     user = staff_api_client.user
 
@@ -296,12 +332,15 @@ def test_export_products_mutation_with_warehouse_and_attribute_ids(
         }
     }
 
+    # when
     response = staff_api_client.post_graphql(
         query,
         variables=variables,
         permissions=[permission_manage_products, permission_manage_apps],
     )
     content = get_graphql_content(response)
+
+    # then
     data = content["data"]["exportProducts"]
     export_file_data = data["exportFile"]
 
@@ -330,7 +369,7 @@ def test_export_products_mutation_with_warehouse_and_attribute_ids(
     ).exists()
 
 
-@patch("saleor.graphql.csv.mutations.export_products_task.delay")
+@patch("saleor.graphql.csv.mutations.export_products.export_products_task.delay")
 def test_export_products_mutation_with_warehouse_ids_invalid_object_type(
     export_products_mock,
     staff_api_client,
@@ -340,6 +379,7 @@ def test_export_products_mutation_with_warehouse_ids_invalid_object_type(
     permission_manage_products,
     permission_manage_apps,
 ):
+    # given
     query = EXPORT_PRODUCTS_MUTATION
 
     products = product_list[:2]
@@ -370,12 +410,15 @@ def test_export_products_mutation_with_warehouse_ids_invalid_object_type(
         }
     }
 
+    # when
     response = staff_api_client.post_graphql(
         query,
         variables=variables,
         permissions=[permission_manage_products, permission_manage_apps],
     )
     content = get_graphql_content(response)
+
+    # then
     data = content["data"]["exportProducts"]
     errors = data["errors"]
     assert len(errors) == 1
@@ -386,7 +429,7 @@ def test_export_products_mutation_with_warehouse_ids_invalid_object_type(
     export_products_mock.assert_not_called()
 
 
-@patch("saleor.graphql.csv.mutations.export_products_task.delay")
+@patch("saleor.graphql.csv.mutations.export_products.export_products_task.delay")
 def test_export_products_mutation_with_attribute_ids_invalid_object_type(
     export_products_mock,
     staff_api_client,
@@ -396,6 +439,7 @@ def test_export_products_mutation_with_attribute_ids_invalid_object_type(
     permission_manage_products,
     permission_manage_apps,
 ):
+    # given
     query = EXPORT_PRODUCTS_MUTATION
 
     products = product_list[:2]
@@ -426,12 +470,15 @@ def test_export_products_mutation_with_attribute_ids_invalid_object_type(
         }
     }
 
+    # when
     response = staff_api_client.post_graphql(
         query,
         variables=variables,
         permissions=[permission_manage_products, permission_manage_apps],
     )
     content = get_graphql_content(response)
+
+    # then
     data = content["data"]["exportProducts"]
     errors = data["errors"]
     assert len(errors) == 1
@@ -442,7 +489,7 @@ def test_export_products_mutation_with_attribute_ids_invalid_object_type(
     export_products_mock.assert_not_called()
 
 
-@patch("saleor.graphql.csv.mutations.export_products_task.delay")
+@patch("saleor.graphql.csv.mutations.export_products.export_products_task.delay")
 def test_export_products_mutation_with_channel_ids_invalid_object_type(
     export_products_mock,
     staff_api_client,
@@ -452,6 +499,7 @@ def test_export_products_mutation_with_channel_ids_invalid_object_type(
     permission_manage_products,
     permission_manage_apps,
 ):
+    # given
     query = EXPORT_PRODUCTS_MUTATION
 
     products = product_list[:2]
@@ -482,12 +530,15 @@ def test_export_products_mutation_with_channel_ids_invalid_object_type(
         }
     }
 
+    # when
     response = staff_api_client.post_graphql(
         query,
         variables=variables,
         permissions=[permission_manage_products, permission_manage_apps],
     )
     content = get_graphql_content(response)
+
+    # then
     data = content["data"]["exportProducts"]
     errors = data["errors"]
     assert len(errors) == 1
@@ -499,7 +550,7 @@ def test_export_products_mutation_with_channel_ids_invalid_object_type(
 
 
 @pytest.mark.parametrize(
-    "input, error_field",
+    ("input", "error_field"),
     [
         (
             {
@@ -519,7 +570,7 @@ def test_export_products_mutation_with_channel_ids_invalid_object_type(
         ),
     ],
 )
-@patch("saleor.graphql.csv.mutations.export_products_task.delay")
+@patch("saleor.graphql.csv.mutations.export_products.export_products_task.delay")
 def test_export_products_mutation_failed(
     export_products_mock,
     staff_api_client,
@@ -528,14 +579,18 @@ def test_export_products_mutation_failed(
     input,
     error_field,
 ):
+    # given
     query = EXPORT_PRODUCTS_MUTATION
     user = staff_api_client.user
     variables = {"input": input}
 
+    # when
     response = staff_api_client.post_graphql(
         query, variables=variables, permissions=[permission_manage_products]
     )
     content = get_graphql_content(response)
+
+    # then
     data = content["data"]["exportProducts"]
     errors = data["errors"]
 
@@ -546,3 +601,37 @@ def test_export_products_mutation_failed(
     assert not ExportEvent.objects.filter(
         user=user, type=ExportEvents.EXPORT_PENDING
     ).exists()
+
+
+@patch("saleor.plugins.manager.PluginsManager.product_export_completed")
+def test_export_products_webhooks(
+    product_export_completed_mock,
+    user_api_client,
+    product_list,
+    permission_manage_products,
+    permission_manage_apps,
+    media_root,
+):
+    # given
+    query = EXPORT_PRODUCTS_MUTATION
+    variables = {
+        "input": {
+            "scope": ExportScope.ALL.name,
+            "exportInfo": {},
+            "fileType": FileTypeEnum.CSV.name,
+        }
+    }
+
+    # when
+    response = user_api_client.post_graphql(
+        query,
+        variables=variables,
+        permissions=[permission_manage_products, permission_manage_apps],
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["exportProducts"]
+    assert not data["errors"]
+
+    product_export_completed_mock.assert_called_once()

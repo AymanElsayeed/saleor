@@ -1,7 +1,9 @@
 from decimal import Decimal
 from unittest import mock
 
+import Adyen
 import pytest
+from requests_hardened import HTTPSession
 
 from .....checkout import calculations
 from .....checkout.fetch import fetch_checkout_info, fetch_checkout_lines
@@ -39,9 +41,9 @@ def adyen_plugin(settings, channel_USD):
         adyen_auto_capture = adyen_auto_capture or False
         auto_capture = auto_capture or False
         settings.PLUGINS = ["saleor.payment.gateways.adyen.plugin.AdyenGatewayPlugin"]
-        manager = get_plugins_manager()
+        manager = get_plugins_manager(allow_replica=False)
 
-        with mock.patch("saleor.payment.gateways.adyen.utils.apple_pay.requests.post"):
+        with mock.patch.object(HTTPSession, "request"):
             manager.save_plugin_configuration(
                 AdyenGatewayPlugin.PLUGIN_ID,
                 channel_USD.slug,
@@ -61,21 +63,22 @@ def adyen_plugin(settings, channel_USD):
                 },
             )
 
-        manager = get_plugins_manager()
+        manager = get_plugins_manager(allow_replica=False)
+        manager.get_all_plugins()
         return manager.plugins_per_channel[channel_USD.slug][0]
 
     return fun
 
 
 @pytest.fixture
-def payment_adyen_for_checkout(checkout_with_items, address, shipping_method):
+def payment_adyen_for_checkout(checkout_with_items, address, checkout_delivery):
     checkout_with_items.billing_address = address
     checkout_with_items.shipping_address = address
-    checkout_with_items.shipping_method = shipping_method
+    checkout_with_items.assigned_delivery = checkout_delivery(checkout_with_items)
     checkout_with_items.save()
-    manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout_with_items)
-    checkout_info = fetch_checkout_info(checkout_with_items, lines, [], manager)
+    manager = get_plugins_manager(allow_replica=False)
+    lines, _ = fetch_checkout_lines(checkout_with_items)
+    checkout_info = fetch_checkout_info(checkout_with_items, lines, manager)
     total = calculations.calculate_checkout_total_with_gift_cards(
         manager, checkout_info, lines, address
     )
@@ -90,6 +93,13 @@ def payment_adyen_for_checkout(checkout_with_items, address, shipping_method):
         return_url="https://www.example.com",
     )
     return payment
+
+
+@pytest.fixture
+def inactive_payment_adyen_for_checkout(payment_adyen_for_checkout):
+    payment_adyen_for_checkout.is_active = False
+    payment_adyen_for_checkout.save(update_fields=["is_active"])
+    return payment_adyen_for_checkout
 
 
 @pytest.fixture
@@ -121,7 +131,7 @@ def payment_adyen_for_order(order_with_lines):
     return payment
 
 
-@pytest.fixture()
+@pytest.fixture
 def notification():
     def fun(
         event_code=None,
@@ -234,3 +244,14 @@ def adyen_additional_data_for_klarna():
             "timeZoneOffset": -120,
         },
     }
+
+
+@pytest.fixture
+def adyen_check_balance_response():
+    return Adyen.client.AdyenResult(
+        message={
+            "pspReference": "851634546949980A",
+            "resultCode": "Success",
+            "balance": {"currency": "GBP", "value": 10000},
+        }
+    )

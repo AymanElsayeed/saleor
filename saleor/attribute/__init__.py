@@ -1,6 +1,3 @@
-default_app_config = "saleor.attribute.app.AttributeAppConfig"
-
-
 class AttributeInputType:
     """The type that we expect to render the attribute's values as."""
 
@@ -8,8 +5,11 @@ class AttributeInputType:
     MULTISELECT = "multiselect"
     FILE = "file"
     REFERENCE = "reference"
+    SINGLE_REFERENCE = "single-reference"
     NUMERIC = "numeric"
     RICH_TEXT = "rich-text"
+    PLAIN_TEXT = "plain-text"
+    SWATCH = "swatch"
     BOOLEAN = "boolean"
     DATE = "date"
     DATE_TIME = "date-time"
@@ -19,39 +19,49 @@ class AttributeInputType:
         (MULTISELECT, "Multi Select"),
         (FILE, "File"),
         (REFERENCE, "Reference"),
+        (SINGLE_REFERENCE, "Single Reference"),
         (NUMERIC, "Numeric"),
         (RICH_TEXT, "Rich Text"),
+        (PLAIN_TEXT, "Plain Text"),
+        (SWATCH, "Swatch"),
         (BOOLEAN, "Boolean"),
         (DATE, "Date"),
         (DATE_TIME, "Date Time"),
     ]
 
     # list of the input types that can be used in variant selection
-    ALLOWED_IN_VARIANT_SELECTION = [
-        DROPDOWN,
-        BOOLEAN,
-    ]
+    ALLOWED_IN_VARIANT_SELECTION = [DROPDOWN, BOOLEAN, SWATCH, NUMERIC]
 
     TYPES_WITH_CHOICES = [
         DROPDOWN,
         MULTISELECT,
+        SWATCH,
     ]
 
     # list of the input types that are unique per instances
-    TYPES_WITH_UNIQUE_VALUES = [FILE, REFERENCE, RICH_TEXT, NUMERIC, DATE, DATE_TIME]
+    TYPES_WITH_UNIQUE_VALUES = [
+        FILE,
+        REFERENCE,
+        RICH_TEXT,
+        PLAIN_TEXT,
+        NUMERIC,
+        DATE,
+        DATE_TIME,
+    ]
 
     # list of the translatable attributes, excluding attributes with choices.
     TRANSLATABLE_ATTRIBUTES = [
         RICH_TEXT,
+        PLAIN_TEXT,
     ]
 
 
-# list of input types that are allowed for given attribute property
 ATTRIBUTE_PROPERTIES_CONFIGURATION = {
     "filterable_in_storefront": [
         AttributeInputType.DROPDOWN,
         AttributeInputType.MULTISELECT,
         AttributeInputType.NUMERIC,
+        AttributeInputType.SWATCH,
         AttributeInputType.BOOLEAN,
         AttributeInputType.DATE,
         AttributeInputType.DATE_TIME,
@@ -60,6 +70,7 @@ ATTRIBUTE_PROPERTIES_CONFIGURATION = {
         AttributeInputType.DROPDOWN,
         AttributeInputType.MULTISELECT,
         AttributeInputType.NUMERIC,
+        AttributeInputType.SWATCH,
         AttributeInputType.BOOLEAN,
         AttributeInputType.DATE,
         AttributeInputType.DATE_TIME,
@@ -68,6 +79,7 @@ ATTRIBUTE_PROPERTIES_CONFIGURATION = {
         AttributeInputType.DROPDOWN,
         AttributeInputType.MULTISELECT,
         AttributeInputType.NUMERIC,
+        AttributeInputType.SWATCH,
         AttributeInputType.BOOLEAN,
         AttributeInputType.DATE,
         AttributeInputType.DATE_TIME,
@@ -92,12 +104,20 @@ class AttributeType:
 class AttributeEntityType:
     """Type of a reference entity type. Must match the name of the graphql type.
 
-    After adding new value, `REFERENCE_VALUE_NAME_MAPPING`
-    and `ENTITY_TYPE_TO_MODEL_MAPPING` in saleor/graphql/attribute/utils.py
-    must be updated.
+    After adding a new value the `ENTITY_TYPE_MAPPING` in
+    saleor/graphql/attribute/utils.py must be updated.
     """
 
     PAGE = "Page"
     PRODUCT = "Product"
+    PRODUCT_VARIANT = "ProductVariant"
+    CATEGORY = "Category"
+    COLLECTION = "Collection"
 
-    CHOICES = [(PAGE, "Page"), (PRODUCT, "Product")]
+    CHOICES = [
+        (PAGE, "Page"),
+        (PRODUCT, "Product"),
+        (PRODUCT_VARIANT, "Product Variant"),
+        (CATEGORY, "Category"),
+        (COLLECTION, "Collection"),
+    ]

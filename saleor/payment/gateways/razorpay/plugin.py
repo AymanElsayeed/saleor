@@ -2,7 +2,7 @@ from typing import TYPE_CHECKING
 
 from saleor.plugins.base_plugin import BasePlugin, ConfigurationTypeField
 
-from ..utils import get_supported_currencies, require_active_plugin
+from ..utils import get_supported_currencies
 from . import GatewayConfig, capture, process_payment, refund
 
 GATEWAY_NAME = "Razorpay"
@@ -11,7 +11,12 @@ if TYPE_CHECKING:
     from . import GatewayResponse, PaymentData
 
 
-class RazorpayGatewayPlugin(BasePlugin):
+class DeprecatedRazorpayGatewayPlugin(BasePlugin):
+    """Deprecated.
+
+    This plugin is deprecated and will be removed in future version.
+    """
+
     PLUGIN_NAME = GATEWAY_NAME
     PLUGIN_ID = "mirumee.payments.razorpay"
     DEFAULT_CONFIGURATION = [
@@ -72,30 +77,35 @@ class RazorpayGatewayPlugin(BasePlugin):
     def _get_gateway_config(self):
         return self.config
 
-    @require_active_plugin
     def capture_payment(
         self, payment_information: "PaymentData", previous_value
     ) -> "GatewayResponse":
+        if not self.active:
+            return previous_value
         return capture(payment_information, self._get_gateway_config())
 
-    @require_active_plugin
     def refund_payment(
         self, payment_information: "PaymentData", previous_value
     ) -> "GatewayResponse":
+        if not self.active:
+            return previous_value
         return refund(payment_information, self._get_gateway_config())
 
-    @require_active_plugin
     def process_payment(
         self, payment_information: "PaymentData", previous_value
     ) -> "GatewayResponse":
+        if not self.active:
+            return previous_value
         return process_payment(payment_information, self._get_gateway_config())
 
-    @require_active_plugin
     def get_supported_currencies(self, previous_value):
+        if not self.active:
+            return previous_value
         config = self._get_gateway_config()
         return get_supported_currencies(config, GATEWAY_NAME)
 
-    @require_active_plugin
     def get_payment_config(self, previous_value):
+        if not self.active:
+            return previous_value
         config = self._get_gateway_config()
         return [{"field": "api_key", "value": config.connection_params["public_key"]}]

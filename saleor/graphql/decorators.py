@@ -1,16 +1,32 @@
+from collections.abc import Iterable
 from enum import Enum
 from functools import wraps
-from typing import Iterable, Union
 
-from graphql.execution.base import ResolveInfo
+from graphene import ResolveInfo
 
 from ..attribute import AttributeType
+from ..attribute.models import Attribute
 from ..core.exceptions import PermissionDenied
-from ..core.permissions import AccountPermissions, PagePermissions, ProductPermissions
+from ..permission.auth_filters import is_app, is_staff_user
+from ..permission.enums import (
+    BasePermissionEnum,
+    PagePermissions,
+    PageTypePermissions,
+    ProductPermissions,
+    ProductTypePermissions,
+)
+from ..permission.utils import (
+    has_one_of_permissions,
+    one_of_permissions_or_auth_filter_required,
+)
+from ..permission.utils import permission_required as core_permission_required
+from .core.context import ChannelContext
+from .utils import get_user_or_app_from_context
 
 
 def context(f):
     def decorator(func):
+        @wraps(func)
         def wrapper(*args, **kwargs):
             info = next(arg for arg in args if isinstance(arg, ResolveInfo))
             return func(info.context, *args, **kwargs)
@@ -27,9 +43,8 @@ def account_passes_test(test_func):
         @wraps(f)
         @context(f)
         def wrapper(context, *args, **kwargs):
-            if test_func(context):
-                return f(*args, **kwargs)
-            raise PermissionDenied()
+            test_func(context)
+            return f(*args, **kwargs)
 
         return wrapper
 
@@ -44,57 +59,59 @@ def account_passes_test_for_attribute(test_func):
         @context(f)
         def wrapper(context, *args, **kwargs):
             root = args[0]
-            if test_func(context, root):
-                return f(*args, **kwargs)
-            raise PermissionDenied()
+            test_func(context, root)
+            return f(*args, **kwargs)
 
         return wrapper
 
     return decorator
 
 
-def _permission_required(perms: Iterable[Enum], context):
-    if context.user.has_perms(perms):
-        return True
-    app = getattr(context, "app", None)
-    if app:
-        # for now MANAGE_STAFF permission for app is not supported
-        if AccountPermissions.MANAGE_STAFF in perms:
-            return False
-        return app.has_perms(perms)
-    return False
-
-
-def permission_required(perm: Union[Enum, Iterable[Enum]]):
+def permission_required(perm: BasePermissionEnum | list[BasePermissionEnum]):
     def check_perms(context):
         if isinstance(perm, Enum):
-            perms = (perm,)
+            perms = [perm]
         else:
             perms = perm
-        return _permission_required(perms, context)
+
+        requestor = get_user_or_app_from_context(context)
+        if not core_permission_required(requestor, perms):
+            raise PermissionDenied(permissions=perms)
 
     return account_passes_test(check_perms)
 
 
-def one_of_permissions_required(perms: Iterable[Enum]):
+def one_of_permissions_required(perms: Iterable[BasePermissionEnum]):
     def check_perms(context):
-        for perm in perms:
-            has_perm = _permission_required((perm,), context)
-            if has_perm:
-                return True
-        return False
+        if not one_of_permissions_or_auth_filter_required(context, perms):
+            raise PermissionDenied(permissions=perms)
 
     return account_passes_test(check_perms)
 
 
-staff_member_required = account_passes_test(
-    lambda context: context.user.is_active and context.user.is_staff
-)
+def _check_staff_member(context):
+    if not is_staff_user(context):
+        raise PermissionDenied(
+            message=(
+                "You need to be authenticated as a staff member to perform this action"
+            )
+        )
 
 
-staff_member_or_app_required = account_passes_test(
-    lambda context: context.app or (context.user.is_active and context.user.is_staff)
-)
+staff_member_required = account_passes_test(_check_staff_member)
+
+
+def _check_staff_member_or_app(context):
+    if not (is_app(context) or is_staff_user(context)):
+        raise PermissionDenied(
+            message=(
+                "You need to be authenticated as a staff member or an app to perform "
+                "this action"
+            )
+        )
+
+
+staff_member_or_app_required = account_passes_test(_check_staff_member_or_app)
 
 
 def check_attribute_required_permissions():
@@ -104,9 +121,24 @@ def check_attribute_required_permissions():
     different permissions need to be checked.
     """
 
-    def check_perms(context, attribute):
+    def check_perms(context, root: ChannelContext[Attribute]):
+        attribute = root.node
+        requestor = get_user_or_app_from_context(context)
+        permissions: list[BasePermissionEnum]
         if attribute.type == AttributeType.PAGE_TYPE:
-            return _permission_required((PagePermissions.MANAGE_PAGES,), context)
-        return _permission_required((ProductPermissions.MANAGE_PRODUCTS,), context)
+            permissions = [
+                PagePermissions.MANAGE_PAGES,
+                PageTypePermissions.MANAGE_PAGE_TYPES_AND_ATTRIBUTES,
+            ]
+        else:
+            permissions = [
+                ProductPermissions.MANAGE_PRODUCTS,
+                ProductTypePermissions.MANAGE_PRODUCT_TYPES_AND_ATTRIBUTES,
+            ]
+        if not has_one_of_permissions(
+            requestor,
+            permissions,
+        ):
+            raise PermissionDenied(permissions=permissions)
 
     return account_passes_test_for_attribute(check_perms)

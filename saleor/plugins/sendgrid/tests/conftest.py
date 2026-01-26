@@ -1,7 +1,7 @@
 import pytest
 
+from ....plugins.sendgrid.plugin import DeprecatedSendgridEmailPlugin
 from ...manager import get_plugins_manager
-from ..plugin import SendgridEmailPlugin
 
 
 @pytest.fixture
@@ -24,13 +24,15 @@ def sendgrid_email_plugin(settings, channel_USD):
         order_payment_confirmation_template_id=None,
         order_canceled_template_id=None,
         order_refund_confirmation_template_id=None,
+        send_gift_card_template_id=None,
         api_key=None,
     ):
-
-        settings.PLUGINS = ["saleor.plugins.sendgrid.plugin.SendgridEmailPlugin"]
-        manager = get_plugins_manager()
+        settings.PLUGINS = [
+            "saleor.plugins.sendgrid.plugin.DeprecatedSendgridEmailPlugin"
+        ]
+        manager = get_plugins_manager(allow_replica=False)
         manager.save_plugin_configuration(
-            SendgridEmailPlugin.PLUGIN_ID,
+            DeprecatedSendgridEmailPlugin.PLUGIN_ID,
             channel_USD.slug,
             {
                 "active": active,
@@ -93,11 +95,16 @@ def sendgrid_email_plugin(settings, channel_USD):
                         "name": "order_refund_confirmation_template_id",
                         "value": order_refund_confirmation_template_id,
                     },
+                    {
+                        "name": "send_gift_card_template_id",
+                        "value": send_gift_card_template_id,
+                    },
                     {"name": "api_key", "value": api_key},
                 ],
             },
         )
-        manager = get_plugins_manager()
+        manager = get_plugins_manager(allow_replica=False)
+        manager.get_all_plugins()
         return manager.plugins_per_channel[channel_USD.slug][0]
 
     return fun

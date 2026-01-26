@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
 import graphene
+from django.core.files.uploadedfile import SimpleUploadedFile
 
 from ....product.error_codes import ProductErrorCode
 from ....product.models import DigitalContent, ProductVariant
@@ -15,7 +16,6 @@ from ...tests.utils import (
 def test_fetch_all_digital_contents(
     staff_api_client, variant, digital_content, permission_manage_products
 ):
-
     digital_content_num = DigitalContent.objects.count()
     query = """
     query {
@@ -81,7 +81,8 @@ def test_digital_content_query_invalid_id(
     content = get_graphql_content_from_response(response)
     assert len(content["errors"]) == 1
     assert (
-        content["errors"][0]["message"] == f"Couldn't resolve id: {digital_content_id}."
+        content["errors"][0]["message"]
+        == f"Invalid ID: {digital_content_id}. Expected: DigitalContent."
     )
     assert content["data"]["digitalContent"] is None
 
@@ -116,19 +117,56 @@ def test_digital_content_query_with_invalid_object_type(
     assert content["data"]["digitalContent"] is None
 
 
-def test_digital_content_create_mutation_custom_settings(
-    monkeypatch, staff_api_client, variant, permission_manage_products, media_root
-):
-    query = """
+DIGITAL_CONTENT_CREATE_MUTATION = """
     mutation createDigitalContent($variant: ID!,
         $input: DigitalContentUploadInput!) {
         digitalContentCreate(variantId: $variant, input: $input) {
             variant {
                 id
             }
+            errors {
+                code
+                field
+            }
         }
     }
-    """
+"""
+
+DIGITAL_CONTENT_CREATE_WITH_METADATA_MUTATION = """
+    mutation createDigitalContent($variant: ID!,
+        $input: DigitalContentUploadInput!) {
+        digitalContentCreate(variantId: $variant, input: $input) {
+            variant {
+                id
+            }
+            content {
+                metadata {
+                    key
+                    value
+                }
+                privateMetadata {
+                    key
+                    value
+                }
+            }
+        }
+    }
+"""
+
+
+@patch("saleor.graphql.core.validators.file.magic.from_buffer")
+def test_digital_content_create_mutation_custom_settings(
+    from_buffer_mock,
+    monkeypatch,
+    staff_api_client,
+    variant,
+    permission_manage_products,
+    media_root,
+):
+    query = DIGITAL_CONTENT_CREATE_MUTATION
+
+    # Mock magic to detect actual content as JPEG
+    from_buffer_mock.return_value = "image/jpeg"
 
     image_file, image_name = create_image()
     url_valid_days = 3
@@ -158,19 +196,19 @@ def test_digital_content_create_mutation_custom_settings(
     assert not variant.digital_content.use_default_settings
 
 
+@patch("saleor.graphql.core.validators.file.magic.from_buffer")
 def test_digital_content_create_mutation_default_settings(
-    monkeypatch, staff_api_client, variant, permission_manage_products, media_root
+    from_buffer_mock,
+    monkeypatch,
+    staff_api_client,
+    variant,
+    permission_manage_products,
+    media_root,
 ):
-    query = """
-    mutation digitalCreate($variant: ID!,
-        $input: DigitalContentUploadInput!) {
-        digitalContentCreate(variantId: $variant, input: $input) {
-            variant {
-                id
-            }
-        }
-    }
-    """
+    query = DIGITAL_CONTENT_CREATE_MUTATION
+
+    # Mock magic to detect actual content as JPEG
+    from_buffer_mock.return_value = "image/jpeg"
 
     image_file, image_name = create_image()
 
@@ -189,19 +227,67 @@ def test_digital_content_create_mutation_default_settings(
     assert variant.digital_content.use_default_settings
 
 
-def test_digital_content_create_mutation_removes_old_content(
-    monkeypatch, staff_api_client, variant, permission_manage_products, media_root
+@patch("saleor.graphql.core.validators.file.magic.from_buffer")
+def test_digital_content_create_mutation_with_metadata(
+    from_buffer_mock,
+    monkeypatch,
+    staff_api_client,
+    variant,
+    permission_manage_products,
+    media_root,
 ):
-    query = """
-    mutation digitalCreate($variant: ID!,
-        $input: DigitalContentUploadInput!) {
-        digitalContentCreate(variantId: $variant, input: $input) {
-            variant {
-                id
-            }
-        }
+    # given
+    query = DIGITAL_CONTENT_CREATE_WITH_METADATA_MUTATION
+
+    # Mock magic to detect actual content as JPEG
+    from_buffer_mock.return_value = "image/jpeg"
+
+    image_file, image_name = create_image()
+    url_valid_days = 3
+    max_downloads = 5
+    metadata_key = "md key"
+    metadata_value = "md value"
+
+    variables = {
+        "variant": graphene.Node.to_global_id("ProductVariant", variant.id),
+        "input": {
+            "useDefaultSettings": False,
+            "maxDownloads": max_downloads,
+            "urlValidDays": url_valid_days,
+            "automaticFulfillment": True,
+            "contentFile": image_name,
+            "metadata": [{"key": metadata_key, "value": metadata_value}],
+            "privateMetadata": [{"key": metadata_key, "value": metadata_value}],
+        },
     }
-    """
+
+    body = get_multipart_request_body(query, variables, image_file, image_name)
+
+    # when
+    response = staff_api_client.post_multipart(
+        body, permissions=[permission_manage_products]
+    )
+    get_graphql_content(response)
+    variant.refresh_from_db()
+
+    # then
+    assert variant.digital_content.metadata == {metadata_key: metadata_value}
+    assert variant.digital_content.private_metadata == {metadata_key: metadata_value}
+
+
+@patch("saleor.graphql.core.validators.file.magic.from_buffer")
+def test_digital_content_create_mutation_removes_old_content(
+    from_buffer_mock,
+    monkeypatch,
+    staff_api_client,
+    variant,
+    permission_manage_products,
+    media_root,
+):
+    query = DIGITAL_CONTENT_CREATE_MUTATION
+
+    # Mock magic to detect actual content as JPEG
+    from_buffer_mock.return_value = "image/jpeg"
 
     image_file, image_name = create_image()
 
@@ -222,7 +308,89 @@ def test_digital_content_create_mutation_removes_old_content(
     variant.refresh_from_db()
     assert variant.digital_content.content_file
     assert variant.digital_content.use_default_settings
-    assert not DigitalContent.objects.filter(id=d_content.id).exists()
+    assert not DigitalContent.objects.filter(id=d_content.pk).exists()
+
+
+@patch("saleor.graphql.core.validators.file.magic.from_buffer")
+def test_digital_content_create_mutation_invalid_mime_type(
+    from_buffer_mock, staff_api_client, variant, permission_manage_products
+):
+    # given
+    query = DIGITAL_CONTENT_CREATE_MUTATION
+
+    # Mock magic to detect actual content as executable
+    from_buffer_mock.return_value = "application/x-msdownload"
+
+    exe_file = SimpleUploadedFile(
+        "malicious.exe",
+        b"fake executable content",
+        content_type="application/x-msdownload",
+    )
+
+    variables = {
+        "variant": graphene.Node.to_global_id("ProductVariant", variant.id),
+        "input": {
+            "useDefaultSettings": True,
+            "contentFile": "malicious.exe",
+        },
+    }
+
+    body = get_multipart_request_body(query, variables, exe_file, "malicious.exe")
+
+    # when
+    response = staff_api_client.post_multipart(
+        body, permissions=[permission_manage_products]
+    )
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["digitalContentCreate"]
+    errors = data["errors"]
+
+    assert errors
+    assert len(errors) == 1
+    assert errors[0]["code"] == ProductErrorCode.UNSUPPORTED_MIME_TYPE.name
+    assert errors[0]["field"] == "contentFile"
+
+
+@patch("saleor.graphql.core.validators.file.magic.from_buffer")
+def test_digital_content_create_mutation_invalid_extension(
+    from_buffer_mock, staff_api_client, variant, permission_manage_products
+):
+    # given
+    query = DIGITAL_CONTENT_CREATE_MUTATION
+
+    # Mock magic to detect actual content as JPEG (mismatches .png extension)
+    from_buffer_mock.return_value = "image/jpeg"
+
+    invalid_file = SimpleUploadedFile(
+        "test.png", b"fake jpeg content", content_type="image/jpeg"
+    )
+
+    variables = {
+        "variant": graphene.Node.to_global_id("ProductVariant", variant.id),
+        "input": {
+            "useDefaultSettings": True,
+            "contentFile": "test.png",
+        },
+    }
+
+    body = get_multipart_request_body(query, variables, invalid_file, "test.png")
+
+    # when
+    response = staff_api_client.post_multipart(
+        body, permissions=[permission_manage_products]
+    )
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["digitalContentCreate"]
+    errors = data["errors"]
+
+    assert errors
+    assert len(errors) == 1
+    assert errors[0]["code"] == ProductErrorCode.INVALID_FILE_TYPE.name
+    assert errors[0]["field"] == "contentFile"
 
 
 DIGITAL_CONTENT_DELETE_MUTATION = """
@@ -250,7 +418,7 @@ def test_digital_content_delete_mutation(
     variant.digital_content = digital_content
     variant.digital_content.save()
 
-    path = digital_content.content_file.path
+    path = digital_content.content_file.name
 
     assert hasattr(variant, "digital_content")
     variables = {"variant": graphene.Node.to_global_id("ProductVariant", variant.id)}
@@ -267,6 +435,7 @@ def test_digital_content_delete_mutation(
 def test_digital_content_update_mutation(
     monkeypatch, staff_api_client, variant, digital_content, permission_manage_products
 ):
+    # given
     url_valid_days = 3
     max_downloads = 5
     query = """
@@ -280,6 +449,14 @@ def test_digital_content_update_mutation(
                 maxDownloads
                 urlValidDays
                 automaticFulfillment
+                metadata {
+                    key
+                    value
+                }
+                privateMetadata {
+                    key
+                    value
+                }
             }
         }
     }
@@ -287,6 +464,12 @@ def test_digital_content_update_mutation(
 
     digital_content.automatic_fulfillment = False
     variant.digital_content = digital_content
+    old_meta = {"old": "meta"}
+    metadata_key = "md key"
+    metadata_value = "md value"
+    variant.digital_content.store_value_in_metadata(items=old_meta)
+    variant.digital_content.store_value_in_private_metadata(items=old_meta)
+    variant.digital_content.save(update_fields=["metadata", "private_metadata"])
     variant.digital_content.save()
 
     variables = {
@@ -296,18 +479,28 @@ def test_digital_content_update_mutation(
             "urlValidDays": url_valid_days,
             "automaticFulfillment": True,
             "useDefaultSettings": False,
+            "metadata": [{"key": metadata_key, "value": metadata_value}],
+            "privateMetadata": [{"key": metadata_key, "value": metadata_value}],
         },
     }
 
+    # when
     response = staff_api_client.post_graphql(
         query, variables, permissions=[permission_manage_products]
     )
     get_graphql_content(response)
     variant = ProductVariant.objects.get(id=variant.id)
     digital_content = variant.digital_content
+
+    # then
     assert digital_content.max_downloads == max_downloads
     assert digital_content.url_valid_days == url_valid_days
     assert digital_content.automatic_fulfillment
+    assert digital_content.metadata == {metadata_key: metadata_value, **old_meta}
+    assert digital_content.private_metadata == {
+        metadata_key: metadata_value,
+        **old_meta,
+    }
 
 
 def test_digital_content_update_mutation_missing_content(

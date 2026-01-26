@@ -4,6 +4,7 @@ import graphene
 import pytest
 
 from .....attribute.models import Attribute, AttributeProduct, AttributeVariant
+from .....product import ProductTypeKind
 from .....product.models import (
     Product,
     ProductChannelListing,
@@ -53,7 +54,10 @@ def attributes_for_filtering_with_channels(
         ]
     )
 
-    product_type = ProductType.objects.create(name="My Product Type")
+    product_type = ProductType.objects.create(
+        name="My Product Type",
+        kind=ProductTypeKind.NORMAL,
+    )
     product = Product.objects.create(
         name="Test product",
         product_type=product_type,
@@ -84,7 +88,7 @@ def attributes_for_filtering_with_channels(
             ),
         ]
     )
-    variant = ProductVariant.objects.create(product=product)
+    variant = ProductVariant.objects.create(product=product, sku="TEST_SKU")
     ProductVariantChannelListing.objects.create(
         variant=variant,
         channel=channel_USD,
@@ -189,7 +193,7 @@ def test_attributes_with_filtering_without_channel(
 
 
 @pytest.mark.parametrize(
-    "tested_field, attribute_count",
+    ("tested_field", "attribute_count"),
     [("inCategory", 5), ("inCollection", 5)],
 )
 def test_products_with_filtering_with_channel_as_staff_user(
@@ -256,7 +260,7 @@ def test_products_with_alternative_filtering_with_channel_as_staff_user(
 
 
 @pytest.mark.parametrize(
-    "tested_field, attribute_count",
+    ("tested_field", "attribute_count"),
     [("inCategory", 5), ("inCollection", 5)],
 )
 def test_products_with_filtering_as_anonymous_client(
@@ -289,7 +293,7 @@ def test_products_with_filtering_as_anonymous_client(
 
 
 @pytest.mark.parametrize(
-    "tested_field, attribute_count",
+    ("tested_field", "attribute_count"),
     [("inCategory", 5), ("inCollection", 5)],
 )
 def test_products_with_filtering_with_not_visible_in_listings_as_staff_user(
@@ -328,7 +332,7 @@ def test_products_with_filtering_with_not_visible_in_listings_as_staff_user(
 
 
 @pytest.mark.parametrize(
-    "tested_field, attribute_count",
+    ("tested_field", "attribute_count"),
     [
         ("inCategory", 0),
         # Products not visible in listings should be visible in collections
@@ -365,7 +369,7 @@ def test_products_with_filtering_with_not_visible_in_listings_as_anonymous_clien
 
 
 @pytest.mark.parametrize(
-    "tested_field, attribute_count",
+    ("tested_field", "attribute_count"),
     [("inCategory", 5), ("inCollection", 5)],
 )
 def test_products_with_filtering_with_not_published_as_staff_user(
@@ -404,7 +408,7 @@ def test_products_with_filtering_with_not_published_as_staff_user(
 
 
 @pytest.mark.parametrize(
-    "tested_field, attribute_count",
+    ("tested_field", "attribute_count"),
     [("inCategory", 0), ("inCollection", 0)],
 )
 def test_products_with_filtering_with_not_published_as_anonymous_client(

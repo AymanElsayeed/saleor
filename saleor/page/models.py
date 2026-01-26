@@ -1,12 +1,28 @@
-from django.contrib.postgres.indexes import GinIndex
+from typing import TYPE_CHECKING, Union
+
+from django.contrib.postgres.indexes import BTreeIndex, GinIndex
+from django.contrib.postgres.search import SearchVectorField
 from django.db import models
 
 from ..core.db.fields import SanitizedJSONField
-from ..core.models import ModelWithMetadata, PublishableModel
-from ..core.permissions import PagePermissions, PageTypePermissions
+from ..core.models import ModelWithMetadata, PublishableModel, PublishedQuerySet
 from ..core.utils.editorjs import clean_editor_js
-from ..core.utils.translations import TranslationProxy
-from ..seo.models import SeoModel, SeoModelTranslation
+from ..permission.enums import PagePermissions, PageTypePermissions
+from ..seo.models import SeoModel, SeoModelTranslationWithSlug
+
+if TYPE_CHECKING:
+    from ..account.models import User
+    from ..app.models import App
+
+
+class PageQueryset(PublishedQuerySet):
+    def visible_to_user(self, requestor: Union["App", "User", None]):
+        if requestor and requestor.has_perm(PagePermissions.MANAGE_PAGES):
+            return self.all()
+        return self.published()
+
+
+PageManager = models.Manager.from_queryset(PageQueryset)
 
 
 class Page(ModelWithMetadata, SeoModel, PublishableModel):
@@ -16,20 +32,29 @@ class Page(ModelWithMetadata, SeoModel, PublishableModel):
         "PageType", related_name="pages", on_delete=models.CASCADE
     )
     content = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editor_js)
-    created = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    search_vector = SearchVectorField(blank=True, null=True)
+    search_index_dirty = models.BooleanField(default=True, db_default=True)
 
-    translated = TranslationProxy()
+    objects = PageManager()  # type: ignore[misc]
 
     class Meta(ModelWithMetadata.Meta):
         ordering = ("slug",)
         permissions = ((PagePermissions.MANAGE_PAGES.codename, "Manage pages."),)
-        indexes = [*ModelWithMetadata.Meta.indexes, GinIndex(fields=["title", "slug"])]
+        indexes = [
+            *ModelWithMetadata.Meta.indexes,
+            GinIndex(
+                name="page_tsearch",
+                fields=["search_vector"],
+            ),
+            BTreeIndex(fields=["slug"], name="page_slug_btree_idx"),
+        ]
 
     def __str__(self):
         return self.title
 
 
-class PageTranslation(SeoModelTranslation):
+class PageTranslation(SeoModelTranslationWithSlug):
     page = models.ForeignKey(
         Page, related_name="translations", on_delete=models.CASCADE
     )
@@ -37,17 +62,18 @@ class PageTranslation(SeoModelTranslation):
     content = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editor_js)
 
     class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["language_code", "slug"],
+                name="uniq_lang_slug_pagetransl",
+            ),
+        ]
         ordering = ("language_code", "page", "pk")
         unique_together = (("language_code", "page"),)
 
     def __repr__(self):
         class_ = type(self)
-        return "%s(pk=%r, title=%r, page_pk=%r)" % (
-            class_.__name__,
-            self.pk,
-            self.title,
-            self.page_id,
-        )
+        return f"{class_.__name__}(pk={self.pk!r}, title={self.title!r}, page_pk={self.page_id!r})"
 
     def __str__(self):
         return self.title if self.title else str(self.pk)

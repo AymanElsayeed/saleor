@@ -1,4 +1,5 @@
 from collections import defaultdict
+from typing import TypeVar
 
 from ...attribute import models as attribute_models
 from ...discount import models as discount_models
@@ -9,8 +10,10 @@ from ...shipping import models as shipping_models
 from ...site import models as site_models
 from ..core.dataloaders import DataLoader
 
+T = TypeVar("T")
 
-class BaseTranslationByIdAndLanguageCodeLoader(DataLoader):
+
+class BaseTranslationByIdAndLanguageCodeLoader[T](DataLoader[tuple[int, str], T]):
     model = None
     relation_name = None
 
@@ -20,27 +23,29 @@ class BaseTranslationByIdAndLanguageCodeLoader(DataLoader):
         if not self.relation_name:
             raise ValueError("Provide a relation_name for this dataloader.")
 
-        ids = set([key[0] for key in keys])
-        language_codes = set([key[1] for key in keys])
+        ids = {str(key[0]) for key in keys}
+        language_codes = {key[1] for key in keys}
 
         filters = {
             "language_code__in": language_codes,
             f"{self.relation_name}__in": ids,
         }
 
-        translations = self.model.objects.filter(**filters)
+        translations = self.model.objects.using(self.database_connection_name).filter(
+            **filters
+        )
         translation_by_language_code_by_id = defaultdict(
             lambda: defaultdict(lambda: None)
         )
         for translation in translations:
             language_code = translation.language_code
-            id = getattr(translation, self.relation_name)
+            id = str(getattr(translation, self.relation_name))
             translation_by_language_code_by_id[language_code][id] = translation
-        return [translation_by_language_code_by_id[key[1]][key[0]] for key in keys]
+        return [translation_by_language_code_by_id[key[1]][str(key[0])] for key in keys]
 
 
 class AttributeTranslationByIdAndLanguageCodeLoader(
-    BaseTranslationByIdAndLanguageCodeLoader
+    BaseTranslationByIdAndLanguageCodeLoader[attribute_models.AttributeTranslation]
 ):
     context_key = "attribute_translation_by_id_and_language_code"
     model = attribute_models.AttributeTranslation
@@ -48,7 +53,7 @@ class AttributeTranslationByIdAndLanguageCodeLoader(
 
 
 class AttributeValueTranslationByIdAndLanguageCodeLoader(
-    BaseTranslationByIdAndLanguageCodeLoader
+    BaseTranslationByIdAndLanguageCodeLoader[attribute_models.AttributeValueTranslation]
 ):
     context_key = "attribute_value_translation_by_id_and_language_code"
     model = attribute_models.AttributeValueTranslation
@@ -56,7 +61,7 @@ class AttributeValueTranslationByIdAndLanguageCodeLoader(
 
 
 class CategoryTranslationByIdAndLanguageCodeLoader(
-    BaseTranslationByIdAndLanguageCodeLoader
+    BaseTranslationByIdAndLanguageCodeLoader[product_models.CategoryTranslation]
 ):
     context_key = "category_translation_by_id_and_language_code"
     model = product_models.CategoryTranslation
@@ -64,7 +69,7 @@ class CategoryTranslationByIdAndLanguageCodeLoader(
 
 
 class CollectionTranslationByIdAndLanguageCodeLoader(
-    BaseTranslationByIdAndLanguageCodeLoader
+    BaseTranslationByIdAndLanguageCodeLoader[product_models.CollectionTranslation]
 ):
     context_key = "collection_translation_by_id_and_language_code"
     model = product_models.CollectionTranslation
@@ -72,7 +77,7 @@ class CollectionTranslationByIdAndLanguageCodeLoader(
 
 
 class MenuItemTranslationByIdAndLanguageCodeLoader(
-    BaseTranslationByIdAndLanguageCodeLoader
+    BaseTranslationByIdAndLanguageCodeLoader[menu_models.MenuItemTranslation]
 ):
     context_key = "menu_item_translation_by_id_and_language_code"
     model = menu_models.MenuItemTranslation
@@ -80,7 +85,7 @@ class MenuItemTranslationByIdAndLanguageCodeLoader(
 
 
 class PageTranslationByIdAndLanguageCodeLoader(
-    BaseTranslationByIdAndLanguageCodeLoader
+    BaseTranslationByIdAndLanguageCodeLoader[page_models.PageTranslation]
 ):
     context_key = "page_translation_by_id_and_language_code"
     model = page_models.PageTranslation
@@ -88,7 +93,7 @@ class PageTranslationByIdAndLanguageCodeLoader(
 
 
 class ProductTranslationByIdAndLanguageCodeLoader(
-    BaseTranslationByIdAndLanguageCodeLoader
+    BaseTranslationByIdAndLanguageCodeLoader[product_models.ProductTranslation]
 ):
     context_key = "product_translation_by_id_and_language_code"
     model = product_models.ProductTranslation
@@ -96,23 +101,15 @@ class ProductTranslationByIdAndLanguageCodeLoader(
 
 
 class ProductVariantTranslationByIdAndLanguageCodeLoader(
-    BaseTranslationByIdAndLanguageCodeLoader
+    BaseTranslationByIdAndLanguageCodeLoader[product_models.ProductVariantTranslation]
 ):
     context_key = "product_variant_translation_by_id_and_language_code"
     model = product_models.ProductVariantTranslation
     relation_name = "product_variant_id"
 
 
-class SaleTranslationByIdAndLanguageCodeLoader(
-    BaseTranslationByIdAndLanguageCodeLoader
-):
-    context_key = "sale_translation_by_id_and_language_code"
-    model = discount_models.SaleTranslation
-    relation_name = "sale_id"
-
-
 class ShippingMethodTranslationByIdAndLanguageCodeLoader(
-    BaseTranslationByIdAndLanguageCodeLoader
+    BaseTranslationByIdAndLanguageCodeLoader[shipping_models.ShippingMethodTranslation]
 ):
     context_key = "shipping_method_translation_by_id_and_language_code"
     model = shipping_models.ShippingMethodTranslation
@@ -120,7 +117,7 @@ class ShippingMethodTranslationByIdAndLanguageCodeLoader(
 
 
 class SiteSettingsTranslationByIdAndLanguageCodeLoader(
-    BaseTranslationByIdAndLanguageCodeLoader
+    BaseTranslationByIdAndLanguageCodeLoader[site_models.SiteSettingsTranslation]
 ):
     context_key = "site_settings_translation_by_id_and_language_code"
     model = site_models.SiteSettingsTranslation
@@ -128,8 +125,24 @@ class SiteSettingsTranslationByIdAndLanguageCodeLoader(
 
 
 class VoucherTranslationByIdAndLanguageCodeLoader(
-    BaseTranslationByIdAndLanguageCodeLoader
+    BaseTranslationByIdAndLanguageCodeLoader[discount_models.VoucherTranslation]
 ):
     context_key = "voucher_translation_by_id_and_language_code"
     model = discount_models.VoucherTranslation
     relation_name = "voucher_id"
+
+
+class PromotionTranslationByIdAndLanguageCodeLoader(
+    BaseTranslationByIdAndLanguageCodeLoader[discount_models.PromotionTranslation]
+):
+    context_key = "promotion_translation_by_id_and_language_code"
+    model = discount_models.PromotionTranslation
+    relation_name = "promotion_id"
+
+
+class PromotionRuleTranslationByIdAndLanguageCodeLoader(
+    BaseTranslationByIdAndLanguageCodeLoader[discount_models.PromotionRuleTranslation]
+):
+    context_key = "promotion_rule_translation_by_id_and_language_code"
+    model = discount_models.PromotionRuleTranslation
+    relation_name = "promotion_rule_id"

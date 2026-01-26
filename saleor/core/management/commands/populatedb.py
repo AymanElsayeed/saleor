@@ -1,7 +1,6 @@
 from io import StringIO
 
 from django.apps import apps
-from django.conf import settings
 from django.core.management import call_command
 from django.core.management.base import BaseCommand
 from django.db import connection
@@ -9,17 +8,23 @@ from django.db import connection
 from ....account.utils import create_superuser
 from ...utils.random_data import (
     add_address_to_admin,
+    create_catalogue_promotions,
     create_channels,
-    create_gift_card,
+    create_checkout_with_custom_prices,
+    create_checkout_with_preorders,
+    create_checkout_with_same_variant_in_multiple_lines,
+    create_gift_cards,
     create_menus,
+    create_order_promotions,
     create_orders,
     create_page_type,
     create_pages,
     create_permission_groups,
-    create_product_sales,
     create_products_by_schema,
     create_shipping_zones,
+    create_site_settings,
     create_staffs,
+    create_tax_classes,
     create_users,
     create_vouchers,
     create_warehouses,
@@ -78,11 +83,7 @@ class Command(BaseCommand):
         user_password = options["user_password"]
         staff_password = options["staff_password"]
         superuser_password = options["superuser_password"]
-        settings.PLUGINS = [
-            "saleor.payment.gateways.dummy.plugin.DummyGatewayPlugin",
-            "saleor.payment.gateways.dummy_credit_card.plugin."
-            "DummyCreditCardGatewayPlugin",
-        ]
+
         create_images = not options["withoutimages"]
         for msg in create_channels():
             self.stdout.write(msg)
@@ -96,17 +97,29 @@ class Command(BaseCommand):
             self.stdout.write(msg)
         create_products_by_schema(self.placeholders_dir, create_images)
         self.stdout.write("Created products")
-        for msg in create_product_sales(5):
+        for msg in create_catalogue_promotions(2):
+            self.stdout.write(msg)
+        for msg in create_order_promotions(2):
             self.stdout.write(msg)
         for msg in create_vouchers():
-            self.stdout.write(msg)
-        for msg in create_gift_card():
             self.stdout.write(msg)
         for msg in create_users(user_password, 20):
             self.stdout.write(msg)
         for msg in create_orders(20):
             self.stdout.write(msg)
+        for msg in create_gift_cards():
+            self.stdout.write(msg)
         for msg in create_menus():
+            self.stdout.write(msg)
+        for msg in create_checkout_with_preorders():
+            self.stdout.write(msg)
+        for msg in create_checkout_with_custom_prices():
+            self.stdout.write(msg)
+        for msg in create_tax_classes():
+            self.stdout.write(msg)
+        for msg in create_checkout_with_same_variant_in_multiple_lines():
+            self.stdout.write(msg)
+        for msg in create_site_settings():
             self.stdout.write(msg)
 
         if options["createsuperuser"]:

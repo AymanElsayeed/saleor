@@ -5,18 +5,19 @@ from django.db import migrations
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("page", "0022_alter_pagetranslation_title"),
     ]
 
     operations = [
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="page",
             index=django.contrib.postgres.indexes.GinIndex(
                 fields=["title", "slug"], name="page_page_title_964714_gin"
             ),
         ),
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="pagetype",
             index=django.contrib.postgres.indexes.GinIndex(

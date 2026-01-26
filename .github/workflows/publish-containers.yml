@@ -1,143 +1,198 @@
 name: Publish
 
 on:
-  push:
-    tags:
-      # Matches stable and pre-releases
-      - "[0-9]+.[0-9]+.[0-9]+*"
-    branches:
-      - master
-      - ci/**
+  workflow_call:
+    inputs:
+      ref:
+        description: Optional ref name for custom build
+        required: false
+        type: string
+      prefix:
+        description: Optional image prefix for branch build
+        required: false
+        type: string
+      version:
+        description: Optional custom image version tag
+        required: false
+        type: string
+    secrets:
+      SLACK_WEBHOOK_URL:
+      SLACK_MENTION_GROUP_ID:
+    outputs:
+      version:
+        description: Docker image version
+        value: ${{ jobs.merge-digests.outputs.version }}
 
 jobs:
-  docker:
-    runs-on: ubuntu-20.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
+  build-and-push:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - ubuntu-24.04 # AMD64
+          - ubuntu-24.04-arm # ARM64
 
-      # Outputs the name of the repository (owner/repo)
+    runs-on: ${{ matrix.platform }}
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
       - name: Build Image Name
         id: image
+        env:
+          GH_REPO: ${{ github.repository }}
         run: |
           # The name of the owner and of the repository: owner/repository
-          IMAGE_NAME=$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')
-          echo ::set-output name=image_name::${IMAGE_NAME}
+          IMAGE_NAME=$(echo "$GH_REPO" | tr '[:upper:]' '[:lower:]')
+          echo "image_name=$IMAGE_NAME" >> $GITHUB_OUTPUT
 
-      # Outputs container tags for tagged pushes starting by 'v'
-      # Pushes only to GitHub Container Repository (ghcr.io)
-      #
-      # Tags stable versions as :latest
-      # Pre-releases, alphas, etc. as :snapshot
-      - name: Prepare Image Tags from Git Tag
-        id: tagged
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
-        run: |
-          set -x
-
-          # Remove everything else than the tagged version
-          VERSION=${GITHUB_REF#refs/tags/}
-
-          # Tag as stable (:latest) if there is no letters in the version
-          # Otherwise, tag as preview (:snapshot)
-          if [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            # Matches 1.0.0, 1.0.1, etc.
-            NAMED_VERSION="latest"
-          else
-            # Matches 1.0.0a1, 1.0.0rc1, etc.
-            NAMED_VERSION="snapshot"
-          fi
-
-          TAGS=$"\
-          ghcr.io/${{ steps.image.outputs.image_name }}:${NAMED_VERSION},\
-          ghcr.io/${{ steps.image.outputs.image_name }}:${VERSION}\
-          "
-
-          # Output the target tags
-          echo "
-          CONTAINER_TAGS=${TAGS}
-          NAMED_VERSION=${NAMED_VERSION}
-          " >> "${GITHUB_ENV}"
-
-      # Outputs the containers tags for staging branches
-      # Only publishes them onto Docker Hub
-      - name: Prepare Tags for Staging
-        id: staging
-        if: ${{ startsWith(github.ref, 'refs/heads/') }}
-        run: |
-          set -x
-
-          # Version name is the branch name
-          # Slashes are substitued by dashes
-          CLEAN_BRANCH_NAME=$(echo ${GITHUB_REF#refs/heads/} | tr / -)
-          SHA=${GITHUB_SHA}
-
-          # Target Docker Hub with the SHA value
-          # and branch name
-          TAGS=$"\
-          ${{ steps.image.outputs.image_name }}:${CLEAN_BRANCH_NAME},\
-          ${{ steps.image.outputs.image_name }}:sha-${SHA}\
-          "
-
-          # Set version name for open-containers version label as:
-          # <branch>-<drift>-g<6-digit-hash>
-          NAMED_VERSION=$(git describe --all --long | tr -d $'\n')
-
-          # Output the target tags
-          echo "
-          CONTAINER_TAGS=${TAGS}
-          NAMED_VERSION=${NAMED_VERSION}
-          " >> "${GITHUB_ENV}"
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v1
+      - name: Checkout
+        uses: actions/checkout@v5
         with:
-          platforms: all
+          ref: ${{ inputs.ref }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ steps.image.outputs.image_name }}
 
       - name: Set up Docker Buildx
-        id: buildx
-        uses: docker/setup-buildx-action@v1
-
-      - name: Cache Docker layers
-        uses: actions/cache@v2
-        with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-buildx-
-
-      - name: Login to DockerHub
-        if: ${{ startsWith(github.ref, 'refs/heads/') }}
-        uses: docker/login-action@v1
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+        uses: docker/setup-buildx-action@v3
 
       - name: Login to GitHub Container Registry
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
-        uses: docker/login-action@v1
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ secrets.CR_USERNAME }}
-          password: ${{ secrets.CR_PAT }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and Push
-        id: docker_build
-        uses: docker/build-push-action@v2
+        id: build
+        uses: docker/build-push-action@v6
         with:
-          builder: ${{ steps.buildx.outputs.name }}
-          context: ./
-          platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ env.CONTAINER_TAGS }}
-          cache-from: type=local,src=/tmp/.buildx-cache
-          cache-to: type=local,dest=/tmp/.buildx-cache
-          build-args: |
-            PROJECT_VERSION=${{ env.NAMED_VERSION }}
-            COMMIT_ID=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          context: .
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=true
+          # We set `push-by-digest=true` thus we cannot put any tag and thus we use
+          # the container repository name instead (ghcr.io/saleor/saleor)
+          # (we cannot push both by tags and by digest, only one or the other)
+          tags: ghcr.io/${{ steps.image.outputs.image_name }}
+          push: true
 
-      - name: Image digest
+      - name: Export digest
         run: |
-          echo $"\
-            Digest: ${{ steps.docker_build.outputs.digest }}
-            Tags: ${{ env.CONTAINER_TAGS }}"
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.platform }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-digests:
+    needs: build-and-push
+
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: Build Image Name
+        id: image
+        env:
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # The name of the owner and of the repository: owner/repository
+          IMAGE_NAME=$(echo "$GH_REPO" | tr '[:upper:]' '[:lower:]')
+          echo "image_name=$IMAGE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Download digests
+        uses: actions/download-artifact@v5
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      # Needed by `docker/metadata-action` (to fetch tags and other git information)
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ steps.image.outputs.image_name }}
+          tags: |
+            type=ref,event=branch,prefix=${{ inputs.prefix }}
+            type=pep440,pattern={{version}}
+            type=pep440,pattern={{major}}.{{minor}}
+            type=raw,value=${{ inputs.version }},enable=${{ inputs.version != null }}
+          context: git
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          DOCKER_META_JSON: ${{ steps.meta.outputs.json }}
+          IMAGE_NAME: ${{ steps.image.outputs.image_name }}
+        run: |
+          set -x
+          tag_list=$(echo "$DOCKER_META_JSON" | jq -cr '.tags | map("-t " + .) | join(" ")')
+          image_digest_list=$(printf "ghcr.io/$IMAGE_NAME@sha256:%s " *)
+          docker buildx imagetools create $tag_list $image_digest_list
+
+      - name: Inspect image
+        env:
+          IMAGE_VERSION: ${{ steps.meta.outputs.version }}
+          IMAGE_NAME: ${{ steps.image.outputs.image_name }}
+        run: |
+          docker buildx imagetools inspect ghcr.io/"$IMAGE_NAME":"$IMAGE_VERSION"
+
+  notify:
+    if: ${{ failure() }}
+    needs: build-and-push
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          sparse-checkout: |
+            ./.github/workflows/notify
+
+      - name: Notify Slack
+        env:
+          JOB_STATUS: ${{ job.status }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_MENTION_GROUP_ID: ${{ secrets.SLACK_MENTION_GROUP_ID }}
+          JOB_TITLE: "Build of Saleor Core ${{ steps.meta.outputs.version }}"
+        run: |
+          python3 ./.github/workflows/notify/notify-slack.py

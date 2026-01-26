@@ -17,8 +17,11 @@ MUTATION_CHECKOUT_ADD_PROMO_CODE = """
                 token
                 voucherCode
                 giftCards {
+                    code
+                }
+                giftCards {
                     id
-                    displayCode
+                    last4CodeChars
                 }
                 totalPrice {
                     gross {
@@ -40,6 +43,16 @@ def _mutate_checkout_add_promo_code(client, variables):
 def test_checkout_add_voucher_code_by_id(api_client, checkout_with_item, voucher):
     checkout_id = graphene.Node.to_global_id("Checkout", checkout_with_item.pk)
     variables = {"checkoutId": checkout_id, "promoCode": voucher.code}
+    data = _mutate_checkout_add_promo_code(api_client, variables)
+
+    assert not data["errors"]
+    assert data["checkout"]["id"] == checkout_id
+    assert data["checkout"]["voucherCode"] == voucher.code
+
+
+def test_checkout_add_voucher_code_by_token(api_client, checkout_with_item, voucher):
+    checkout_id = graphene.Node.to_global_id("Checkout", checkout_with_item.pk)
+    variables = {"token": checkout_with_item.token, "promoCode": voucher.code}
     data = _mutate_checkout_add_promo_code(api_client, variables)
 
     assert not data["errors"]
@@ -88,7 +101,7 @@ MUTATION_CHECKOUT_REMOVE_PROMO_CODE = """
                 voucherCode
                 giftCards {
                     id
-                    displayCode
+                    last4CodeChars
                 }
             }
         }

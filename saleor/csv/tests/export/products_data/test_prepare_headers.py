@@ -4,8 +4,8 @@ from .....graphql.csv.enums import ProductFieldEnum
 from ....utils.product_headers import (
     get_attributes_headers,
     get_channels_headers,
-    get_export_fields_and_headers_info,
     get_product_export_fields_and_headers,
+    get_product_export_fields_and_headers_info,
     get_warehouses_headers,
 )
 
@@ -44,7 +44,10 @@ def test_get_export_fields_and_headers_no_fields():
 
 
 def test_get_attributes_headers(
-    product_with_multiple_values_attributes, product_type_without_variant
+    product_with_multiple_values_attributes,
+    product_type_without_variant,
+    product_type_category_reference_attribute,
+    product_type_collection_reference_attribute,
 ):
     # given
     attribute_ids = Attribute.objects.values_list("id", flat=True)
@@ -52,7 +55,11 @@ def test_get_attributes_headers(
 
     product_type = product_with_multiple_values_attributes.product_type
     product_attribute = product_type.product_attributes.first()
-    product_type_without_variant.product_attributes.add(product_attribute)
+    product_type_without_variant.product_attributes.add(
+        product_attribute,
+        product_type_category_reference_attribute,
+        product_type_collection_reference_attribute,
+    )
 
     # when
     attributes_headers = get_attributes_headers(export_info)
@@ -122,11 +129,13 @@ def test_get_channels_headers(channel_USD, channel_PLN):
             "product currency code",
             "published",
             "publication date",
+            "published at",
             "searchable",
             "available for purchase",
             "price amount",
             "variant currency code",
             "variant cost price",
+            "variant preorder quantity threshold",
         ]:
             expected_headers.append(f"{channel_slug} (channel {field})")
     assert channel_headers == expected_headers
@@ -143,12 +152,12 @@ def test_get_channels_headers_lack_of_channel_ids():
     assert channel_headers == []
 
 
-def test_get_export_fields_and_headers_info(
+def test_get_product_export_fields_and_headers_info(
     warehouses, product_with_multiple_values_attributes, channel_PLN, channel_USD
 ):
     # given
     warehouse_ids = [w.pk for w in warehouses]
-    attribute_ids = [attr.pk for attr in Attribute.objects.all()]
+    attribute_ids = [str(attr.pk) for attr in Attribute.objects.all()]
     channel_ids = [channel_PLN.pk, channel_USD.pk]
     export_info = {
         "fields": [
@@ -167,9 +176,11 @@ def test_get_export_fields_and_headers_info(
     ]
 
     # when
-    export_fields, file_headers, data_headers = get_export_fields_and_headers_info(
-        export_info
-    )
+    (
+        export_fields,
+        file_headers,
+        data_headers,
+    ) = get_product_export_fields_and_headers_info(export_info)
 
     # then
     expected_fields = [
@@ -195,11 +206,13 @@ def test_get_export_fields_and_headers_info(
             "product currency code",
             "published",
             "publication date",
+            "published at",
             "searchable",
             "available for purchase",
             "price amount",
             "variant currency code",
             "variant cost price",
+            "variant preorder quantity threshold",
         ]:
             channel_headers.append(f"{slug} (channel {field})")
 

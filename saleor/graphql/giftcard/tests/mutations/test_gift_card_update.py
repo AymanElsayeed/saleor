@@ -1,12 +1,19 @@
-from datetime import date, timedelta
+import datetime
+import json
+from unittest import mock
 
 import graphene
+import pytest
+from django.utils.functional import SimpleLazyObject
+from freezegun import freeze_time
 
+from .....core.utils.json_serializer import CustomJsonEncoder
 from .....giftcard import GiftCardEvents
 from .....giftcard.error_codes import GiftCardErrorCode
-from ....core.enums import TimePeriodTypeEnum
+from .....giftcard.models import GiftCardTag
+from .....webhook.event_types import WebhookEventAsyncType
+from .....webhook.payloads import generate_meta, generate_requestor
 from ....tests.utils import assert_no_permission, get_graphql_content
-from ...enums import GiftCardExpiryTypeEnum
 
 UPDATE_GIFT_CARD_MUTATION = """
     mutation giftCardUpdate(
@@ -15,16 +22,12 @@ UPDATE_GIFT_CARD_MUTATION = """
         giftCardUpdate(id: $id, input: $input) {
             giftCard {
                 id
-                code
-                displayCode
+                last4CodeChars
                 isActive
                 expiryDate
-                expiryType
-                expiryPeriod {
-                    amount
-                    type
+                tags {
+                    name
                 }
-                tag
                 created
                 lastUsedOn
                 initialBalance {
@@ -57,6 +60,8 @@ UPDATE_GIFT_CARD_MUTATION = """
                     app {
                         name
                     }
+                    tags
+                    oldTags
                     balance {
                         initialBalance {
                             amount
@@ -75,20 +80,8 @@ UPDATE_GIFT_CARD_MUTATION = """
                             currency
                         }
                     }
-                    expiry {
-                        expiryType
-                        oldExpiryType
-                        expiryPeriod {
-                            type
-                            amount
-                        }
-                        oldExpiryPeriod {
-                            type
-                            amount
-                        }
-                        expiryDate
-                        oldExpiryDate
-                    }
+                    expiryDate
+                    oldExpiryDate
                 }
             }
             errors {
@@ -111,22 +104,21 @@ def test_update_gift_card(
     # given
     old_initial_balance = float(gift_card.initial_balance.amount)
     old_current_balance = float(gift_card.current_balance.amount)
-    old_type = gift_card.expiry_type
 
     initial_balance = 100.0
     currency = gift_card.currency
-    expiry_type = GiftCardExpiryTypeEnum.EXPIRY_DATE.name
-    date_value = date.today() + timedelta(days=365)
-    tag = "new-gift-card-tag"
+    date_value = datetime.datetime.now(tz=datetime.UTC).date() + datetime.timedelta(
+        days=365
+    )
+    old_tag = gift_card.tags.first().name
+    new_tag = "new-gift-card-tag"
+    tags_count = GiftCardTag.objects.count()
     variables = {
         "id": graphene.Node.to_global_id("GiftCard", gift_card.pk),
         "input": {
             "balanceAmount": initial_balance,
-            "tag": tag,
-            "expirySettings": {
-                "expiryType": expiry_type,
-                "expiryDate": date_value,
-            },
+            "addTags": [new_tag],
+            "expiryDate": date_value,
         },
     }
 
@@ -147,12 +139,10 @@ def test_update_gift_card(
     data = content["data"]["giftCardUpdate"]["giftCard"]
 
     assert not errors
-    assert data["code"]
-    assert data["displayCode"]
-    assert data["expiryType"] == expiry_type.upper()
+    assert data["last4CodeChars"]
     assert data["expiryDate"] == date_value.isoformat()
-    assert not data["expiryPeriod"]
-    assert data["tag"] == tag
+    assert len(data["tags"]) == 2
+    assert {tag["name"] for tag in data["tags"]} == {old_tag, new_tag}
     assert data["createdBy"]["email"] == gift_card.created_by.email
     assert data["createdByEmail"] == gift_card.created_by_email
     assert not data["usedBy"]
@@ -163,7 +153,7 @@ def test_update_gift_card(
     assert data["initialBalance"]["amount"] == initial_balance
     assert data["currentBalance"]["amount"] == initial_balance
 
-    assert len(data["events"]) == 2
+    assert len(data["events"]) == 3
     events = [
         {
             "type": GiftCardEvents.BALANCE_RESET.upper(),
@@ -189,27 +179,40 @@ def test_update_gift_card(
                     "currency": currency,
                 },
             },
-            "expiry": None,
+            "expiryDate": None,
+            "oldExpiryDate": None,
+            "tags": None,
+            "oldTags": None,
         },
         {
-            "type": GiftCardEvents.EXPIRY_SETTINGS_UPDATED.upper(),
+            "type": GiftCardEvents.EXPIRY_DATE_UPDATED.upper(),
             "user": {
                 "email": staff_api_client.user.email,
             },
             "app": None,
             "balance": None,
-            "expiry": {
-                "expiryType": expiry_type.upper(),
-                "oldExpiryType": old_type.upper(),
-                "expiryPeriod": None,
-                "oldExpiryPeriod": None,
-                "expiryDate": date_value.isoformat(),
-                "oldExpiryDate": None,
+            "expiryDate": date_value.isoformat(),
+            "oldExpiryDate": None,
+            "tags": None,
+            "oldTags": None,
+        },
+        {
+            "type": GiftCardEvents.TAGS_UPDATED.upper(),
+            "user": {
+                "email": staff_api_client.user.email,
             },
+            "app": None,
+            "balance": None,
+            "expiryDate": None,
+            "oldExpiryDate": None,
+            "tags": [new_tag, old_tag],
+            "oldTags": [old_tag],
         },
     ]
     for event in data["events"]:
         assert event in events
+
+    assert GiftCardTag.objects.count() == tags_count + 1
 
 
 def test_update_gift_card_by_app(
@@ -218,26 +221,27 @@ def test_update_gift_card_by_app(
     permission_manage_gift_card,
     permission_manage_users,
     permission_manage_apps,
+    gift_card_tag_list,
 ):
     # given
     old_initial_balance = float(gift_card.initial_balance.amount)
     old_current_balance = float(gift_card.current_balance.amount)
-    old_type = gift_card.expiry_type
+    old_tag = gift_card.tags.first()
 
     initial_balance = 100.0
     currency = gift_card.currency
-    expiry_type = GiftCardExpiryTypeEnum.EXPIRY_DATE.name
-    date_value = date.today() + timedelta(days=365)
-    tag = "new-gift-card-tag"
+    date_value = datetime.datetime.now(tz=datetime.UTC).date() + datetime.timedelta(
+        days=365
+    )
+    new_tag = gift_card_tag_list[0].name
+    tags_count = GiftCardTag.objects.count()
     variables = {
         "id": graphene.Node.to_global_id("GiftCard", gift_card.pk),
         "input": {
             "balanceAmount": initial_balance,
-            "tag": tag,
-            "expirySettings": {
-                "expiryType": expiry_type,
-                "expiryDate": date_value,
-            },
+            "addTags": [new_tag],
+            "removeTags": [old_tag.name],
+            "expiryDate": date_value,
         },
     }
 
@@ -258,12 +262,10 @@ def test_update_gift_card_by_app(
     data = content["data"]["giftCardUpdate"]["giftCard"]
 
     assert not errors
-    assert data["code"]
-    assert data["displayCode"]
-    assert data["expiryType"] == expiry_type.upper()
+    assert data["last4CodeChars"]
     assert data["expiryDate"] == date_value.isoformat()
-    assert not data["expiryPeriod"]
-    assert data["tag"] == tag
+    assert len(data["tags"]) == 1
+    assert {tag["name"] for tag in data["tags"]} == {new_tag}
     assert data["createdBy"]["email"] == gift_card.created_by.email
     assert data["createdByEmail"] == gift_card.created_by_email
     assert not data["usedBy"]
@@ -274,7 +276,7 @@ def test_update_gift_card_by_app(
     assert data["initialBalance"]["amount"] == initial_balance
     assert data["currentBalance"]["amount"] == initial_balance
 
-    assert len(data["events"]) == 2
+    assert len(data["events"]) == 3
     events = [
         {
             "type": GiftCardEvents.BALANCE_RESET.upper(),
@@ -298,28 +300,42 @@ def test_update_gift_card_by_app(
                     "currency": currency,
                 },
             },
-            "expiry": None,
+            "expiryDate": None,
+            "oldExpiryDate": None,
+            "tags": None,
+            "oldTags": None,
         },
         {
-            "type": GiftCardEvents.EXPIRY_SETTINGS_UPDATED.upper(),
+            "type": GiftCardEvents.EXPIRY_DATE_UPDATED.upper(),
             "user": None,
             "app": {"name": app_api_client.app.name},
             "balance": None,
-            "expiry": {
-                "expiryType": expiry_type.upper(),
-                "oldExpiryType": old_type.upper(),
-                "expiryPeriod": None,
-                "oldExpiryPeriod": None,
-                "expiryDate": date_value.isoformat(),
-                "oldExpiryDate": None,
-            },
+            "expiryDate": date_value.isoformat(),
+            "oldExpiryDate": None,
+            "tags": None,
+            "oldTags": None,
+        },
+        {
+            "type": GiftCardEvents.TAGS_UPDATED.upper(),
+            "user": None,
+            "app": {"name": app_api_client.app.name},
+            "balance": None,
+            "expiryDate": None,
+            "oldExpiryDate": None,
+            "tags": [new_tag],
+            "oldTags": [old_tag.name],
         },
     ]
     for event in data["events"]:
         assert event in events
 
+    with pytest.raises(old_tag._meta.model.DoesNotExist):
+        old_tag.refresh_from_db()
 
-def test_update_gift_card_by_customer(api_client, customer_user, gift_card):
+    assert GiftCardTag.objects.count() == tags_count - 1
+
+
+def test_update_gift_card_by_customer(api_client, gift_card):
     # given
     initial_balance = 100.0
     tag = "new-gift-card-tag"
@@ -327,7 +343,7 @@ def test_update_gift_card_by_customer(api_client, customer_user, gift_card):
         "id": graphene.Node.to_global_id("GiftCard", gift_card.pk),
         "input": {
             "balanceAmount": initial_balance,
-            "tag": tag,
+            "addTags": [tag],
         },
     }
 
@@ -341,7 +357,9 @@ def test_update_gift_card_by_customer(api_client, customer_user, gift_card):
     assert_no_permission(response)
 
 
+@pytest.mark.parametrize("initial_balance", [100.0, 0.0])
 def test_update_gift_card_balance(
+    initial_balance,
     staff_api_client,
     gift_card,
     permission_manage_gift_card,
@@ -352,7 +370,6 @@ def test_update_gift_card_balance(
     old_initial_balance = float(gift_card.initial_balance.amount)
     old_current_balance = float(gift_card.current_balance.amount)
 
-    initial_balance = 100.0
     currency = gift_card.currency
     variables = {
         "id": graphene.Node.to_global_id("GiftCard", gift_card.pk),
@@ -378,10 +395,8 @@ def test_update_gift_card_balance(
     data = content["data"]["giftCardUpdate"]["giftCard"]
 
     assert not errors
-    assert data["expiryType"] == gift_card.expiry_type.upper()
     assert not data["expiryDate"]
-    assert not data["expiryPeriod"]
-    assert data["tag"] == gift_card.tag
+    assert data["tags"][0]["name"] == gift_card.tags.first().name
     assert data["isActive"]
     assert data["initialBalance"]["amount"] == initial_balance
     assert data["currentBalance"]["amount"] == initial_balance
@@ -411,12 +426,15 @@ def test_update_gift_card_balance(
                 "currency": currency,
             },
         },
-        "expiry": None,
+        "expiryDate": None,
+        "oldExpiryDate": None,
+        "tags": None,
+        "oldTags": None,
     }
     assert expected_event == data["events"][0]
 
 
-def test_update_gift_card_change_to_expiry_period(
+def test_update_gift_card_change_to_never_expire(
     staff_api_client,
     gift_card_expiry_date,
     permission_manage_gift_card,
@@ -425,23 +443,12 @@ def test_update_gift_card_change_to_expiry_period(
 ):
     # given
     gift_card = gift_card_expiry_date
-    old_type = gift_card.expiry_type
     old_expiry_date = gift_card.expiry_date
 
-    expiry_type = GiftCardExpiryTypeEnum.EXPIRY_PERIOD.name
-    expiry_period = 2
-    expiry_period_type = TimePeriodTypeEnum.YEAR.name
     variables = {
         "id": graphene.Node.to_global_id("GiftCard", gift_card.pk),
         "input": {
-            "expirySettings": {
-                "expiryType": expiry_type,
-                "expiryDate": None,
-                "expiryPeriod": {
-                    "type": expiry_period_type,
-                    "amount": expiry_period,
-                },
-            },
+            "expiryDate": None,
         },
     }
 
@@ -462,127 +469,45 @@ def test_update_gift_card_change_to_expiry_period(
     data = content["data"]["giftCardUpdate"]["giftCard"]
 
     assert not errors
-    assert data["code"]
-    assert data["displayCode"]
-    assert data["expiryType"] == expiry_type.upper()
+    assert data["last4CodeChars"]
     assert not data["expiryDate"]
-    assert data["expiryPeriod"]["amount"] == expiry_period
-    assert data["expiryPeriod"]["type"] == expiry_period_type
-    assert data["tag"] == gift_card.tag
+    assert data["tags"][0]["name"] == gift_card.tags.first().name
     assert data["createdBy"]["email"] == gift_card.created_by.email
     assert data["createdByEmail"] == gift_card.created_by_email
 
     assert len(data["events"]) == 1
     expected_event = {
-        "type": GiftCardEvents.EXPIRY_SETTINGS_UPDATED.upper(),
+        "type": GiftCardEvents.EXPIRY_DATE_UPDATED.upper(),
         "user": {
             "email": staff_api_client.user.email,
         },
         "app": None,
         "balance": None,
-        "expiry": {
-            "expiryType": expiry_type.upper(),
-            "oldExpiryType": old_type.upper(),
-            "expiryPeriod": {"amount": expiry_period, "type": expiry_period_type},
-            "oldExpiryPeriod": None,
-            "expiryDate": None,
-            "oldExpiryDate": old_expiry_date.isoformat(),
-        },
-    }
-    assert expected_event == data["events"][0]
-
-
-def test_update_gift_card_change_to_never_expire(
-    staff_api_client,
-    gift_card_expiry_period,
-    permission_manage_gift_card,
-    permission_manage_users,
-    permission_manage_apps,
-):
-    # given
-    gift_card = gift_card_expiry_period
-    old_type = gift_card.expiry_type
-    old_expiry_period_type = gift_card.expiry_period_type
-    old_expiry_period = gift_card.expiry_period
-
-    expiry_type = GiftCardExpiryTypeEnum.NEVER_EXPIRE.name
-    variables = {
-        "id": graphene.Node.to_global_id("GiftCard", gift_card.pk),
-        "input": {
-            "expirySettings": {
-                "expiryType": expiry_type,
-            },
-        },
-    }
-
-    # when
-    response = staff_api_client.post_graphql(
-        UPDATE_GIFT_CARD_MUTATION,
-        variables,
-        permissions=[
-            permission_manage_gift_card,
-            permission_manage_users,
-            permission_manage_apps,
-        ],
-    )
-
-    # then
-    content = get_graphql_content(response)
-    errors = content["data"]["giftCardUpdate"]["errors"]
-    data = content["data"]["giftCardUpdate"]["giftCard"]
-
-    assert not errors
-    assert data["code"]
-    assert data["displayCode"]
-    assert data["expiryType"] == expiry_type.upper()
-    assert not data["expiryDate"]
-    assert not data["expiryPeriod"]
-    assert data["tag"] == gift_card.tag
-    assert data["createdBy"]["email"] == gift_card.created_by.email
-    assert data["createdByEmail"] == gift_card.created_by_email
-
-    assert len(data["events"]) == 1
-    expected_event = {
-        "type": GiftCardEvents.EXPIRY_SETTINGS_UPDATED.upper(),
-        "user": {
-            "email": staff_api_client.user.email,
-        },
-        "app": None,
-        "balance": None,
-        "expiry": {
-            "expiryType": expiry_type.upper(),
-            "oldExpiryType": old_type.upper(),
-            "oldExpiryPeriod": {
-                "amount": old_expiry_period,
-                "type": old_expiry_period_type.upper(),
-            },
-            "expiryPeriod": None,
-            "expiryDate": None,
-            "oldExpiryDate": None,
-        },
+        "expiryDate": None,
+        "tags": None,
+        "oldTags": None,
+        "oldExpiryDate": old_expiry_date.isoformat(),
     }
     assert expected_event == data["events"][0]
 
 
 def test_update_used_gift_card_to_expiry_date(
     staff_api_client,
-    gift_card_expiry_period,
+    gift_card_used,
     permission_manage_gift_card,
     permission_manage_users,
     permission_manage_apps,
 ):
     # given
-    gift_card = gift_card_expiry_period
-    date_value = date.today() + timedelta(days=365)
+    gift_card = gift_card_used
+    date_value = datetime.datetime.now(tz=datetime.UTC).date() + datetime.timedelta(
+        days=365
+    )
 
-    expiry_type = GiftCardExpiryTypeEnum.EXPIRY_DATE.name
     variables = {
         "id": graphene.Node.to_global_id("GiftCard", gift_card.pk),
         "input": {
-            "expirySettings": {
-                "expiryType": expiry_type,
-                "expiryDate": date_value,
-            },
+            "expiryDate": date_value,
         },
     }
 
@@ -603,13 +528,15 @@ def test_update_used_gift_card_to_expiry_date(
     data = content["data"]["giftCardUpdate"]["giftCard"]
 
     assert not errors
-    assert data["code"]
-    assert data["displayCode"]
-    assert data["expiryType"] == expiry_type.upper()
+    assert data["last4CodeChars"]
     assert data["expiryDate"] == date_value.isoformat()
+    assert len(data["events"]) == 1
+    event = data["events"][0]
+    assert event["expiryDate"] == date_value.isoformat()
+    assert event["oldExpiryDate"] is None
 
 
-def test_update_used_gift_card_to_expiry_period(
+def test_update_used_gift_card_to_never_expired(
     staff_api_client,
     gift_card_used,
     permission_manage_gift_card,
@@ -619,17 +546,10 @@ def test_update_used_gift_card_to_expiry_period(
     # given
     gift_card = gift_card_used
 
-    expiry_type = GiftCardExpiryTypeEnum.EXPIRY_PERIOD.name
     variables = {
         "id": graphene.Node.to_global_id("GiftCard", gift_card.pk),
         "input": {
-            "expirySettings": {
-                "expiryType": expiry_type,
-                "expiryPeriod": {
-                    "type": TimePeriodTypeEnum.DAY.name,
-                    "amount": 100,
-                },
-            },
+            "expiryDate": None,
         },
     }
 
@@ -649,58 +569,9 @@ def test_update_used_gift_card_to_expiry_period(
     errors = content["data"]["giftCardUpdate"]["errors"]
     data = content["data"]["giftCardUpdate"]["giftCard"]
 
-    assert not data
-    assert len(errors) == 1
-    assert errors[0]["field"] == "expiryType"
-    assert errors[0]["code"] == GiftCardErrorCode.INVALID.name
-
-
-def test_update_gift_card_negative_period_amount(
-    staff_api_client,
-    gift_card_expiry_date,
-    permission_manage_gift_card,
-    permission_manage_users,
-    permission_manage_apps,
-):
-    # given
-    gift_card = gift_card_expiry_date
-
-    expiry_type = GiftCardExpiryTypeEnum.EXPIRY_PERIOD.name
-    expiry_period = -10
-    expiry_period_type = TimePeriodTypeEnum.YEAR.name
-    variables = {
-        "id": graphene.Node.to_global_id("GiftCard", gift_card.pk),
-        "input": {
-            "expirySettings": {
-                "expiryType": expiry_type,
-                "expiryPeriod": {
-                    "type": expiry_period_type,
-                    "amount": expiry_period,
-                },
-            },
-        },
-    }
-
-    # when
-    response = staff_api_client.post_graphql(
-        UPDATE_GIFT_CARD_MUTATION,
-        variables,
-        permissions=[
-            permission_manage_gift_card,
-            permission_manage_users,
-            permission_manage_apps,
-        ],
-    )
-
-    # then
-    content = get_graphql_content(response)
-    errors = content["data"]["giftCardUpdate"]["errors"]
-    data = content["data"]["giftCardUpdate"]["giftCard"]
-
-    assert not data
-    assert len(errors) == 1
-    assert errors[0]["field"] == "expiryPeriod"
-    assert errors[0]["code"] == GiftCardErrorCode.INVALID.name
+    assert not errors
+    assert data["last4CodeChars"]
+    assert data["expiryDate"] is None
 
 
 def test_update_gift_card_date_in_past(
@@ -711,15 +582,13 @@ def test_update_gift_card_date_in_past(
     permission_manage_apps,
 ):
     # given
-    expiry_type = GiftCardExpiryTypeEnum.EXPIRY_DATE.name
-    date_value = date.today() - timedelta(days=365)
+    date_value = datetime.datetime.now(tz=datetime.UTC).date() - datetime.timedelta(
+        days=365
+    )
     variables = {
         "id": graphene.Node.to_global_id("GiftCard", gift_card.pk),
         "input": {
-            "expirySettings": {
-                "expiryType": expiry_type,
-                "expiryDate": date_value,
-            },
+            "expiryDate": date_value,
         },
     }
 
@@ -743,3 +612,322 @@ def test_update_gift_card_date_in_past(
     assert len(errors) == 1
     assert errors[0]["field"] == "expiryDate"
     assert errors[0]["code"] == GiftCardErrorCode.INVALID.name
+
+
+def test_update_gift_card_expired_card(
+    staff_api_client,
+    gift_card,
+    permission_manage_gift_card,
+    permission_manage_users,
+    permission_manage_apps,
+):
+    # given
+    gift_card.expiry_date = datetime.datetime.now(
+        tz=datetime.UTC
+    ).date() - datetime.timedelta(days=1)
+    gift_card.save(update_fields=["expiry_date"])
+
+    variables = {
+        "id": graphene.Node.to_global_id("GiftCard", gift_card.pk),
+        "input": {
+            "expiryDate": None,
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        UPDATE_GIFT_CARD_MUTATION,
+        variables,
+        permissions=[
+            permission_manage_gift_card,
+            permission_manage_users,
+            permission_manage_apps,
+        ],
+    )
+
+    # then
+    content = get_graphql_content(response)
+    errors = content["data"]["giftCardUpdate"]["errors"]
+    data = content["data"]["giftCardUpdate"]["giftCard"]
+
+    assert not errors
+    assert data["last4CodeChars"]
+    assert not data["expiryDate"]
+    assert len(data["tags"]) == 1
+    assert data["tags"][0]["name"] == gift_card.tags.first().name
+    assert data["createdBy"]["email"] == gift_card.created_by.email
+    assert data["createdByEmail"] == gift_card.created_by_email
+
+    assert len(data["events"]) == 1
+    assert data["events"][0]["type"] == GiftCardEvents.EXPIRY_DATE_UPDATED.upper()
+
+
+def test_update_gift_card_expiry_date_not_changed(
+    staff_api_client,
+    gift_card_expiry_date,
+    permission_manage_gift_card,
+    permission_manage_users,
+    permission_manage_apps,
+):
+    # given
+    gift_card = gift_card_expiry_date
+    old_expiry_date = gift_card.expiry_date
+
+    variables = {
+        "id": graphene.Node.to_global_id("GiftCard", gift_card.pk),
+        "input": {
+            "expiryDate": old_expiry_date,
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        UPDATE_GIFT_CARD_MUTATION,
+        variables,
+        permissions=[
+            permission_manage_gift_card,
+            permission_manage_users,
+            permission_manage_apps,
+        ],
+    )
+
+    # then
+    content = get_graphql_content(response)
+    errors = content["data"]["giftCardUpdate"]["errors"]
+    data = content["data"]["giftCardUpdate"]["giftCard"]
+
+    assert not errors
+    assert data["last4CodeChars"]
+    assert data["expiryDate"] == old_expiry_date.isoformat()
+    assert data["tags"][0]["name"] == gift_card.tags.first().name
+    assert data["createdBy"]["email"] == gift_card.created_by.email
+    assert data["createdByEmail"] == gift_card.created_by_email
+
+    # no events should be created
+    assert len(data["events"]) == 0
+
+
+def test_update_gift_card_duplicated_tags_item(
+    staff_api_client,
+    gift_card,
+    permission_manage_gift_card,
+    permission_manage_users,
+    permission_manage_apps,
+    gift_card_tag_list,
+):
+    # given
+    tag = gift_card_tag_list[0]
+    variables = {
+        "id": graphene.Node.to_global_id("GiftCard", gift_card.pk),
+        "input": {"addTags": tag.name, "removeTags": tag.name},
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        UPDATE_GIFT_CARD_MUTATION,
+        variables,
+        permissions=[
+            permission_manage_gift_card,
+            permission_manage_users,
+            permission_manage_apps,
+        ],
+    )
+
+    # then
+    content = get_graphql_content(response)
+    errors = content["data"]["giftCardUpdate"]["errors"]
+    data = content["data"]["giftCardUpdate"]["giftCard"]
+
+    assert not data
+    assert len(errors) == 1
+    assert errors[0]["field"] == "tags"
+    assert errors[0]["code"] == GiftCardErrorCode.DUPLICATED_INPUT_ITEM.name
+
+
+@freeze_time("2022-05-12 12:00:00")
+@mock.patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
+@mock.patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
+def test_update_gift_card_trigger_webhook(
+    mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
+    staff_api_client,
+    gift_card,
+    permission_manage_gift_card,
+    permission_manage_users,
+    permission_manage_apps,
+    settings,
+):
+    # given
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
+    settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
+
+    initial_balance = 100.0
+    date_value = datetime.datetime.now(tz=datetime.UTC).date() + datetime.timedelta(
+        days=365
+    )
+    new_tag = "new-gift-card-tag"
+    variables = {
+        "id": graphene.Node.to_global_id("GiftCard", gift_card.pk),
+        "input": {
+            "balanceAmount": initial_balance,
+            "addTags": [new_tag],
+            "expiryDate": date_value,
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        UPDATE_GIFT_CARD_MUTATION,
+        variables,
+        permissions=[
+            permission_manage_gift_card,
+            permission_manage_users,
+            permission_manage_apps,
+        ],
+    )
+
+    # then
+    content = get_graphql_content(response)
+    errors = content["data"]["giftCardUpdate"]["errors"]
+    data = content["data"]["giftCardUpdate"]["giftCard"]
+
+    assert not errors
+    assert data
+
+    mocked_webhook_trigger.assert_called_once_with(
+        json.dumps(
+            {
+                "id": graphene.Node.to_global_id("GiftCard", gift_card.id),
+                "is_active": gift_card.is_active,
+                "meta": generate_meta(
+                    requestor_data=generate_requestor(
+                        SimpleLazyObject(lambda: staff_api_client.user)
+                    )
+                ),
+            },
+            cls=CustomJsonEncoder,
+        ),
+        WebhookEventAsyncType.GIFT_CARD_UPDATED,
+        [any_webhook],
+        gift_card,
+        SimpleLazyObject(lambda: staff_api_client.user),
+        allow_replica=False,
+    )
+
+
+UPDATE_GIFT_CARD_MUTATION_METADATA = """
+    mutation giftCardUpdate(
+        $id: ID!, $input: GiftCardUpdateInput!
+    ){
+        giftCardUpdate(id: $id, input: $input) {
+            giftCard {
+                id
+                metadata { key value }
+                privateMetadata { key value }
+            }
+            errors {
+                field
+                message
+                code
+            }
+        }
+    }
+"""
+
+
+def test_update_gift_card_metadata_empty(
+    staff_api_client,
+    gift_card,
+    permission_manage_gift_card,
+):
+    # given
+    metadata_key = "metadata_key"
+    metadata_value = "metadata_value"
+
+    gift_card.clear_private_metadata()
+    gift_card.clear_metadata()
+
+    gift_card.save()
+
+    variables = {
+        "id": graphene.Node.to_global_id("GiftCard", gift_card.pk),
+        "input": {
+            "metadata": [{"key": metadata_key, "value": metadata_value}],
+            "privateMetadata": [{"key": metadata_key, "value": metadata_value}],
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        UPDATE_GIFT_CARD_MUTATION_METADATA,
+        variables,
+        permissions=[
+            permission_manage_gift_card,
+        ],
+    )
+
+    # then
+    content = get_graphql_content(response)
+    errors = content["data"]["giftCardUpdate"]["errors"]
+    data = content["data"]["giftCardUpdate"]["giftCard"]
+
+    assert not errors
+
+    assert data["metadata"][0]["key"] == metadata_key
+    assert data["metadata"][0]["value"] == metadata_value
+    assert data["privateMetadata"][0]["key"] == metadata_key
+    assert data["privateMetadata"][0]["value"] == metadata_value
+
+
+def test_update_gift_card_metadata_existed(
+    staff_api_client,
+    gift_card,
+    permission_manage_gift_card,
+):
+    # given
+    metadata_key = "metadata_key"
+    metadata_value = "metadata_value"
+
+    gift_card.store_value_in_private_metadata(
+        {"existed": "existed", metadata_key: "old"}
+    )
+    gift_card.store_value_in_metadata({"existed": "existed", metadata_key: "old"})
+
+    gift_card.save()
+
+    variables = {
+        "id": graphene.Node.to_global_id("GiftCard", gift_card.pk),
+        "input": {
+            "metadata": [{"key": metadata_key, "value": metadata_value}],
+            "privateMetadata": [{"key": metadata_key, "value": metadata_value}],
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        UPDATE_GIFT_CARD_MUTATION_METADATA,
+        variables,
+        permissions=[
+            permission_manage_gift_card,
+        ],
+    )
+
+    # then
+    content = get_graphql_content(response)
+    errors = content["data"]["giftCardUpdate"]["errors"]
+    data = content["data"]["giftCardUpdate"]["giftCard"]
+
+    assert not errors
+
+    # Old keys preserved
+    assert data["metadata"][0]["key"] == "existed"
+    assert data["metadata"][0]["value"] == "existed"
+    assert data["privateMetadata"][0]["key"] == "existed"
+    assert data["privateMetadata"][0]["value"] == "existed"
+
+    # New keys written
+    assert data["metadata"][1]["key"] == metadata_key
+    assert data["metadata"][1]["value"] == metadata_value
+    assert data["privateMetadata"][1]["key"] == metadata_key
+    assert data["privateMetadata"][1]["value"] == metadata_value

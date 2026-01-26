@@ -1,5 +1,3 @@
-from typing import List, Optional
-
 import graphene
 
 from ..core.enums import OrderDirection
@@ -13,15 +11,13 @@ def sort_active_key(plugin: Plugin, sort_reverse: bool):
         name = plugin.name
     else:
         active = False
-        if any(
-            [configuration.active for configuration in plugin.channel_configurations]
-        ):
+        if any(configuration.active for configuration in plugin.channel_configurations):
             active = True
         name = plugin.name
     return not active if sort_reverse else active, name
 
 
-def sort_plugins(plugins: List["Plugin"], sort_by: Optional[dict]) -> List["Plugin"]:
+def sort_plugins(plugins: list["Plugin"], sort_by: dict | None) -> list["Plugin"]:
     sort_reverse = False
     direction = sort_by.get("direction", OrderDirection.ASC) if sort_by else None
     if direction == OrderDirection.DESC:
@@ -49,12 +45,12 @@ class PluginSortField(graphene.Enum):
     def description(self):
         # pylint: disable=no-member
         descriptions = {
-            PluginSortField.NAME.name: "name",
+            PluginSortField.NAME.name: "name",  # type: ignore[attr-defined]
             PluginSortField.ACTIVE.name: "activity status",
         }
         if self.name in descriptions:
             return f"Sort plugins by {descriptions[self.name]}."
-        raise ValueError("Unsupported enum value: %s" % self.value)
+        raise ValueError(f"Unsupported enum value: {self.value}")
 
 
 class PluginSortingInput(SortInputObjectType):

@@ -5,9 +5,11 @@ from ..utils.variants import get_variant_selection_attributes
 def test_get_variant_selection_attributes(
     product_type_attribute_list,
     numeric_attribute,
+    swatch_attribute,
     file_attribute_with_file_input_type_without_values,
     product_type_page_reference_attribute,
     product_type_product_reference_attribute,
+    page_type_variant_reference_attribute,
 ):
     # given
     multiselect_attr = product_type_attribute_list[0]
@@ -16,13 +18,22 @@ def test_get_variant_selection_attributes(
 
     attrs = product_type_attribute_list + [
         numeric_attribute,
+        swatch_attribute,
         file_attribute_with_file_input_type_without_values,
         product_type_page_reference_attribute,
         product_type_product_reference_attribute,
+        page_type_variant_reference_attribute,
     ]
 
+    # for now, instead of skipping test
+    attrs = zip(
+        attrs, (False, True, True, False, True, False, False, False), strict=False
+    )
+
     # when
-    result = get_variant_selection_attributes(attrs)
+    result = [attr for attr, *_ in get_variant_selection_attributes(attrs)]
 
     # then
-    assert result == product_type_attribute_list[1:]
+    assert result == product_type_attribute_list[1:] + [
+        swatch_attribute,
+    ]

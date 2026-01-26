@@ -1,46 +1,98 @@
 from dataclasses import asdict
+from decimal import Decimal
 
 import graphene
-from django_countries.fields import Country
+from promise import Promise
 
-from ....core.permissions import ProductPermissions
-from ....core.tracing import traced_resolver
-from ....core.utils import get_currency_for_country
+from ....core.utils.country import get_active_country
 from ....graphql.core.types import Money, MoneyRange
+from ....permission.enums import ProductPermissions
 from ....product import models
 from ....product.utils.availability import get_product_availability
 from ....product.utils.costs import (
     get_margin_for_variant_channel_listing,
     get_product_costs_data,
 )
-from ...account import types as account_types
-from ...channel.dataloaders import ChannelByIdLoader
-from ...core.connection import CountableDjangoObjectType
-from ...decorators import permission_required
-from ...discount.dataloaders import DiscountsByDateTimeLoader
-from ...warehouse.dataloaders import WarehouseCountryCodeByChannelLoader
-from ..dataloaders import (
-    CollectionsByProductIdLoader,
-    ProductByIdLoader,
-    ProductVariantsByProductIdLoader,
-    VariantChannelListingByVariantIdAndChannelSlugLoader,
-    VariantsChannelListingByProductIdAndChannelSlugLoader,
+from ....tax.utils import (
+    get_display_gross_prices,
+    get_tax_calculation_strategy,
+    get_tax_rate_for_country,
 )
+from ...account import types as account_types
+from ...channel.dataloaders.by_self import ChannelByIdLoader
+from ...channel.types import Channel
+from ...core.descriptions import ADDED_IN_321
+from ...core.doc_category import DOC_CATEGORY_PRODUCTS
+from ...core.fields import PermissionsField
+from ...core.scalars import Date, DateTime
+from ...core.tracing import traced_resolver
+from ...core.types import BaseObjectType, ModelObjectType
+from ...tax.dataloaders import (
+    TaxClassCountryRateByTaxClassIDLoader,
+    TaxClassDefaultRateByCountryLoader,
+    TaxClassIdByProductIdLoader,
+    TaxConfigurationByChannelId,
+    TaxConfigurationPerCountryByTaxConfigurationIDLoader,
+)
+from ..dataloaders.products import VariantChannelListingsByProductIdLoader
 
 
-class Margin(graphene.ObjectType):
-    start = graphene.Int()
-    stop = graphene.Int()
+class Margin(BaseObjectType):
+    start = graphene.Int(description="The starting value of the margin.")
+    stop = graphene.Int(description="The ending value of the margin.")
+
+    class Meta:
+        doc_category = DOC_CATEGORY_PRODUCTS
+        description = "Metadata for the Margin class."
 
 
-class ProductChannelListing(CountableDjangoObjectType):
+class ProductChannelListing(ModelObjectType[models.ProductChannelListing]):
+    id = graphene.GlobalID(
+        required=True, description="The ID of the product channel listing."
+    )
+    publication_date = Date(
+        deprecation_reason="Use the `publishedAt` field to fetch the publication date.",
+    )
+    published_at = DateTime(description="The product publication date time.")
+    is_published = graphene.Boolean(
+        required=True,
+        description="Indicates if the product is published in the channel.",
+    )
+    channel = graphene.Field(
+        Channel,
+        required=True,
+        description="The channel in which the product is listed.",
+    )
+    visible_in_listings = graphene.Boolean(
+        required=True,
+        description="Indicates product visibility in the channel listings.",
+    )
+    available_for_purchase = Date(
+        deprecation_reason="Use the `availableForPurchaseAt` field to fetch the available for purchase date.",
+    )
+    available_for_purchase_at = DateTime(
+        description="The product available for purchase date time."
+    )
     discounted_price = graphene.Field(
         Money, description="The price of the cheapest variant (including discounts)."
     )
-    purchase_cost = graphene.Field(MoneyRange, description="Purchase cost of product.")
-    margin = graphene.Field(Margin, description="Range of margin percentage value.")
+    purchase_cost = PermissionsField(
+        MoneyRange,
+        description="Purchase cost of product.",
+        permissions=[ProductPermissions.MANAGE_PRODUCTS],
+    )
+    margin = PermissionsField(
+        Margin,
+        description="Range of margin percentage value.",
+        permissions=[ProductPermissions.MANAGE_PRODUCTS],
+    )
     is_available_for_purchase = graphene.Boolean(
-        description="Whether the product is available for purchase."
+        description=(
+            "Refers to a state that can be set by admins to control whether a product "
+            "is available for purchase in storefronts in this channel. This does not "
+            "guarantee the availability of stock. When set to `False`, this product is "
+            "still visible to customers, but it cannot be purchased."
+        )
     )
     pricing = graphene.Field(
         "saleor.graphql.product.types.products.ProductPricingInfo",
@@ -63,93 +115,73 @@ class ProductChannelListing(CountableDjangoObjectType):
         description = "Represents product channel listing."
         model = models.ProductChannelListing
         interfaces = [graphene.relay.Node]
-        only_fields = [
-            "id",
-            "channel",
-            "is_published",
-            "publication_date",
-            "visible_in_listings",
-            "available_for_purchase",
-        ]
 
     @staticmethod
-    def resolve_channel(root: models.ProductChannelListing, info, **_kwargs):
+    def resolve_publication_date(root: models.ProductChannelListing, _info):
+        return root.published_at
+
+    @staticmethod
+    def resolve_available_for_purchase(root: models.ProductChannelListing, _info):
+        return root.available_for_purchase_at
+
+    @staticmethod
+    def resolve_channel(root: models.ProductChannelListing, info):
         return ChannelByIdLoader(info.context).load(root.channel_id)
 
     @staticmethod
     @traced_resolver
-    @permission_required(ProductPermissions.MANAGE_PRODUCTS)
-    def resolve_purchase_cost(root: models.ProductChannelListing, info, *_kwargs):
-        channel = ChannelByIdLoader(info.context).load(root.channel_id)
+    def resolve_purchase_cost(root: models.ProductChannelListing, info):
+        def calculate_margin_with_channel_listings(
+            variant_channel_listings: list[models.ProductVariantChannelListing | None],
+        ):
+            existing_listings: list[models.ProductVariantChannelListing] = []
+            for listing in variant_channel_listings:
+                if not listing:
+                    continue
+                if listing.channel_id == root.channel_id:
+                    existing_listings.append(listing)
 
-        def calculate_margin_with_variants(variants):
-            def calculate_margin_with_channel(channel):
-                def calculate_margin_with_channel_listings(variant_channel_listings):
-                    variant_channel_listings = list(
-                        filter(None, variant_channel_listings)
-                    )
-                    if not variant_channel_listings:
-                        return None
+            if not existing_listings:
+                return None
 
-                    has_variants = True if len(variant_ids_channel_slug) > 0 else False
-                    purchase_cost, _margin = get_product_costs_data(
-                        variant_channel_listings, has_variants, root.currency
-                    )
-                    return purchase_cost
-
-                variant_ids_channel_slug = [
-                    (variant.id, channel.slug) for variant in variants
-                ]
-                return (
-                    VariantChannelListingByVariantIdAndChannelSlugLoader(info.context)
-                    .load_many(variant_ids_channel_slug)
-                    .then(calculate_margin_with_channel_listings)
-                )
-
-            return channel.then(calculate_margin_with_channel)
+            has_variants = True
+            purchase_cost, _margin = get_product_costs_data(
+                existing_listings, has_variants, root.currency
+            )
+            return purchase_cost
 
         return (
-            ProductVariantsByProductIdLoader(info.context)
+            VariantChannelListingsByProductIdLoader(info.context)
             .load(root.product_id)
-            .then(calculate_margin_with_variants)
+            .then(calculate_margin_with_channel_listings)
         )
 
     @staticmethod
     @traced_resolver
-    @permission_required(ProductPermissions.MANAGE_PRODUCTS)
-    def resolve_margin(root: models.ProductChannelListing, info, *_kwargs):
-        channel = ChannelByIdLoader(info.context).load(root.channel_id)
+    def resolve_margin(root: models.ProductChannelListing, info):
+        def calculate_margin_with_channel_listings(
+            variant_channel_listings: list[models.ProductVariantChannelListing | None],
+        ):
+            existing_listings: list[models.ProductVariantChannelListing] = []
+            for listing in variant_channel_listings:
+                if not listing:
+                    continue
+                if listing.channel_id == root.channel_id:
+                    existing_listings.append(listing)
 
-        def calculate_margin_with_variants(variants):
-            def calculate_margin_with_channel(channel):
-                def calculate_margin_with_channel_listings(variant_channel_listings):
-                    variant_channel_listings = list(
-                        filter(None, variant_channel_listings)
-                    )
-                    if not variant_channel_listings:
-                        return None
+            if not existing_listings:
+                return None
 
-                    has_variants = True if len(variant_ids_channel_slug) > 0 else False
-                    _purchase_cost, margin = get_product_costs_data(
-                        variant_channel_listings, has_variants, root.currency
-                    )
-                    return Margin(margin[0], margin[1])
-
-                variant_ids_channel_slug = [
-                    (variant.id, channel.slug) for variant in variants
-                ]
-                return (
-                    VariantChannelListingByVariantIdAndChannelSlugLoader(info.context)
-                    .load_many(variant_ids_channel_slug)
-                    .then(calculate_margin_with_channel_listings)
-                )
-
-            return channel.then(calculate_margin_with_channel)
+            has_variants = True
+            _purchase_cost, margin = get_product_costs_data(
+                existing_listings, has_variants, root.currency
+            )
+            return Margin(margin[0], margin[1])
 
         return (
-            ProductVariantsByProductIdLoader(info.context)
+            VariantChannelListingsByProductIdLoader(info.context)
             .load(root.product_id)
-            .then(calculate_margin_with_variants)
+            .then(calculate_margin_with_channel_listings)
         )
 
     @staticmethod
@@ -157,122 +189,205 @@ class ProductChannelListing(CountableDjangoObjectType):
         return root.is_available_for_purchase()
 
     @staticmethod
-    @traced_resolver
-    def resolve_pricing(root: models.ProductChannelListing, info, address=None):
+    def resolve_pricing(root: models.ProductChannelListing, info, *, address=None):
         context = info.context
 
-        country_code = address.country if address is not None else None
+        channel = ChannelByIdLoader(context).load(root.channel_id)
+        tax_class_id_loader = TaxClassIdByProductIdLoader(context).load(root.product_id)
 
-        def calculate_pricing_info(discounts):
-            def calculate_pricing_with_channel(channel):
-                def calculate_pricing_with_product(product):
-                    def calculate_pricing_with_variants(variants):
-                        def calculate_pricing_with_variants_channel_listings(
-                            variants_channel_listing,
-                        ):
-                            def calculate_pricing_with_collections(collections):
-                                def calculate_pricing_with_country_code(country_code):
-                                    if not variants_channel_listing:
-                                        return None
+        def load_tax_configuration(data):
+            channel, tax_class_id = data
+            country_code = get_active_country(channel, address_data=address)
 
-                                    vc_listing = variants_channel_listing
-                                    local_currency = None
-                                    if country_code:
-                                        local_currency = get_currency_for_country(
-                                            country_code
-                                        )
+            def load_tax_country_exceptions(tax_config):
+                def load_variant_channel_listings(data):
+                    tax_configs_per_country = data
 
-                                    availability = get_product_availability(
-                                        product=product,
-                                        product_channel_listing=root,
-                                        variants=variants,
-                                        variants_channel_listing=vc_listing,
-                                        collections=collections,
-                                        discounts=discounts,
-                                        channel=channel,
-                                        manager=context.plugins,
-                                        country=Country(country_code),
-                                        local_currency=local_currency,
-                                    )
-                                    from .products import ProductPricingInfo
+                    def load_default_tax_rate(
+                        variants_channel_listings: list[
+                            models.ProductVariantChannelListing
+                        ],
+                    ):
+                        variants_channel_listing = []
+                        for listing in variants_channel_listings:
+                            if listing and listing.channel_id == channel.id:
+                                variants_channel_listing.append(listing)
 
-                                    return ProductPricingInfo(**asdict(availability))
+                        if not variants_channel_listing:
+                            return None
 
-                                if not country_code:
-                                    return (
-                                        WarehouseCountryCodeByChannelLoader(context)
-                                        .load(channel.slug)
-                                        .then(calculate_pricing_with_country_code)
-                                    )
+                        def calculate_pricing_info(data):
+                            country_rates, default_country_rate_obj = data
 
-                                return calculate_pricing_with_country_code(country_code)
-
-                            return (
-                                CollectionsByProductIdLoader(context)
-                                .load(root.product_id)
-                                .then(calculate_pricing_with_collections)
+                            tax_config_country = next(
+                                (
+                                    tc
+                                    for tc in tax_configs_per_country
+                                    if tc.country.code == country_code
+                                ),
+                                None,
                             )
-
-                        return (
-                            VariantsChannelListingByProductIdAndChannelSlugLoader(
-                                context
+                            display_gross_prices = get_display_gross_prices(
+                                tax_config,
+                                tax_config_country,
                             )
-                            .load((root.product_id, channel.slug))
-                            .then(calculate_pricing_with_variants_channel_listings)
+                            tax_calculation_strategy = get_tax_calculation_strategy(
+                                tax_config, tax_config_country
+                            )
+                            default_tax_rate = (
+                                default_country_rate_obj.rate
+                                if default_country_rate_obj
+                                else Decimal(0)
+                            )
+                            tax_rate = get_tax_rate_for_country(
+                                country_rates, default_tax_rate, country_code
+                            )
+                            prices_entered_with_tax = tax_config.prices_entered_with_tax
+
+                            availability = get_product_availability(
+                                product_channel_listing=root,
+                                variants_channel_listing=variants_channel_listing,
+                                prices_entered_with_tax=prices_entered_with_tax,
+                                tax_calculation_strategy=tax_calculation_strategy,
+                                tax_rate=tax_rate,
+                            )
+                            from .products import ProductPricingInfo
+
+                            pricing_info = asdict(availability)
+                            pricing_info["display_gross_prices"] = display_gross_prices
+                            return ProductPricingInfo(**pricing_info)
+
+                        country_rates = (
+                            TaxClassCountryRateByTaxClassIDLoader(context).load(
+                                tax_class_id
+                            )
+                            if tax_class_id
+                            else Promise.resolve([])
+                        )
+                        default_country_rate = TaxClassDefaultRateByCountryLoader(
+                            context
+                        ).load(country_code)
+                        return Promise.all([country_rates, default_country_rate]).then(
+                            calculate_pricing_info
                         )
 
                     return (
-                        ProductVariantsByProductIdLoader(context)
+                        VariantChannelListingsByProductIdLoader(context)
                         .load(root.product_id)
-                        .then(calculate_pricing_with_variants)
+                        .then(load_default_tax_rate)
                     )
 
                 return (
-                    ProductByIdLoader(context)
-                    .load(root.product_id)
-                    .then(calculate_pricing_with_product)
-                )
+                    TaxConfigurationPerCountryByTaxConfigurationIDLoader(context).load(
+                        tax_config.id
+                    )
+                ).then(load_variant_channel_listings)
 
             return (
-                ChannelByIdLoader(context)
-                .load(root.channel_id)
-                .then(calculate_pricing_with_channel)
+                TaxConfigurationByChannelId(context)
+                .load(channel.id)
+                .then(load_tax_country_exceptions)
             )
 
-        return (
-            DiscountsByDateTimeLoader(context)
-            .load(info.context.request_time)
-            .then(calculate_pricing_info)
-        )
+        return Promise.all([channel, tax_class_id_loader]).then(load_tax_configuration)
 
 
-class ProductVariantChannelListing(CountableDjangoObjectType):
-    cost_price = graphene.Field(Money, description="Cost price of the variant.")
-    margin = graphene.Int(description="Gross margin percentage value.")
+class PreorderThreshold(BaseObjectType):
+    quantity = graphene.Int(
+        required=False,
+        description="Preorder threshold for product variant in this channel.",
+    )
+    sold_units = graphene.Int(
+        required=True,
+        description="Number of sold product variant in this channel.",
+    )
 
     class Meta:
-        description = "Represents product varaint channel listing."
+        doc_category = DOC_CATEGORY_PRODUCTS
+        description = "Represents preorder variant data for channel."
+
+
+class ProductVariantChannelListing(
+    ModelObjectType[models.ProductVariantChannelListing]
+):
+    id = graphene.GlobalID(
+        required=True, description="The ID of the variant channel listing."
+    )
+    channel = graphene.Field(
+        Channel,
+        required=True,
+        description="The channel to which the variant listing belongs.",
+    )
+    price = graphene.Field(Money, description="The price of the variant.")
+    cost_price = graphene.Field(Money, description="Cost price of the variant.")
+    prior_price = graphene.Field(
+        Money,
+        description="Previous price of the variant in channel. Useful for providing "
+        "promotion information required by customer protection laws such as EU Omnibus "
+        "directive.\n\n Warning: This field is not updated automatically. Use Channel Listings mutation to update it manually."
+        + ADDED_IN_321,
+    )
+    margin = PermissionsField(
+        graphene.Int,
+        description="Gross margin percentage value.",
+        permissions=[ProductPermissions.MANAGE_PRODUCTS],
+    )
+    preorder_threshold = graphene.Field(
+        PreorderThreshold,
+        required=False,
+        description="Preorder variant data.",
+    )
+
+    class Meta:
+        description = "Represents product variant channel listing."
         model = models.ProductVariantChannelListing
         interfaces = [graphene.relay.Node]
-        only_fields = ["id", "channel", "price", "cost_price"]
 
     @staticmethod
-    def resolve_channel(root: models.ProductVariantChannelListing, info, **_kwargs):
+    def resolve_channel(root: models.ProductVariantChannelListing, info):
         return ChannelByIdLoader(info.context).load(root.channel_id)
 
     @staticmethod
-    @permission_required(ProductPermissions.MANAGE_PRODUCTS)
-    def resolve_margin(root: models.ProductVariantChannelListing, *_args):
+    def resolve_margin(root: models.ProductVariantChannelListing, _info):
         return get_margin_for_variant_channel_listing(root)
 
+    @staticmethod
+    def resolve_preorder_threshold(root: models.ProductVariantChannelListing, _info):
+        # The preorder_quantity_allocated field is added through annotation
+        # when using the `resolve_channel_listings` resolver.
+        return PreorderThreshold(
+            quantity=root.preorder_quantity_threshold,
+            sold_units=getattr(root, "preorder_quantity_allocated", 0),
+        )
 
-class CollectionChannelListing(CountableDjangoObjectType):
+
+class CollectionChannelListing(ModelObjectType[models.CollectionChannelListing]):
+    id = graphene.GlobalID(
+        required=True, description="The ID of the collection channel listing."
+    )
+    publication_date = Date(
+        deprecation_reason="Use the `publishedAt` field to fetch the publication date."
+    )
+    published_at = DateTime(description="The collection publication date.")
+    is_published = graphene.Boolean(
+        required=True,
+        description="Indicates if the collection is published in the channel.",
+    )
+    channel = graphene.Field(
+        Channel,
+        required=True,
+        description="The channel to which the collection belongs.",
+    )
+
     class Meta:
         description = "Represents collection channel listing."
         model = models.CollectionChannelListing
         interfaces = [graphene.relay.Node]
-        only_fields = ["id", "channel", "is_published", "publication_date"]
 
     @staticmethod
-    def resolve_channel(root: models.ProductChannelListing, info, **_kwargs):
+    def resolve_publication_date(root: models.ProductChannelListing, _info):
+        return root.published_at
+
+    @staticmethod
+    def resolve_channel(root: models.ProductChannelListing, info):
         return ChannelByIdLoader(info.context).load(root.channel_id)

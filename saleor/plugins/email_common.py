@@ -2,25 +2,33 @@ import logging
 import operator
 import os
 import re
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
 from email.headerregistry import Address
-from typing import List, Optional
+from typing import TYPE_CHECKING, Any
 
 import dateutil.parser
-import html2text
 import i18naddress
 import pybars
+from babel.core import Locale
 from babel.numbers import format_currency
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.mail import send_mail
 from django.core.mail.backends.smtp import EmailBackend
-from django_prices.utils.locale import get_locale_data
+from django.core.validators import EmailValidator
+from lxml import etree
+from lxml import html as lxml_html
 
-from ..product.product_images import get_thumbnail_size
+from ..thumbnail.utils import get_thumbnail_size
 from .base_plugin import ConfigurationTypeField
 from .error_codes import PluginErrorCode
-from .models import PluginConfiguration
+
+if TYPE_CHECKING:
+    from ..plugins.base_plugin import BasePlugin
+    from ..plugins.models import PluginConfiguration
+
 
 logger = logging.getLogger(__name__)
 
@@ -37,12 +45,12 @@ DEFAULT_EMAIL_TIMEOUT = 5
 
 @dataclass
 class EmailConfig:
-    host: Optional[str] = None
-    port: Optional[str] = None
-    username: Optional[str] = None
-    password: Optional[str] = None
-    sender_name: Optional[str] = None
-    sender_address: Optional[str] = None
+    host: str | None = None
+    port: str | None = None
+    username: str | None = None
+    password: str | None = None
+    sender_name: str | None = None
+    sender_address: str | None = None
     use_tls: bool = False
     use_ssl: bool = False
 
@@ -62,22 +70,22 @@ DEFAULT_EMAIL_CONFIGURATION = [
 DEFAULT_EMAIL_CONFIG_STRUCTURE = {
     "host": {
         "type": ConfigurationTypeField.STRING,
-        "help_text": ("The host to use for sending email."),
+        "help_text": "The host to use for sending email.",
         "label": "SMTP host",
     },
     "port": {
         "type": ConfigurationTypeField.STRING,
-        "help_text": ("Port to use for the SMTP server."),
+        "help_text": "Port to use for the SMTP server.",
         "label": "SMTP port",
     },
     "username": {
         "type": ConfigurationTypeField.STRING,
-        "help_text": ("Username to use for the SMTP server."),
+        "help_text": "Username to use for the SMTP server.",
         "label": "SMTP user",
     },
     "password": {
         "type": ConfigurationTypeField.PASSWORD,
-        "help_text": ("Password to use for the SMTP server."),
+        "help_text": "Password to use for the SMTP server.",
         "label": "Password",
     },
     "sender_name": {
@@ -113,13 +121,15 @@ DEFAULT_EMAIL_CONFIG_STRUCTURE = {
     },
 }
 
+REQUIRED_EMAIL_CONFIG_FIELDS = ("host", "port", "sender_address")
+
 
 def format_address(this, address, include_phone=True, inline=False, latin=False):
     address["name"] = f"{address.get('first_name', '')} {address.get('last_name', '')}"
     address["country_code"] = address["country"]
-    address[
-        "street_address"
-    ] = f"{address.get('street_address_1','')}\n {address.get('street_address_2','')}"
+    address["street_address"] = (
+        f"{address.get('street_address_1', '')}\n {address.get('street_address_2', '')}"
+    )
     address_lines = i18naddress.format_address(address, latin).split("\n")
     phone = address.get("phone")
     if include_phone and phone:
@@ -137,17 +147,19 @@ def format_datetime(this, date, date_format=None):
     return date.strftime(date_format)
 
 
-def get_product_image_thumbnail(this, size, image):
+def get_product_image_thumbnail(this, size: int, image_data) -> None | str:
     """Use provided size to get a correct image."""
-    expected_size = get_thumbnail_size(size, "thumbnail", "products", on_demand=False)
-    return image["original"][expected_size]
+    if image_data is None:
+        return None
+    expected_size = get_thumbnail_size(size)
+    return image_data.get("original", {}).get(str(expected_size))
 
 
 def compare(this, val1, compare_operator, val2):
     """Compare two values based on the provided operator."""
-    operators = {
+    operators: dict[str, Callable[[Any, Any], Any]] = {
         "==": operator.eq,
-        "!=": operator.neg,
+        "!=": operator.ne,
         "<": operator.lt,
         "<=": operator.le,
         ">=": operator.ge,
@@ -167,8 +179,9 @@ def price(this, net_amount, gross_amount, currency, display_gross=False):
     except (TypeError, InvalidOperation):
         return ""
 
-    locale, locale_code = get_locale_data()
-    pattern = locale.currency_formats.get("standard").pattern
+    locale_code = settings.LANGUAGE_CODE
+    locale = Locale(locale_code)
+    pattern = locale.currency_formats["standard"].pattern
 
     pattern = re.sub("(\xa4+)", '<span class="currency">\\1</span>', pattern)
 
@@ -176,6 +189,22 @@ def price(this, net_amount, gross_amount, currency, display_gross=False):
         value, currency, format=pattern, locale=locale_code
     )
     return pybars.strlist([formatted_price])
+
+
+def get_plain_text_message_for_email(message: str) -> str:
+    try:
+        html_message = lxml_html.fromstring(message)
+    except etree.ParserError:
+        html_message = None
+
+    plain_text = ""
+    if html_message is not None:
+        html_message_to_parse = html_message.find("body")
+        if html_message_to_parse is None:
+            html_message_to_parse = html_message
+
+        plain_text = " ".join(str(html_message_to_parse.text_content()).split())
+    return plain_text
 
 
 def send_email(
@@ -209,7 +238,7 @@ def send_email(
     subject_message = subject_template(context, helpers)
     send_mail(
         subject_message,
-        html2text.html2text(message),
+        get_plain_text_message_for_email(message),
         from_email,
         recipient_list,
         html_message=message,
@@ -259,6 +288,7 @@ def validate_default_email_configuration(
                 ),
             }
         )
+
     config = EmailConfig(
         host=configuration["host"],
         port=configuration["port"],
@@ -270,36 +300,47 @@ def validate_default_email_configuration(
         use_ssl=configuration["use_ssl"],
     )
 
-    if not config.sender_address:
-        raise ValidationError(
-            {
-                "sender_address": ValidationError(
-                    "Missing sender address value.",
-                    code=PluginErrorCode.PLUGIN_MISCONFIGURED.value,
-                )
-            }
-        )
+    errors = {}
+    for field in REQUIRED_EMAIL_CONFIG_FIELDS:
+        if not getattr(config, field):
+            errors[field] = ValidationError(
+                f"Missing {field.replace('_', ' ')} value.",
+                code=PluginErrorCode.PLUGIN_MISCONFIGURED.value,
+            )
+
+    if errors:
+        raise ValidationError(errors)
+
+    EmailValidator(
+        message={  # type: ignore[arg-type] # the code below is a hack
+            "sender_address": ValidationError(
+                "Invalid email", code=PluginErrorCode.INVALID.value
+            )
+        }
+    )(config.sender_address)
 
     try:
         validate_email_config(config)
     except Exception as e:
         logger.warning("Unable to connect to email backend.", exc_info=e)
         error_msg = (
-            "Unable to connect to email backend. Make sure that you provided "
-            "correct values."
+            f"Unable to connect to email backend. Make sure that you provided "
+            f"correct values. {e}"
         )
+
         raise ValidationError(
             {
                 c: ValidationError(
                     error_msg, code=PluginErrorCode.PLUGIN_MISCONFIGURED.value
                 )
-                for c in configuration.keys()
+                for c in asdict(config).keys()
             }
-        )
+        ) from e
 
 
 def validate_format_of_provided_templates(
-    plugin_configuration: "PluginConfiguration", template_fields: List[str]
+    plugin_configuration: "PluginConfiguration",
+    email_templates_data: list[dict],
 ):
     """Make sure that the templates provided by the user have the correct structure."""
     configuration = plugin_configuration.configuration
@@ -308,9 +349,10 @@ def validate_format_of_provided_templates(
     if not plugin_configuration.active:
         return
     compiler = pybars.Compiler()
-    errors = {}
-    for field in template_fields:
-        template_str = configuration.get(field)
+    errors: dict[str, ValidationError] = {}
+    for email_data in email_templates_data:
+        field: str = email_data["name"]
+        template_str = email_data.get("value")
         if not template_str or template_str == DEFAULT_EMAIL_VALUE:
             continue
         try:
@@ -325,26 +367,31 @@ def validate_format_of_provided_templates(
 
 
 def get_email_template(
-    plugin_configuration: PluginConfiguration, template_field_name: str, default: str
+    plugin: "BasePlugin", template_field_name: str, default: str
 ) -> str:
     """Get email template from plugin configuration."""
-    configuration = plugin_configuration.configuration
-    for config_field in configuration:
-        if config_field["name"] == template_field_name:
-            return config_field["value"] or default
-    return default
+    template_str = default
+
+    if plugin.db_config:
+        email_template = plugin.db_config.email_templates.filter(
+            name=template_field_name
+        ).first()
+        if email_template:
+            template_str = email_template.value
+
+    return template_str
 
 
 def get_email_template_or_default(
-    plugin_configuration: Optional[PluginConfiguration],
+    plugin: "BasePlugin",
     template_field_name: str,
     default_template_file_name: str,
     default_template_path: str,
 ):
     email_template_str = DEFAULT_EMAIL_VALUE
-    if plugin_configuration:
+    if plugin:
         email_template_str = get_email_template(
-            plugin_configuration=plugin_configuration,
+            plugin=plugin,
             template_field_name=template_field_name,
             default=DEFAULT_EMAIL_VALUE,
         )
@@ -356,15 +403,14 @@ def get_email_template_or_default(
 
 
 def get_email_subject(
-    plugin_configuration: Optional["PluginConfiguration"],
+    plugin_configuration: list | None,
     subject_field_name: str,
     default: str,
 ) -> str:
     """Get email subject from plugin configuration."""
     if not plugin_configuration:
         return default
-    configuration = plugin_configuration.configuration
-    for config_field in configuration:
+    for config_field in plugin_configuration:
         if config_field["name"] == subject_field_name:
             return config_field["value"] or default
     return default

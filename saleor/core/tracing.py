@@ -1,37 +1,51 @@
+from collections.abc import Sequence
 from contextlib import contextmanager
 
-import opentracing
 from django.db import transaction
-from graphql import ResolveInfo
 
-
-def traced_resolver(func):
-    def wrapper(*args, **kwargs):
-        info = next(arg for arg in args if isinstance(arg, ResolveInfo))
-        operation = f"{info.parent_type.name}.{info.field_name}"
-        with opentracing.global_tracer().start_active_span(operation) as scope:
-            span = scope.span
-            span.set_tag(opentracing.tags.COMPONENT, "graphql")
-            span.set_tag("graphql.parent_type", info.parent_type.name)
-            span.set_tag("graphql.field_name", info.field_name)
-            return func(*args, **kwargs)
-
-    return wrapper
+from ..app.models import App
+from ..core.telemetry import Link, Scope, SpanKind, saleor_attributes, tracer
 
 
 @contextmanager
 def traced_atomic_transaction():
     with transaction.atomic():
-        with opentracing.global_tracer().start_active_span("transaction") as scope:
-            span = scope.span
-            span.set_tag(opentracing.tags.COMPONENT, "orm")
+        with tracer.start_as_current_span("transaction") as span:
+            span.set_attribute(saleor_attributes.COMPONENT, "orm")
             yield
 
 
 @contextmanager
-def opentracing_trace(span_name, component_name, service_name):
-    with opentracing.global_tracer().start_active_span(span_name) as scope:
-        span = scope.span
-        span.set_tag(opentracing.tags.COMPONENT, component_name)
-        span.set_tag("service.name", service_name)
+def otel_trace(span_name, component_name):
+    with tracer.start_as_current_span(span_name) as span:
+        span.set_attribute(saleor_attributes.COMPONENT, component_name)
         yield
+
+
+@contextmanager
+def webhooks_otel_trace(
+    event_type: str,
+    payload_size: int,
+    app: App,
+    sync=False,
+    span_links: Sequence[Link] | None = None,
+):
+    """Context manager for tracing webhooks.
+
+    :param payload_size: size of the payload in bytes
+    """
+    with tracer.start_as_current_span(
+        f"webhooks.{event_type}",
+        scope=Scope.SERVICE,
+        kind=SpanKind.CLIENT,
+        links=span_links,
+    ) as span:
+        span.set_attribute(saleor_attributes.SALEOR_APP_ID, app.id)
+        span.set_attribute(saleor_attributes.SALEOR_APP_IDENTIFIER, app.identifier)
+        span.set_attribute(saleor_attributes.SALEOR_APP_NAME, app.name)
+        span.set_attribute(saleor_attributes.COMPONENT, "webhooks")
+        span.set_attribute(
+            saleor_attributes.SALEOR_WEBHOOK_EXECUTION_MODE, "sync" if sync else "async"
+        )
+        span.set_attribute(saleor_attributes.SALEOR_WEBHOOK_PAYLOAD_SIZE, payload_size)
+        yield span

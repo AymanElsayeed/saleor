@@ -1,20 +1,25 @@
 from email.headerregistry import Address
 from email.utils import parseaddr
-from typing import Optional
+from typing import Final
 
 from django.conf import settings
 from django.contrib.sites.models import Site
 from django.core.exceptions import ImproperlyConfigured
-from django.core.validators import MaxLengthValidator, RegexValidator
+from django.core.validators import MaxLengthValidator, MinValueValidator, RegexValidator
 from django.db import models
 
-from ..core.permissions import SitePermissions
+from ..core import TimePeriodType
+from ..core.models import ModelWithMetadata
 from ..core.units import WeightUnits
-from ..core.utils.translations import Translation, TranslationProxy
+from ..core.utils.translations import Translation
+from ..permission.enums import SitePermissions
+from . import GiftCardSettingsExpiryType
 from .error_codes import SiteErrorCode
 from .patch_sites import patch_contrib_sites
 
 patch_contrib_sites()
+
+DEFAULT_LIMIT_QUANTITY_PER_CHECKOUT: Final[int] = 50
 
 
 def email_sender_name_validators():
@@ -29,7 +34,7 @@ def email_sender_name_validators():
     ]
 
 
-class SiteSettings(models.Model):
+class SiteSettings(ModelWithMetadata):
     site = models.OneToOneField(Site, related_name="settings", on_delete=models.CASCADE)
     header_text = models.CharField(max_length=200, blank=True)
     description = models.CharField(max_length=500, blank=True)
@@ -39,14 +44,11 @@ class SiteSettings(models.Model):
     bottom_menu = models.ForeignKey(
         "menu.Menu", on_delete=models.SET_NULL, related_name="+", blank=True, null=True
     )
-    include_taxes_in_prices = models.BooleanField(default=True)
-    display_gross_prices = models.BooleanField(default=True)
-    charge_taxes_on_shipping = models.BooleanField(default=True)
     track_inventory_by_default = models.BooleanField(default=True)
     default_weight_unit = models.CharField(
         max_length=30,
-        choices=WeightUnits.CHOICES,  # type: ignore
-        default=WeightUnits.KG,  # type: ignore
+        choices=WeightUnits.CHOICES,
+        default=WeightUnits.KG,
     )
     automatic_fulfillment_digital_products = models.BooleanField(default=False)
     default_digital_max_downloads = models.IntegerField(blank=True, null=True)
@@ -63,9 +65,58 @@ class SiteSettings(models.Model):
         validators=email_sender_name_validators(),
     )
     default_mail_sender_address = models.EmailField(blank=True, null=True)
+    enable_account_confirmation_by_email = models.BooleanField(default=True)
+    allow_login_without_confirmation = models.BooleanField(default=False)
     customer_set_password_url = models.CharField(max_length=255, blank=True, null=True)
-    automatically_confirm_all_new_orders = models.BooleanField(default=True)
-    translated = TranslationProxy()
+    fulfillment_auto_approve = models.BooleanField(default=True)
+    fulfillment_allow_unpaid = models.BooleanField(default=True)
+
+    # Duration in minutes
+    reserve_stock_duration_anonymous_user = models.IntegerField(blank=True, null=True)
+    reserve_stock_duration_authenticated_user = models.IntegerField(
+        blank=True, null=True
+    )
+
+    limit_quantity_per_checkout = models.IntegerField(
+        blank=True,
+        null=True,
+        default=DEFAULT_LIMIT_QUANTITY_PER_CHECKOUT,
+        validators=[MinValueValidator(1)],
+    )
+
+    # gift card settings
+    gift_card_expiry_type = models.CharField(
+        max_length=32,
+        choices=GiftCardSettingsExpiryType.CHOICES,
+        default=GiftCardSettingsExpiryType.NEVER_EXPIRE,
+    )
+    gift_card_expiry_period_type = models.CharField(
+        max_length=32, choices=TimePeriodType.CHOICES, null=True, blank=True
+    )
+    gift_card_expiry_period = models.PositiveIntegerField(null=True, blank=True)
+
+    # refund settings
+    refund_reason_reference_type = models.ForeignKey(
+        null=True, blank=True, on_delete=models.SET_NULL, to="page.PageType"
+    )
+
+    # deprecated
+    charge_taxes_on_shipping = models.BooleanField(default=True)
+    include_taxes_in_prices = models.BooleanField(default=True)
+    display_gross_prices = models.BooleanField(default=True)
+
+    # legacy settings
+    use_legacy_update_webhook_emission = models.BooleanField(
+        default=False,
+        db_default=True,
+        help_text=(
+            "When enabled, update webhooks (e.g. `customerUpdated`,"
+            "`productVariantUpdated`) are sent even when only metadata changes. "
+            "When disabled, update webhooks are not sent for metadata-only changes; "
+            "only metadata-specific webhooks (e.g., `customerMetadataUpdated`, "
+            "`productVariantMetadataUpdated`) are sent."
+        ),
+    )
 
     class Meta:
         permissions = (
@@ -73,13 +124,10 @@ class SiteSettings(models.Model):
             (SitePermissions.MANAGE_TRANSLATIONS.codename, "Manage translations."),
         )
 
-    def __str__(self):
-        return self.site.name
-
     @property
     def default_from_email(self) -> str:
         sender_name: str = self.default_mail_sender_name
-        sender_address: Optional[str] = self.default_mail_sender_address
+        sender_address: str | None = self.default_mail_sender_address
 
         if not sender_address:
             sender_address = settings.DEFAULT_FROM_EMAIL
@@ -110,14 +158,7 @@ class SiteSettingsTranslation(Translation):
 
     def __repr__(self):
         class_ = type(self)
-        return "%s(pk=%r, site_settings_pk=%r)" % (
-            class_.__name__,
-            self.pk,
-            self.site_settings_id,
-        )
-
-    def __str__(self):
-        return self.site_settings.site.name
+        return f"{class_.__name__}(pk={self.pk!r}, site_settings_pk={self.site_settings_id!r})"
 
     def get_translated_object_id(self):
         return "Shop", self.site_settings_id

@@ -5,6 +5,7 @@ import graphene
 import pytest
 
 from ....attribute.utils import associate_attribute_values_to_instance
+from ....product import ProductTypeKind
 from ....product.models import (
     Category,
     Collection,
@@ -89,7 +90,7 @@ QUERY_CATEGORIES_PAGINATION = """
 
 
 @pytest.mark.parametrize(
-    "sort_by, categories_order",
+    ("sort_by", "categories_order"),
     [
         (
             {"field": "NAME", "direction": "ASC"},
@@ -131,7 +132,7 @@ def test_categories_pagination_with_sorting(
 
 
 @pytest.mark.parametrize(
-    "filter_by, categories_order",
+    ("filter_by", "categories_order"),
     [
         ({"search": "CategoryCategory"}, ["CategoryCategory1", "CategoryCategory2"]),
         ({"search": "cat_cat"}, ["CategoryCategory1", "CategoryCategory2"]),
@@ -212,7 +213,7 @@ QUERY_COLLECTIONS_PAGINATION = """
 
 
 @pytest.mark.parametrize(
-    "sort_by, collections_order",
+    ("sort_by", "collections_order"),
     [
         (
             {"field": "NAME", "direction": "ASC"},
@@ -262,7 +263,7 @@ def test_collections_pagination_with_sorting(
 
 
 @pytest.mark.parametrize(
-    "filter_by, collections_order",
+    ("filter_by", "collections_order"),
     [
         (
             {"search": "CollectionCollection"},
@@ -305,7 +306,9 @@ def test_collections_pagination_with_filtering(
 def products_for_pagination(
     product_type, color_attribute, category, warehouse, channel_USD
 ):
-    product_type2 = ProductType.objects.create(name="Apple")
+    product_type2 = ProductType.objects.create(
+        name="Apple", kind=ProductTypeKind.NORMAL
+    )
     products = Product.objects.bulk_create(
         [
             Product(
@@ -374,10 +377,10 @@ def products_for_pagination(
 
     product_attrib_values = color_attribute.values.all()
     associate_attribute_values_to_instance(
-        products[1], color_attribute, product_attrib_values[0]
+        products[1], {color_attribute.id: [product_attrib_values[0]]}
     )
     associate_attribute_values_to_instance(
-        products[3], color_attribute, product_attrib_values[1]
+        products[3], {color_attribute.id: [product_attrib_values[1]]}
     )
 
     variants = ProductVariant.objects.bulk_create(
@@ -475,7 +478,7 @@ QUERY_PRODUCTS_PAGINATION = """
 
 
 @pytest.mark.parametrize(
-    "sort_by, products_order",
+    ("sort_by", "products_order"),
     [
         ({"field": "NAME", "direction": "ASC"}, ["Product1", "Product2", "Product3"]),
         (
@@ -513,7 +516,7 @@ def test_products_pagination_with_sorting(
 
 
 @pytest.mark.parametrize(
-    "sort_by, products_order",
+    ("sort_by", "products_order"),
     [
         (
             {"field": "PUBLISHED", "direction": "ASC"},
@@ -695,7 +698,7 @@ def test_products_pagination_for_products_with_the_same_names_one_page(
 
 
 @pytest.mark.parametrize(
-    "filter_by, products_order",
+    ("filter_by", "products_order"),
     [
         ({"hasCategory": True}, ["Product1", "Product2"]),
         (
@@ -734,7 +737,7 @@ def test_products_pagination_with_filtering(
 
 
 @pytest.mark.parametrize(
-    "filter_by, products_order",
+    ("filter_by", "products_order"),
     [
         ({"isPublished": True}, ["Product1", "Product2"]),
         ({"price": {"gte": 8, "lte": 12}}, ["Product1", "ProductProduct2"]),
@@ -915,7 +918,7 @@ QUERY_PRODUCT_TYPES_PAGINATION = """
 
 
 @pytest.mark.parametrize(
-    "sort_by, product_types_order",
+    ("sort_by", "product_types_order"),
     [
         (
             {"field": "NAME", "direction": "ASC"},
@@ -954,7 +957,7 @@ def test_product_types_pagination_with_sorting(
 
 
 @pytest.mark.parametrize(
-    "filter_by, product_types_order",
+    ("filter_by", "product_types_order"),
     [
         (
             {"search": "ProductTypeProductType"},

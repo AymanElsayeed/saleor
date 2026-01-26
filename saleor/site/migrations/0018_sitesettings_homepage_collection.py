@@ -13,7 +13,7 @@ def copy_featured_products_to_homepade_collection(apps, schema_editor):
     Collection = apps.get_model("product", "Collection")
     Product = apps.get_model("product", "Product")
 
-    today = datetime.date.today()
+    today = datetime.datetime.now(tz=datetime.UTC).date()
     homepage_products = list(
         Product.objects.filter(
             Q(available_on__lte=today) | Q(available_on__isnull=True),
@@ -33,7 +33,6 @@ def copy_featured_products_to_homepade_collection(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("product", "0066_auto_20180803_0528"),
         ("site", "0017_auto_20180803_0528"),

@@ -2,7 +2,7 @@ from django.db import models
 
 from ...core.models import SortableModel
 from ...product.models import ProductType, ProductVariant
-from .base import AssociatedAttributeQuerySet, BaseAssignedAttribute
+from .base import AssociatedAttributeManager, AttributeValue, BaseAssignedAttribute
 
 
 class AssignedVariantAttributeValue(SortableModel):
@@ -15,6 +15,13 @@ class AssignedVariantAttributeValue(SortableModel):
         "AssignedVariantAttribute",
         on_delete=models.CASCADE,
         related_name="variantvalueassignment",
+    )
+    variant = models.ForeignKey(
+        ProductVariant,
+        related_name="attributevalues",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
     )
 
     class Meta:
@@ -35,7 +42,7 @@ class AssignedVariantAttribute(BaseAssignedAttribute):
         "AttributeVariant", on_delete=models.CASCADE, related_name="variantassignments"
     )
     values = models.ManyToManyField(
-        "AttributeValue",
+        AttributeValue,
         blank=True,
         related_name="variantassignments",
         through=AssignedVariantAttributeValue,
@@ -59,8 +66,9 @@ class AttributeVariant(SortableModel):
         through_fields=("assignment", "variant"),
         related_name="attributesrelated",
     )
+    variant_selection = models.BooleanField(default=False)
 
-    objects = models.Manager.from_queryset(AssociatedAttributeQuerySet)()
+    objects = AssociatedAttributeManager()
 
     class Meta:
         unique_together = (("attribute", "product_type"),)

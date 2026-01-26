@@ -5,6 +5,7 @@ import pytest
 
 from .....attribute.models import Attribute
 from .....attribute.utils import associate_attribute_values_to_instance
+from .....product import ProductTypeKind
 from .....product.models import ProductType
 from ....tests.utils import get_graphql_content, get_graphql_content_from_response
 from ...filters import filter_attributes_by_product_types
@@ -72,6 +73,23 @@ def test_search_attributes_value(
     assert values[0]["node"]["slug"] == filter_value
 
 
+@pytest.mark.parametrize(
+    ("filter_by", "attributes_count"),
+    [({"slugs": ["red", "blue"]}, 2), ({"slugs": ["red"]}, 1), ({"slugs": []}, 2)],
+)
+def test_atribute_values_with_filtering_slugs(
+    filter_by, api_client, attributes_count, color_attribute, size_attribute
+):
+    variables = {"filters": filter_by}
+
+    attributes = get_graphql_content(
+        api_client.post_graphql(ATTRIBUTES_VALUE_FILTER_QUERY, variables)
+    )["data"]["attributes"]
+
+    slugs = attributes["edges"][0]["node"]["choices"]["edges"]
+    assert len(slugs) == attributes_count
+
+
 def test_filter_attributes_if_filterable_in_dashboard(
     api_client, color_attribute, size_attribute
 ):
@@ -127,6 +145,29 @@ def test_filter_attributes_by_global_id_list(api_client, product_type_attribute_
     assert received_slugs == expected_slugs
 
 
+def test_filter_attribute_values_by_global_id_list(
+    api_client, attribute_choices_for_sorting
+):
+    # given
+    values = attribute_choices_for_sorting.values.all()
+    global_ids = [
+        graphene.Node.to_global_id("AttributeValue", value.pk) for value in values[:2]
+    ]
+    variables = {"filters": {"ids": global_ids}}
+
+    # when
+    content = get_graphql_content(
+        api_client.post_graphql(ATTRIBUTES_VALUE_FILTER_QUERY, variables)
+    )
+
+    # then
+    expected_slugs = sorted([values[0].slug, values[1].slug])
+    values = content["data"]["attributes"]["edges"][0]["node"]["choices"]["edges"]
+    assert len(values) == 2
+    received_slugs = sorted([value["node"]["slug"] for value in values])
+    assert received_slugs == expected_slugs
+
+
 def test_filter_attributes_in_category_invalid_category_id(
     user_api_client, product_list, weight_attribute, channel_USD
 ):
@@ -134,6 +175,7 @@ def test_filter_attributes_in_category_invalid_category_id(
     product_type = ProductType.objects.create(
         name="Default Type 2",
         slug="default-type-2",
+        kind=ProductTypeKind.NORMAL,
         has_variants=True,
         is_shipping_required=True,
     )
@@ -145,7 +187,7 @@ def test_filter_attributes_in_category_invalid_category_id(
     last_product.channel_listings.all().update(visible_in_listings=False)
 
     associate_attribute_values_to_instance(
-        product_list[-1], weight_attribute, weight_attribute.values.first()
+        product_list[-1], {weight_attribute.pk: [weight_attribute.values.first()]}
     )
 
     variables = {
@@ -175,6 +217,7 @@ def test_filter_attributes_in_category_object_with_given_id_does_not_exist(
     product_type = ProductType.objects.create(
         name="Default Type 2",
         slug="default-type-2",
+        kind=ProductTypeKind.NORMAL,
         has_variants=True,
         is_shipping_required=True,
     )
@@ -186,7 +229,7 @@ def test_filter_attributes_in_category_object_with_given_id_does_not_exist(
     last_product.channel_listings.all().update(visible_in_listings=False)
 
     associate_attribute_values_to_instance(
-        product_list[-1], weight_attribute, weight_attribute.values.first()
+        product_list[-1], {weight_attribute.pk: [weight_attribute.values.first()]}
     )
 
     variables = {
@@ -211,6 +254,7 @@ def test_filter_attributes_in_category_not_visible_in_listings_by_customer(
     product_type = ProductType.objects.create(
         name="Default Type 2",
         slug="default-type-2",
+        kind=ProductTypeKind.NORMAL,
         has_variants=True,
         is_shipping_required=True,
     )
@@ -222,7 +266,7 @@ def test_filter_attributes_in_category_not_visible_in_listings_by_customer(
     last_product.channel_listings.all().update(visible_in_listings=False)
 
     associate_attribute_values_to_instance(
-        product_list[-1], weight_attribute, weight_attribute.values.first()
+        product_list[-1], {weight_attribute.pk: [weight_attribute.values.first()]}
     )
 
     attribute_count = Attribute.objects.count()
@@ -260,6 +304,7 @@ def test_filter_attributes_in_category_not_visible_in_listings_by_staff_with_per
     product_type = ProductType.objects.create(
         name="Default Type 2",
         slug="default-type-2",
+        kind=ProductTypeKind.NORMAL,
         has_variants=True,
         is_shipping_required=True,
     )
@@ -271,7 +316,7 @@ def test_filter_attributes_in_category_not_visible_in_listings_by_staff_with_per
     last_product.channel_listings.all().update(visible_in_listings=False)
 
     associate_attribute_values_to_instance(
-        product_list[-1], weight_attribute, weight_attribute.values.first()
+        product_list[-1], {weight_attribute.pk: [weight_attribute.values.first()]}
     )
 
     attribute_count = Attribute.objects.count()
@@ -303,6 +348,7 @@ def test_filter_attributes_in_category_not_in_listings_by_staff_without_manage_p
     product_type = ProductType.objects.create(
         name="Default Type 2",
         slug="default-type-2",
+        kind=ProductTypeKind.NORMAL,
         has_variants=True,
         is_shipping_required=True,
     )
@@ -314,7 +360,7 @@ def test_filter_attributes_in_category_not_in_listings_by_staff_without_manage_p
     last_product.channel_listings.all().update(visible_in_listings=False)
 
     associate_attribute_values_to_instance(
-        product_list[-1], weight_attribute, weight_attribute.values.first()
+        product_list[-1], {weight_attribute.pk: [weight_attribute.values.first()]}
     )
 
     attribute_count = Attribute.objects.count()
@@ -333,7 +379,7 @@ def test_filter_attributes_in_category_not_in_listings_by_staff_without_manage_p
     )["data"]["attributes"]["edges"]
 
     # then
-    assert len(attributes) == attribute_count
+    assert len(attributes) == attribute_count - 1  # product not listed will not count
 
 
 def test_filter_attributes_in_category_not_visible_in_listings_by_app_with_perm(
@@ -349,6 +395,7 @@ def test_filter_attributes_in_category_not_visible_in_listings_by_app_with_perm(
     product_type = ProductType.objects.create(
         name="Default Type 2",
         slug="default-type-2",
+        kind=ProductTypeKind.NORMAL,
         has_variants=True,
         is_shipping_required=True,
     )
@@ -360,7 +407,7 @@ def test_filter_attributes_in_category_not_visible_in_listings_by_app_with_perm(
     last_product.channel_listings.all().update(visible_in_listings=False)
 
     associate_attribute_values_to_instance(
-        product_list[-1], weight_attribute, weight_attribute.values.first()
+        product_list[-1], {weight_attribute.pk: [weight_attribute.values.first()]}
     )
 
     attribute_count = Attribute.objects.count()
@@ -392,6 +439,7 @@ def test_filter_attributes_in_category_not_in_listings_by_app_without_manage_pro
     product_type = ProductType.objects.create(
         name="Default Type 2",
         slug="default-type-2",
+        kind=ProductTypeKind.NORMAL,
         has_variants=True,
         is_shipping_required=True,
     )
@@ -403,7 +451,7 @@ def test_filter_attributes_in_category_not_in_listings_by_app_without_manage_pro
     last_product.channel_listings.all().update(visible_in_listings=False)
 
     associate_attribute_values_to_instance(
-        product_list[-1], weight_attribute, weight_attribute.values.first()
+        product_list[-1], {weight_attribute.pk: [weight_attribute.values.first()]}
     )
 
     attribute_count = Attribute.objects.count()
@@ -422,7 +470,7 @@ def test_filter_attributes_in_category_not_in_listings_by_app_without_manage_pro
     )["data"]["attributes"]["edges"]
 
     # then
-    assert len(attributes) == attribute_count
+    assert len(attributes) == attribute_count - 1  # product not visible will not count
 
 
 def test_filter_attributes_in_category_not_published_by_customer(
@@ -432,6 +480,7 @@ def test_filter_attributes_in_category_not_published_by_customer(
     product_type = ProductType.objects.create(
         name="Default Type 2",
         slug="default-type-2",
+        kind=ProductTypeKind.NORMAL,
         has_variants=True,
         is_shipping_required=True,
     )
@@ -443,7 +492,7 @@ def test_filter_attributes_in_category_not_published_by_customer(
     last_product.channel_listings.all().update(is_published=False)
 
     associate_attribute_values_to_instance(
-        product_list[-1], weight_attribute, weight_attribute.values.first()
+        product_list[-1], {weight_attribute.pk: [weight_attribute.values.first()]}
     )
 
     attribute_count = Attribute.objects.count()
@@ -481,6 +530,7 @@ def test_filter_attributes_in_category_not_published_by_staff_with_perm(
     product_type = ProductType.objects.create(
         name="Default Type 2",
         slug="default-type-2",
+        kind=ProductTypeKind.NORMAL,
         has_variants=True,
         is_shipping_required=True,
     )
@@ -492,7 +542,7 @@ def test_filter_attributes_in_category_not_published_by_staff_with_perm(
     last_product.channel_listings.all().update(is_published=False)
 
     associate_attribute_values_to_instance(
-        product_list[-1], weight_attribute, weight_attribute.values.first()
+        product_list[-1], {weight_attribute.pk: [weight_attribute.values.first()]}
     )
 
     attribute_count = Attribute.objects.count()
@@ -524,6 +574,7 @@ def test_filter_attributes_in_category_not_published_by_staff_without_manage_pro
     product_type = ProductType.objects.create(
         name="Default Type 2",
         slug="default-type-2",
+        kind=ProductTypeKind.NORMAL,
         has_variants=True,
         is_shipping_required=True,
     )
@@ -535,7 +586,7 @@ def test_filter_attributes_in_category_not_published_by_staff_without_manage_pro
     last_product.channel_listings.all().update(is_published=False)
 
     associate_attribute_values_to_instance(
-        product_list[-1], weight_attribute, weight_attribute.values.first()
+        product_list[-1], {weight_attribute.pk: [weight_attribute.values.first()]}
     )
 
     attribute_count = Attribute.objects.count()
@@ -554,7 +605,7 @@ def test_filter_attributes_in_category_not_published_by_staff_without_manage_pro
     )["data"]["attributes"]["edges"]
 
     # then
-    assert len(attributes) == attribute_count
+    assert len(attributes) == attribute_count - 1
 
 
 def test_filter_attributes_in_category_not_published_by_app_with_perm(
@@ -570,6 +621,7 @@ def test_filter_attributes_in_category_not_published_by_app_with_perm(
     product_type = ProductType.objects.create(
         name="Default Type 2",
         slug="default-type-2",
+        kind=ProductTypeKind.NORMAL,
         has_variants=True,
         is_shipping_required=True,
     )
@@ -581,7 +633,7 @@ def test_filter_attributes_in_category_not_published_by_app_with_perm(
     last_product.channel_listings.all().update(is_published=False)
 
     associate_attribute_values_to_instance(
-        product_list[-1], weight_attribute, weight_attribute.values.first()
+        product_list[-1], {weight_attribute.pk: [weight_attribute.values.first()]}
     )
 
     attribute_count = Attribute.objects.count()
@@ -613,6 +665,7 @@ def test_filter_attributes_in_category_not_published_by_app_without_manage_produ
     product_type = ProductType.objects.create(
         name="Default Type 2",
         slug="default-type-2",
+        kind=ProductTypeKind.NORMAL,
         has_variants=True,
         is_shipping_required=True,
     )
@@ -624,7 +677,7 @@ def test_filter_attributes_in_category_not_published_by_app_without_manage_produ
     last_product.channel_listings.all().update(is_published=False)
 
     associate_attribute_values_to_instance(
-        product_list[-1], weight_attribute, weight_attribute.values.first()
+        product_list[-1], {weight_attribute.pk: [weight_attribute.values.first()]}
     )
 
     attribute_count = Attribute.objects.count()
@@ -643,7 +696,7 @@ def test_filter_attributes_in_category_not_published_by_app_without_manage_produ
     )["data"]["attributes"]["edges"]
 
     # then
-    assert len(attributes) == attribute_count
+    assert len(attributes) == attribute_count - 1
 
 
 def test_filter_attributes_in_collection_invalid_category_id(
@@ -653,6 +706,7 @@ def test_filter_attributes_in_collection_invalid_category_id(
     product_type = ProductType.objects.create(
         name="Default Type 2",
         slug="default-type-2",
+        kind=ProductTypeKind.NORMAL,
         has_variants=True,
         is_shipping_required=True,
     )
@@ -667,7 +721,7 @@ def test_filter_attributes_in_collection_invalid_category_id(
         collection.products.add(product)
 
     associate_attribute_values_to_instance(
-        product_list[-1], weight_attribute, weight_attribute.values.first()
+        product_list[-1], {weight_attribute.pk: [weight_attribute.values.first()]}
     )
 
     variables = {
@@ -697,6 +751,7 @@ def test_filter_attributes_in_collection_object_with_given_id_does_not_exist(
     product_type = ProductType.objects.create(
         name="Default Type 2",
         slug="default-type-2",
+        kind=ProductTypeKind.NORMAL,
         has_variants=True,
         is_shipping_required=True,
     )
@@ -711,7 +766,7 @@ def test_filter_attributes_in_collection_object_with_given_id_does_not_exist(
         collection.products.add(product)
 
     associate_attribute_values_to_instance(
-        product_list[-1], weight_attribute, weight_attribute.values.first()
+        product_list[-1], {weight_attribute.pk: [weight_attribute.values.first()]}
     )
 
     variables = {
@@ -736,6 +791,7 @@ def test_filter_attributes_in_collection_not_visible_in_listings_by_customer(
     product_type = ProductType.objects.create(
         name="Default Type 2",
         slug="default-type-2",
+        kind=ProductTypeKind.NORMAL,
         has_variants=True,
         is_shipping_required=True,
     )
@@ -750,7 +806,7 @@ def test_filter_attributes_in_collection_not_visible_in_listings_by_customer(
         collection.products.add(product)
 
     associate_attribute_values_to_instance(
-        product_list[-1], weight_attribute, weight_attribute.values.first()
+        product_list[-1], {weight_attribute.pk: [weight_attribute.values.first()]}
     )
 
     attribute_count = Attribute.objects.count()
@@ -778,6 +834,7 @@ def test_filter_in_collection_not_published_by_customer(
     product_type = ProductType.objects.create(
         name="Default Type 2",
         slug="default-type-2",
+        kind=ProductTypeKind.NORMAL,
         has_variants=True,
         is_shipping_required=True,
     )
@@ -792,7 +849,7 @@ def test_filter_in_collection_not_published_by_customer(
         collection.products.add(product)
 
     associate_attribute_values_to_instance(
-        product_list[-1], weight_attribute, weight_attribute.values.first()
+        product_list[-1], {weight_attribute.pk: [weight_attribute.values.first()]}
     )
 
     attribute_count = Attribute.objects.count()
@@ -830,6 +887,7 @@ def test_filter_in_collection_not_published_by_staff_with_perm(
     product_type = ProductType.objects.create(
         name="Default Type 2",
         slug="default-type-2",
+        kind=ProductTypeKind.NORMAL,
         has_variants=True,
         is_shipping_required=True,
     )
@@ -844,7 +902,7 @@ def test_filter_in_collection_not_published_by_staff_with_perm(
         collection.products.add(product)
 
     associate_attribute_values_to_instance(
-        product_list[-1], weight_attribute, weight_attribute.values.first()
+        product_list[-1], {weight_attribute.pk: [weight_attribute.values.first()]}
     )
 
     attribute_count = Attribute.objects.count()
@@ -876,6 +934,7 @@ def test_filter_in_collection_not_published_by_staff_without_manage_products(
     product_type = ProductType.objects.create(
         name="Default Type 2",
         slug="default-type-2",
+        kind=ProductTypeKind.NORMAL,
         has_variants=True,
         is_shipping_required=True,
     )
@@ -890,7 +949,7 @@ def test_filter_in_collection_not_published_by_staff_without_manage_products(
         collection.products.add(product)
 
     associate_attribute_values_to_instance(
-        product_list[-1], weight_attribute, weight_attribute.values.first()
+        product_list[-1], {weight_attribute.pk: [weight_attribute.values.first()]}
     )
 
     attribute_count = Attribute.objects.count()
@@ -908,7 +967,7 @@ def test_filter_in_collection_not_published_by_staff_without_manage_products(
     )["data"]["attributes"]["edges"]
 
     # then
-    assert len(attributes) == attribute_count
+    assert len(attributes) == attribute_count - 1
 
 
 def test_filter_in_collection_not_published_by_app_with_perm(
@@ -925,6 +984,7 @@ def test_filter_in_collection_not_published_by_app_with_perm(
     product_type = ProductType.objects.create(
         name="Default Type 2",
         slug="default-type-2",
+        kind=ProductTypeKind.NORMAL,
         has_variants=True,
         is_shipping_required=True,
     )
@@ -939,7 +999,7 @@ def test_filter_in_collection_not_published_by_app_with_perm(
         collection.products.add(product)
 
     associate_attribute_values_to_instance(
-        product_list[-1], weight_attribute, weight_attribute.values.first()
+        product_list[-1], {weight_attribute.pk: [weight_attribute.values.first()]}
     )
 
     attribute_count = Attribute.objects.count()
@@ -971,6 +1031,7 @@ def test_filter_in_collection_not_published_by_app_without_manage_products(
     product_type = ProductType.objects.create(
         name="Default Type 2",
         slug="default-type-2",
+        kind=ProductTypeKind.NORMAL,
         has_variants=True,
         is_shipping_required=True,
     )
@@ -985,7 +1046,7 @@ def test_filter_in_collection_not_published_by_app_without_manage_products(
         collection.products.add(product)
 
     associate_attribute_values_to_instance(
-        product_list[-1], weight_attribute, weight_attribute.values.first()
+        product_list[-1], {weight_attribute.pk: [weight_attribute.values.first()]}
     )
 
     attribute_count = Attribute.objects.count()
@@ -1003,7 +1064,7 @@ def test_filter_in_collection_not_published_by_app_without_manage_products(
     )["data"]["attributes"]["edges"]
 
     # then
-    assert len(attributes) == attribute_count
+    assert len(attributes) == attribute_count - 1
 
 
 def test_filter_attributes_by_page_type(
@@ -1051,10 +1112,6 @@ def test_filter_attributes_by_product_type(
 
 
 def test_attributes_filter_by_product_type_with_empty_value():
-    """Ensure passing an empty or null value is ignored and the queryset is simply
-    returned without any modification.
-    """
-
     qs = Attribute.objects.all()
 
     assert filter_attributes_by_product_types(qs, "...", "", None, None) is qs
@@ -1064,10 +1121,6 @@ def test_attributes_filter_by_product_type_with_empty_value():
 def test_attributes_filter_by_product_type_with_unsupported_field(
     customer_user, channel_USD
 ):
-    """Ensure using an unknown field to filter attributes by raises a NotImplemented
-    exception.
-    """
-
     qs = Attribute.objects.all()
 
     with pytest.raises(NotImplementedError) as exc:
@@ -1082,7 +1135,7 @@ def test_attributes_filter_by_non_existing_category_id(customer_user, channel_US
     """Ensure using a non-existing category ID returns an empty query set."""
 
     category_id = graphene.Node.to_global_id("Category", -1)
-    mocked_qs = mock.MagicMock()
+    mocked_qs = mock.MagicMock(db="default")
     qs = filter_attributes_by_product_types(
         mocked_qs, "in_category", category_id, customer_user, channel_USD.slug
     )

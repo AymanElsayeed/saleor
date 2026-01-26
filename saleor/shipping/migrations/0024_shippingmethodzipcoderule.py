@@ -5,7 +5,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("shipping", "0023_shippingmethod_excluded_products"),
     ]
@@ -36,6 +35,6 @@ class Migration(migrations.Migration):
             ],
             options={
                 "unique_together": {("shipping_method", "start", "end")},
-            },  # noqa
+            },
         ),
     ]

@@ -2,6 +2,7 @@ from unittest.mock import patch
 
 import pytest
 
+from ....plugins.models import EmailTemplate, PluginConfiguration
 from ...email_common import DEFAULT_EMAIL_VALUE
 from ...manager import get_plugins_manager
 from ..constants import (
@@ -104,9 +105,8 @@ def user_email_plugin(settings, channel_USD):
         order_refund_template=DEFAULT_EMAIL_VALUE,
         order_refund_subject=ORDER_REFUND_CONFIRMATION_DEFAULT_SUBJECT,
     ):
-
         settings.PLUGINS = ["saleor.plugins.user_email.plugin.UserEmailPlugin"]
-        manager = get_plugins_manager()
+        manager = get_plugins_manager(allow_replica=False)
         with patch(
             "saleor.plugins.user_email.plugin.validate_default_email_configuration"
         ):
@@ -239,7 +239,19 @@ def user_email_plugin(settings, channel_USD):
                     ],
                 },
             )
-        manager = get_plugins_manager()
+        manager = get_plugins_manager(allow_replica=False)
+        manager.get_all_plugins()
         return manager.plugins_per_channel[channel_USD.slug][0]
 
     return fun
+
+
+@pytest.fixture
+def user_email_template(user_email_plugin):
+    plugin = user_email_plugin()
+    config = PluginConfiguration.objects.get(identifier=plugin.PLUGIN_ID)
+    return EmailTemplate.objects.create(
+        name=ORDER_CONFIRMATION_TEMPLATE_FIELD,
+        value="Custom order confirmation template",
+        plugin_configuration=config,
+    )

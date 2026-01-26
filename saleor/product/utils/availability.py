@@ -1,36 +1,22 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable, List, Optional, Tuple, Union
+from decimal import Decimal
+from typing import Literal
 
-import opentracing
-from django.conf import settings
-from django_countries.fields import Country
-from prices import MoneyRange, TaxedMoney, TaxedMoneyRange
+from prices import Money, MoneyRange, TaxedMoney, TaxedMoneyRange
 
-from ...channel.models import Channel
-from ...core.utils import to_local_currency
-from ...discount import DiscountInfo
-from ...discount.utils import calculate_discounted_price
-from ...product.models import (
-    Collection,
-    Product,
-    ProductChannelListing,
-    ProductVariant,
-    ProductVariantChannelListing,
-)
-
-if TYPE_CHECKING:
-    # flake8: noqa
-    from ...plugins.manager import PluginsManager
+from ...product.models import ProductChannelListing, ProductVariantChannelListing
+from ...tax import TaxCalculationStrategy
+from ...tax.calculations import calculate_flat_rate_tax
 
 
 @dataclass
 class ProductAvailability:
     on_sale: bool
-    price_range: Optional[TaxedMoneyRange]
-    price_range_undiscounted: Optional[TaxedMoneyRange]
-    discount: Optional[TaxedMoney]
-    price_range_local_currency: Optional[TaxedMoneyRange]
-    discount_local_currency: Optional[TaxedMoneyRange]
+    price_range: TaxedMoneyRange | None
+    price_range_undiscounted: TaxedMoneyRange | None
+    price_range_prior: TaxedMoneyRange | None
+    discount: TaxedMoney | None
+    discount_prior: TaxedMoney | None
 
 
 @dataclass
@@ -38,14 +24,14 @@ class VariantAvailability:
     on_sale: bool
     price: TaxedMoney
     price_undiscounted: TaxedMoney
-    discount: Optional[TaxedMoney]
-    price_local_currency: Optional[TaxedMoney]
-    discount_local_currency: Optional[TaxedMoney]
+    price_prior: TaxedMoney | None
+    discount: TaxedMoney | None
+    discount_prior: TaxedMoney | None
 
 
 def _get_total_discount_from_range(
     undiscounted: TaxedMoneyRange, discounted: TaxedMoneyRange
-) -> Optional[TaxedMoney]:
+) -> TaxedMoney | None:
     """Calculate the discount amount between two TaxedMoneyRange.
 
     Subtract two prices and return their total discount, if any.
@@ -56,7 +42,7 @@ def _get_total_discount_from_range(
 
 def _get_total_discount(
     undiscounted: TaxedMoney, discounted: TaxedMoney
-) -> Optional[TaxedMoney]:
+) -> TaxedMoney | None:
     """Calculate the discount amount between two TaxedMoney.
 
     Subtract two prices and return their total discount, if any.
@@ -67,226 +53,176 @@ def _get_total_discount(
     return None
 
 
-def _get_product_price_range(
-    discounted: Union[MoneyRange, TaxedMoneyRange],
-    undiscounted: Union[MoneyRange, TaxedMoneyRange],
-    local_currency: Optional[str] = None,
-) -> Tuple[TaxedMoneyRange, TaxedMoney]:
-    price_range_local = None
-    discount_local_currency = None
-
-    if local_currency:
-        price_range_local = to_local_currency(discounted, local_currency)
-        undiscounted_local = to_local_currency(undiscounted, local_currency)
-        if undiscounted_local and undiscounted_local.start > price_range_local.start:
-            discount_local_currency = undiscounted_local.start - price_range_local.start
-
-    return price_range_local, discount_local_currency
-
-
-def get_variant_price(
-    *,
-    variant: ProductVariant,
-    variant_channel_listing: ProductVariantChannelListing,
-    product: Product,
-    collections: Iterable[Collection],
-    discounts: Iterable[DiscountInfo],
-    channel: Channel
-):
-    return calculate_discounted_price(
-        product=product,
-        price=variant_channel_listing.price,
-        collections=collections,
-        discounts=discounts,
-        channel=channel,
-    )
-
-
 def get_product_price_range(
     *,
-    product: Product,
-    variants: Iterable[ProductVariant],
-    variants_channel_listing: List[ProductVariantChannelListing],
-    collections: Iterable[Collection],
-    discounts: Iterable[DiscountInfo],
-    channel: Channel,
-) -> Optional[MoneyRange]:
-    with opentracing.global_tracer().start_active_span("get_product_price_range"):
-        if variants:
-            variants_channel_listing_dict = {
-                channel_listing.variant_id: channel_listing
-                for channel_listing in variants_channel_listing
-                if channel_listing
-            }
-            prices = []
-            for variant in variants:
-                variant_channel_listing = variants_channel_listing_dict.get(variant.id)
-                if variant_channel_listing:
-                    price = get_variant_price(
-                        variant=variant,
-                        variant_channel_listing=variant_channel_listing,
-                        product=product,
-                        collections=collections,
-                        discounts=discounts,
-                        channel=channel,
-                    )
-                    prices.append(price)
-            if prices:
-                return MoneyRange(min(prices), max(prices))
+    variants_channel_listing: list[ProductVariantChannelListing],
+    field: Literal["price", "discounted_price", "prior_price"],
+) -> MoneyRange | None:
+    """Return the range of product prices based on product variants prices.
 
-        return None
+    When discounted parameter is True, the range of discounted prices is provided.
+    """
+    prices = []
+    for channel_listing in variants_channel_listing:
+        price: Money | None = channel_listing.__getattribute__(field)
+        if price is not None:
+            prices.append(price)
+    if prices:
+        return MoneyRange(min(prices), max(prices))
+
+    return None
+
+
+def _calculate_product_price_with_taxes(
+    price: Money,
+    tax_rate: Decimal,
+    tax_calculation_strategy: str,
+    prices_entered_with_tax: bool,
+):
+    # Currently only FLAT_RATES strategy allows calculating taxes for product types;
+    # support for apps will be added in the future.
+    if tax_calculation_strategy == TaxCalculationStrategy.FLAT_RATES:
+        return calculate_flat_rate_tax(price, tax_rate, prices_entered_with_tax)
+    return TaxedMoney(price, price)
+
+
+def _calculate_product_price_with_taxes_range(
+    field: Literal["price", "discounted_price", "prior_price"],
+    variants_channel_listing: list[ProductVariantChannelListing],
+    tax_rate: Decimal,
+    tax_calculation_strategy: str,
+    prices_entered_with_tax: bool,
+) -> TaxedMoneyRange | None:
+    price: TaxedMoneyRange | None = None
+    price_net_range = get_product_price_range(
+        variants_channel_listing=variants_channel_listing, field=field
+    )
+    if price_net_range is not None:
+        price = TaxedMoneyRange(
+            start=_calculate_product_price_with_taxes(
+                price_net_range.start,
+                tax_rate,
+                tax_calculation_strategy,
+                prices_entered_with_tax,
+            ),
+            stop=_calculate_product_price_with_taxes(
+                price_net_range.stop,
+                tax_rate,
+                tax_calculation_strategy,
+                prices_entered_with_tax,
+            ),
+        )
+
+    return price
 
 
 def get_product_availability(
     *,
-    product: Product,
-    product_channel_listing: Optional[ProductChannelListing],
-    variants: Iterable[ProductVariant],
-    variants_channel_listing: List[ProductVariantChannelListing],
-    collections: Iterable[Collection],
-    discounts: Iterable[DiscountInfo],
-    channel: Channel,
-    manager: "PluginsManager",
-    country: Country,
-    local_currency: Optional[str] = None,
+    product_channel_listing: ProductChannelListing | None,
+    variants_channel_listing: list[ProductVariantChannelListing],
+    prices_entered_with_tax: bool,
+    tax_calculation_strategy: str,
+    tax_rate: Decimal,
 ) -> ProductAvailability:
-    with opentracing.global_tracer().start_active_span("get_product_availability"):
-        channel_slug = channel.slug
+    undiscounted: TaxedMoneyRange | None = _calculate_product_price_with_taxes_range(
+        "price",
+        variants_channel_listing,
+        tax_rate,
+        tax_calculation_strategy,
+        prices_entered_with_tax,
+    )
 
-        discounted = None
-        discounted_net_range = get_product_price_range(
-            product=product,
-            variants=variants,
-            variants_channel_listing=variants_channel_listing,
-            collections=collections,
-            discounts=discounts,
-            channel=channel,
+    discounted: TaxedMoneyRange | None = None
+    prior: TaxedMoneyRange | None = None
+
+    if undiscounted is not None:
+        discounted = _calculate_product_price_with_taxes_range(
+            "discounted_price",
+            variants_channel_listing,
+            tax_rate,
+            tax_calculation_strategy,
+            prices_entered_with_tax,
         )
-        if discounted_net_range is not None:
-            discounted = TaxedMoneyRange(
-                start=manager.apply_taxes_to_product(
-                    product,
-                    discounted_net_range.start,
-                    country,
-                    channel_slug=channel_slug,
-                ),
-                stop=manager.apply_taxes_to_product(
-                    product,
-                    discounted_net_range.stop,
-                    country,
-                    channel_slug=channel_slug,
-                ),
-            )
 
-        undiscounted = None
-        undiscounted_net_range = get_product_price_range(
-            product=product,
-            variants=variants,
-            variants_channel_listing=variants_channel_listing,
-            collections=collections,
-            discounts=[],
-            channel=channel,
+        prior = _calculate_product_price_with_taxes_range(
+            "prior_price",
+            variants_channel_listing,
+            tax_rate,
+            tax_calculation_strategy,
+            prices_entered_with_tax,
         )
-        if undiscounted_net_range is not None:
-            undiscounted = TaxedMoneyRange(
-                start=manager.apply_taxes_to_product(
-                    product,
-                    undiscounted_net_range.start,
-                    country,
-                    channel_slug=channel_slug,
-                ),
-                stop=manager.apply_taxes_to_product(
-                    product,
-                    undiscounted_net_range.stop,
-                    country,
-                    channel_slug=channel_slug,
-                ),
-            )
 
-        discount = None
-        price_range_local = None
-        discount_local_currency = None
-        if undiscounted_net_range is not None and discounted_net_range is not None:
-            discount = _get_total_discount_from_range(undiscounted, discounted)
-            price_range_local, discount_local_currency = _get_product_price_range(
-                discounted, undiscounted, local_currency
-            )
+    discount = None
+    if undiscounted is not None and discounted is not None:
+        discount = _get_total_discount_from_range(undiscounted, discounted)
 
-        is_visible = (
-            product_channel_listing is not None and product_channel_listing.is_visible
-        )
-        is_on_sale = is_visible and discount is not None
+    discount_prior = None
+    if prior is not None and discounted is not None:
+        discount_prior = _get_total_discount_from_range(prior, discounted)
 
-        return ProductAvailability(
-            on_sale=is_on_sale,
-            price_range=discounted,
-            price_range_undiscounted=undiscounted,
-            discount=discount,
-            price_range_local_currency=price_range_local,
-            discount_local_currency=discount_local_currency,
-        )
+    is_visible = (
+        product_channel_listing is not None and product_channel_listing.is_visible
+    )
+    is_on_sale = is_visible and discount is not None
+
+    return ProductAvailability(
+        on_sale=is_on_sale,
+        price_range=discounted,
+        price_range_undiscounted=undiscounted,
+        price_range_prior=prior,
+        discount=discount,
+        discount_prior=discount_prior,
+    )
 
 
 def get_variant_availability(
-    variant: ProductVariant,
+    *,
     variant_channel_listing: ProductVariantChannelListing,
-    product: Product,
-    product_channel_listing: Optional[ProductChannelListing],
-    collections: Iterable[Collection],
-    discounts: Iterable[DiscountInfo],
-    channel: Channel,
-    plugins: "PluginsManager",
-    country: Country,
-    local_currency: Optional[str] = None,
-) -> VariantAvailability:
-    with opentracing.global_tracer().start_active_span("get_variant_availability"):
-        channel_slug = channel.slug
-        discounted = plugins.apply_taxes_to_product(
-            product,
-            get_variant_price(
-                variant=variant,
-                variant_channel_listing=variant_channel_listing,
-                product=product,
-                collections=collections,
-                discounts=discounts,
-                channel=channel,
-            ),
-            country,
-            channel_slug=channel_slug,
+    product_channel_listing: ProductChannelListing | None,
+    prices_entered_with_tax: bool,
+    tax_calculation_strategy: str,
+    tax_rate: Decimal,
+) -> VariantAvailability | None:
+    if variant_channel_listing.price is None:
+        return None
+    discounted_price_taxed = _calculate_product_price_with_taxes(
+        variant_channel_listing.discounted_price,
+        tax_rate,
+        tax_calculation_strategy,
+        prices_entered_with_tax,
+    )
+    undiscounted_price = variant_channel_listing.price
+    undiscounted_price_taxed = _calculate_product_price_with_taxes(
+        undiscounted_price,
+        tax_rate,
+        tax_calculation_strategy,
+        prices_entered_with_tax,
+    )
+    prior_price = variant_channel_listing.prior_price
+    prior_price_taxed = None
+    if prior_price is not None:
+        prior_price_taxed = _calculate_product_price_with_taxes(
+            prior_price,
+            tax_rate,
+            tax_calculation_strategy,
+            prices_entered_with_tax,
         )
-        undiscounted = plugins.apply_taxes_to_product(
-            product,
-            get_variant_price(
-                variant=variant,
-                variant_channel_listing=variant_channel_listing,
-                product=product,
-                collections=collections,
-                discounts=[],
-                channel=channel,
-            ),
-            country,
-            channel_slug=channel_slug,
-        )
+    discount = _get_total_discount(undiscounted_price_taxed, discounted_price_taxed)
 
-        discount = _get_total_discount(undiscounted, discounted)
+    discount_prior = None
+    if prior_price_taxed is not None:
+        discount_prior = _get_total_discount(prior_price_taxed, discounted_price_taxed)
 
-        if local_currency:
-            price_local_currency = to_local_currency(discounted, local_currency)
-            discount_local_currency = to_local_currency(discount, local_currency)
-        else:
-            price_local_currency = None
-            discount_local_currency = None
+    is_visible = (
+        product_channel_listing is not None and product_channel_listing.is_visible
+    )
+    is_on_sale = is_visible and discount is not None
 
-        is_visible = (
-            product_channel_listing is not None and product_channel_listing.is_visible
-        )
-        is_on_sale = is_visible and discount is not None
-
-        return VariantAvailability(
-            on_sale=is_on_sale,
-            price=discounted,
-            price_undiscounted=undiscounted,
-            discount=discount,
-            price_local_currency=price_local_currency,
-            discount_local_currency=discount_local_currency,
-        )
+    return VariantAvailability(
+        on_sale=is_on_sale,
+        price=discounted_price_taxed,
+        price_undiscounted=undiscounted_price_taxed,
+        price_prior=prior_price_taxed,
+        discount=discount,
+        discount_prior=discount_prior,
+    )

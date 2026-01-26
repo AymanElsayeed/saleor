@@ -1,33 +1,37 @@
-import io
-from contextlib import redirect_stdout
 from unittest.mock import Mock, patch
 from urllib.parse import urljoin
 
 import pytest
-from django.core.files.storage import default_storage
 from django.core.management import CommandError, call_command
 from django.db.utils import DataError
 from django.templatetags.static import static
 from django.test import RequestFactory, override_settings
-from django_countries.fields import Country
 
 from ...account.models import Address, User
 from ...account.utils import create_superuser
+from ...attribute.models import AttributeValue
 from ...channel.models import Channel
-from ...discount.models import Sale, SaleChannelListing, Voucher, VoucherChannelListing
-from ...giftcard.models import GiftCard
+from ...discount.models import (
+    Promotion,
+    PromotionRule,
+    Voucher,
+    VoucherChannelListing,
+    VoucherCode,
+)
+from ...giftcard.models import GiftCard, GiftCardEvent
 from ...order.models import Order
-from ...product.models import ProductMedia, ProductType
+from ...payment.models import TransactionItem
+from ...product import ProductTypeKind
+from ...product.models import ProductType
 from ...shipping.models import ShippingZone
 from ..storages import S3MediaStorage
-from ..templatetags.placeholder import placeholder
 from ..utils import (
     build_absolute_uri,
-    create_thumbnails,
-    delete_versatile_image,
     generate_unique_slug,
     get_client_ip,
-    get_currency_for_country,
+    get_domain,
+    is_ssl_enabled,
+    prepare_unique_attribute_value_slug,
     random_data,
 )
 
@@ -46,7 +50,7 @@ type_schema = {
 
 
 @pytest.mark.parametrize(
-    "ip_address, expected_ip",
+    ("ip_address", "expected_ip"),
     [
         ("83.0.0.1", "83.0.0.1"),
         ("::1", "::1"),
@@ -57,22 +61,10 @@ type_schema = {
     ],
 )
 def test_get_client_ip(ip_address, expected_ip):
-    """Test providing a valid IP in X-Forwarded-For returns the valid IP.
-    Otherwise, if no valid IP were found, returns the requester's IP.
-    """
     expected_ip = expected_ip
     headers = {"HTTP_X_FORWARDED_FOR": ip_address} if ip_address else {}
     request = RequestFactory(**headers).get("/")
     assert get_client_ip(request) == expected_ip
-
-
-@pytest.mark.parametrize(
-    "country, expected_currency",
-    [(Country("PL"), "PLN"), (Country("US"), "USD"), (Country("GB"), "GBP")],
-)
-def test_get_currency_for_country(country, expected_currency, monkeypatch):
-    currency = get_currency_for_country(country.code)
-    assert currency == expected_currency
 
 
 def test_create_superuser(db, client, media_root):
@@ -145,26 +137,37 @@ def test_create_fake_order(db, monkeypatch, image, media_root, warehouse):
         pass
     for _ in random_data.create_users("password", 3):
         pass
-    for msg in random_data.create_page_type():
+    for _ in random_data.create_page_type():
         pass
-    for msg in random_data.create_pages():
+    for _ in random_data.create_pages():
         pass
     random_data.create_products_by_schema("/", False)
-    how_many = 2
-    for _ in random_data.create_orders(how_many):
+    how_many_orders = 2
+    for _ in random_data.create_orders(how_many_orders):
         pass
-    assert Order.objects.all().count() == 2
+    assert Order.objects.all().count() == how_many_orders
 
 
-def test_create_product_sales(db):
+def test_create_catalogue_promotions(db):
     how_many = 5
     channel_count = 0
     for _ in random_data.create_channels():
         channel_count += 1
-    for _ in random_data.create_product_sales(how_many):
+    for _ in random_data.create_catalogue_promotions(how_many):
         pass
-    assert Sale.objects.all().count() == how_many
-    assert SaleChannelListing.objects.all().count() == how_many * channel_count
+    assert Promotion.objects.all().count() == how_many
+    assert PromotionRule.objects.all().count() == how_many * 2
+
+
+def test_create_order_promotions(db):
+    how_many = 5
+    channel_count = 0
+    for _ in random_data.create_channels():
+        channel_count += 1
+    for _ in random_data.create_order_promotions(how_many):
+        pass
+    assert Promotion.objects.all().count() == how_many
+    assert PromotionRule.objects.all().count() == how_many * 2
 
 
 def test_create_vouchers(db):
@@ -176,45 +179,24 @@ def test_create_vouchers(db):
     for _ in random_data.create_vouchers():
         pass
     assert Voucher.objects.all().count() == voucher_count
+    assert VoucherCode.objects.all().count() == voucher_count
     assert VoucherChannelListing.objects.all().count() == voucher_count * channel_count
 
 
-def test_create_gift_card(db):
+def test_create_gift_card(
+    db, product, shippable_gift_card_product, customer_user, staff_user, order
+):
+    product = shippable_gift_card_product
+    product.name = "Gift card 100"
+    product.save(update_fields=["name"])
+
+    amount = 5
     assert GiftCard.objects.count() == 0
-    for _ in random_data.create_gift_card():
+    assert GiftCardEvent.objects.count() == 0
+    for _ in random_data.create_gift_cards(amount):
         pass
-    assert GiftCard.objects.count() == 1
-
-
-@override_settings(VERSATILEIMAGEFIELD_SETTINGS={"create_images_on_demand": False})
-def test_create_thumbnails(product_with_image, settings, monkeypatch):
-    monkeypatch.setattr("django.core.cache.cache.get", Mock(return_value=None))
-    sizeset = settings.VERSATILEIMAGEFIELD_RENDITION_KEY_SETS["products"]
-    product_image = product_with_image.media.first()
-
-    # There's no way to list images created by versatile prewarmer
-    # So we delete all created thumbnails/crops and count them
-    log_deleted_images = io.StringIO()
-    with redirect_stdout(log_deleted_images):
-        product_image.image.delete_all_created_images()
-    log_deleted_images = log_deleted_images.getvalue()
-    # Image didn't have any thumbnails/crops created, so there's no log
-    assert not log_deleted_images
-
-    create_thumbnails(product_image.pk, ProductMedia, "products")
-    log_deleted_images = io.StringIO()
-    with redirect_stdout(log_deleted_images):
-        product_image.image.delete_all_created_images()
-    log_deleted_images = log_deleted_images.getvalue()
-
-    for image_name, method_size in sizeset:
-        method, size = method_size.split("__")
-        if method == "crop":
-            assert product_image.image.crop[size].name in log_deleted_images
-        elif method == "thumbnail":
-            assert (
-                product_image.image.thumbnail[size].name in log_deleted_images
-            )  # noqa
+    assert GiftCard.objects.count() == amount * 2
+    assert GiftCardEvent.objects.count() == amount * 2
 
 
 @patch("storages.backends.s3boto3.S3Boto3Storage")
@@ -235,7 +217,7 @@ def test_storages_not_setting_s3_bucket_domain(storage, settings):
     assert storage.custom_domain is None
 
 
-def test_build_absolute_uri(site_settings, settings):
+def test_build_absolute_uri():
     # Case when we are using external service for storing static files,
     # eg. Amazon s3
     url = "https://example.com/static/images/image.jpg"
@@ -243,29 +225,93 @@ def test_build_absolute_uri(site_settings, settings):
 
     # Case when static url is resolved to relative url
     logo_url = build_absolute_uri(static("images/close.svg"))
-    protocol = "https" if settings.ENABLE_SSL else "http"
-    current_url = "%s://%s" % (protocol, site_settings.site.domain)
+    current_url = "https://example.com/"
     logo_location = urljoin(current_url, static("images/close.svg"))
     assert logo_url == logo_location
 
 
-def test_delete_sort_order_with_null_value(menu_item):
-    """Ensures there is no error when trying to delete a sortable item,
-    which triggers a shifting of the sort orders--which can be null."""
+def test_build_absolute_uri_with_host(settings):
+    settings.PUBLIC_URL = None
+    settings.ENABLE_SSL = True
+    # given
+    host = "test.com"
+    location = "images/close.svg"
 
+    # when
+    url = build_absolute_uri(location, host)
+
+    # then
+    assert url == f"https://{host}/{location}"
+
+
+@pytest.mark.parametrize(
+    "public_url", ["https://api.example.com", "http://api.example.com"]
+)
+@pytest.mark.parametrize("enable_ssl", [True, False])
+@pytest.mark.parametrize("host", [None, "test.com"])
+def test_build_absolute_uri_with_public_url(public_url, enable_ssl, host, settings):
+    # given
+    location = "images/close.svg"
+    settings.PUBLIC_URL = public_url
+    settings.ENABLE_SSL = enable_ssl
+    # when
+    url = build_absolute_uri(location, host)
+    # then
+    assert url == f"{public_url}/{location}"
+
+
+def test_build_absolute_uri_with_public_url_and_absolute_location(settings):
+    # given
+    location = "https://example.com/static/images/image.jpg"
+    settings.PUBLIC_URL = "https://api.example.com"
+    # when
+    url = build_absolute_uri(location)
+    # then
+    assert url == location
+
+
+@pytest.mark.parametrize("enable_ssl", [True, False])
+def test_is_ssl_enabled(enable_ssl, settings):
+    settings.PUBLIC_URL = None
+    # given
+    settings.ENABLE_SSL = enable_ssl
+    # then
+    assert is_ssl_enabled() == enable_ssl
+
+
+@pytest.mark.parametrize(
+    ("public_url", "expected"),
+    [("https://api.example.com", True), ("http://api.example.com", False)],
+)
+@pytest.mark.parametrize("enable_ssl", [True, False])
+def test_is_ssl_enabled_with_public_url(public_url, expected, enable_ssl, settings):
+    # given
+    settings.PUBLIC_URL = public_url
+    settings.ENABLE_SSL = enable_ssl
+    # then
+    assert is_ssl_enabled() == expected
+
+
+def test_get_domain(site_settings, settings):
+    settings.PUBLIC_URL = None
+    assert get_domain() == site_settings.site.domain
+
+
+def test_get_domain_with_public_url(site_settings, settings):
+    # given
+    domain = "api.example.com"
+    settings.PUBLIC_URL = f"https://{domain}"
+    assert get_domain() == domain
+
+
+def test_delete_sort_order_with_null_value(menu_item):
     menu_item.sort_order = None
     menu_item.save(update_fields=["sort_order"])
     menu_item.delete()
 
 
-def test_placeholder(settings):
-    size = 60
-    result = placeholder(size)
-    assert result == "/static/" + settings.PLACEHOLDER_IMAGES[size]
-
-
 @pytest.mark.parametrize(
-    "product_name, slug_result",
+    ("product_name", "slug_result"),
     [
         ("Paint", "paint"),
         ("paint", "paint-3"),
@@ -274,8 +320,10 @@ def test_placeholder(settings):
         ("Shirt", "shirt"),
         ("40.5", "405-2"),
         ("FM1+", "fm1-2"),
-        ("زيوت", "زيوت"),
-        ("わたし-わ にっぽん です", "わたし-わ-にっぽん-です-2"),
+        ("Ładny", "ladny"),
+        ("زيوت", "zywt"),
+        ("わたし-わ にっぽん です", "watasi-wa-nitupon-desu-2"),
+        ("Салеор", "saleor-2"),
     ],
 )
 def test_generate_unique_slug_with_slugable_field(
@@ -285,12 +333,17 @@ def test_generate_unique_slug_with_slugable_field(
         ("Paint", "paint"),
         ("Paint blue", "paint-blue"),
         ("Paint test", "paint-2"),
+        ("Saleor", "saleor"),
         ("405", "405"),
         ("FM1", "fm1"),
-        ("わたし わ にっぽん です", "わたし-わ-にっぽん-です"),
+        ("わたし わ にっぽん です", "watasi-wa-nitupon-desu"),
     ]
     for name, slug in product_names_and_slugs:
-        ProductType.objects.create(name=name, slug=slug)
+        ProductType.objects.create(
+            name=name,
+            slug=slug,
+            kind=ProductTypeKind.NORMAL,
+        )
 
     instance, _ = ProductType.objects.get_or_create(name=product_name)
     result = generate_unique_slug(instance, instance.name)
@@ -305,9 +358,40 @@ def test_generate_unique_slug_for_slug_with_max_characters_number(category):
         category.save()
 
 
-def test_generate_unique_slug_non_slugable_value_and_slugable_field(category):
-    with pytest.raises(Exception):
-        generate_unique_slug(category)
+def test_generate_unique_slug_with_additional_lookup_slug_not_changed(
+    color_attribute, attribute_without_values
+):
+    # given
+    value_1 = color_attribute.values.first()
+
+    # when
+    value_2 = AttributeValue(name=value_1.name, attribute=attribute_without_values)
+
+    # then
+    result = generate_unique_slug(
+        value_2,
+        value_2.name,
+        additional_search_lookup={"attribute": value_2.attribute_id},
+    )
+
+    assert result == value_1.slug
+
+
+def test_generate_unique_slug_with_additional_lookup_slug_changed(color_attribute):
+    # given
+    value_1 = color_attribute.values.first()
+
+    # when
+    value_2 = AttributeValue(name=value_1.name, attribute=color_attribute)
+
+    # then
+    result = generate_unique_slug(
+        value_2,
+        value_2.name,
+        additional_search_lookup={"attribute": value_2.attribute_id},
+    )
+
+    assert result == f"{value_1.slug}-2"
 
 
 @override_settings(DEBUG=False)
@@ -343,21 +427,37 @@ def test_cleardb_preserves_data(admin_user, app, site_settings, staff_user):
     staff_user.refresh_from_db()
 
 
-def test_delete_versatile_image(product_with_image, media_root):
-    # given
-    media = product_with_image.media.first()
-    thumb_200x200 = media.image.thumbnail["200x200"].name
-    thumb_400x400 = media.image.thumbnail["400x400"].name
-    img_name = media.image.name
+@override_settings(DEBUG=True)
+def test_cleardb_remove_orders_and_transactions(transaction_item):
+    transaction_item.refresh_from_db()
 
-    assert default_storage.exists(img_name)
-    assert default_storage.exists(thumb_200x200)
-    assert default_storage.exists(thumb_400x400)
+    call_command("cleardb")
+    with pytest.raises(TransactionItem.DoesNotExist):
+        transaction_item.refresh_from_db()
+    with pytest.raises(Order.DoesNotExist):
+        transaction_item.order.refresh_from_db()
+
+
+def test_prepare_unique_attribute_value_slug(color_attribute):
+    # given
+    value_1 = color_attribute.values.first()
 
     # when
-    delete_versatile_image(media.image)
+    value_2 = AttributeValue(
+        name=value_1.name, attribute=color_attribute, slug=value_1.slug
+    )
 
     # then
-    assert not default_storage.exists(img_name)
-    assert not default_storage.exists(thumb_400x400)
-    assert not default_storage.exists(thumb_400x400)
+    result = prepare_unique_attribute_value_slug(value_2.attribute, value_2.slug)
+
+    assert result == f"{value_1.slug}-2"
+
+
+def test_prepare_unique_attribute_value_slug_non_existing_slug(color_attribute):
+    # when
+    non_existing_slug = "non-existing-slug"
+
+    # then
+    result = prepare_unique_attribute_value_slug(color_attribute, non_existing_slug)
+
+    assert result == non_existing_slug

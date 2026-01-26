@@ -5,18 +5,19 @@ from django.db import migrations
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("warehouse", "0012_auto_20210115_1307"),
     ]
 
     operations = [
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="warehouse",
             index=django.contrib.postgres.indexes.GinIndex(
                 fields=["private_metadata"], name="warehouse_p_meta_idx"
             ),
         ),
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="warehouse",
             index=django.contrib.postgres.indexes.GinIndex(

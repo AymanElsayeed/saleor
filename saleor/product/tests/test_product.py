@@ -1,23 +1,25 @@
+import datetime
 import os
 from collections import defaultdict
-from datetime import datetime, timezone
 from decimal import Decimal
 from unittest.mock import patch
 
+import graphene
 import pytest
 from freezegun import freeze_time
 from prices import Money
 
 from ...account import events as account_events
 from ...attribute.utils import associate_attribute_values_to_instance
-from ...graphql.product.filters import (
+from ...discount import RewardValueType
+from ...discount.models import PromotionRule
+from ...graphql.product.filters.product_attributes import (
     _clean_product_attributes_boolean_filter_input,
     _clean_product_attributes_date_time_range_filter_input,
     filter_products_by_attributes_values,
 )
-from .. import models
-from ..models import DigitalContentUrl
-from ..thumbnails import create_product_thumbnails
+from .. import ProductTypeKind, models
+from ..tasks import update_variants_names
 from ..utils.costs import get_margin_for_variant_channel_listing
 from ..utils.digital_products import increment_download_count
 
@@ -34,11 +36,17 @@ def test_filtering_by_attribute(
     boolean_attribute,
 ):
     product_type_a = models.ProductType.objects.create(
-        name="New class", slug="new-class1", has_variants=True
+        name="New class",
+        slug="new-class1",
+        has_variants=True,
+        kind=ProductTypeKind.NORMAL,
     )
     product_type_a.product_attributes.add(color_attribute)
     product_type_b = models.ProductType.objects.create(
-        name="New class", slug="new-class2", has_variants=True
+        name="New class",
+        slug="new-class2",
+        has_variants=True,
+        kind=ProductTypeKind.NORMAL,
     )
     product_type_b.variant_attributes.add(color_attribute)
     product_a = models.Product.objects.create(
@@ -73,8 +81,14 @@ def test_filtering_by_attribute(
     color_2 = color_attribute.values.last()
 
     # Associate color to a product and a variant
-    associate_attribute_values_to_instance(product_a, color_attribute, color)
-    associate_attribute_values_to_instance(variant_b, color_attribute, color)
+    associate_attribute_values_to_instance(
+        product_a,
+        {color_attribute.pk: [color]},
+    )
+    associate_attribute_values_to_instance(
+        variant_b,
+        {color_attribute.pk: [color]},
+    )
 
     product_qs = models.Product.objects.all().values_list("pk", flat=True)
 
@@ -83,7 +97,10 @@ def test_filtering_by_attribute(
     assert product_a.pk in list(filtered)
     assert product_b.pk in list(filtered)
 
-    associate_attribute_values_to_instance(product_a, color_attribute, color_2)
+    associate_attribute_values_to_instance(
+        product_a,
+        {color_attribute.pk: [color_2]},
+    )
 
     filters = {color_attribute.pk: [color.pk]}
     filtered = filter_products_by_attributes_values(product_qs, filters)
@@ -105,7 +122,10 @@ def test_filtering_by_attribute(
     # Associate additional attribute to a product
     size = size_attribute.values.first()
     product_type_a.product_attributes.add(size_attribute)
-    associate_attribute_values_to_instance(product_a, size_attribute, size)
+    associate_attribute_values_to_instance(
+        product_a,
+        {size_attribute.pk: [size]},
+    )
 
     # Filter by multiple attributes
     filters = {color_attribute.pk: [color_2.pk], size_attribute.pk: [size.pk]}
@@ -117,10 +137,16 @@ def test_filtering_by_attribute(
     product_type_b.product_attributes.add(date_attribute)
 
     date = date_attribute.values.first()
-    associate_attribute_values_to_instance(product_a, date_attribute, date)
+    associate_attribute_values_to_instance(
+        product_a,
+        {date_attribute.pk: [date]},
+    )
 
     date_2 = date_attribute.values.last()
-    associate_attribute_values_to_instance(product_b, date_attribute, date_2)
+    associate_attribute_values_to_instance(
+        product_b,
+        {date_attribute.pk: [date_2]},
+    )
 
     filters = {date_attribute.pk: [date.pk]}
     filtered = filter_products_by_attributes_values(product_qs, filters)
@@ -133,67 +159,72 @@ def test_filtering_by_attribute(
 
 
 def test_clean_product_attributes_date_time_range_filter_input(
-    date_attribute, date_time_attribute
+    date_attribute, date_time_attribute, settings
 ):
     # filter date attribute
     filter_value = [
         (
             date_attribute.slug,
-            {"gte": datetime(2020, 10, 5).date()},
+            {"gte": datetime.datetime(2020, 10, 5, tzinfo=datetime.UTC)},
         )
     ]
-    queries = defaultdict(list)
-    _clean_product_attributes_date_time_range_filter_input(
-        filter_value, queries, is_date=True
+    values_qs = _clean_product_attributes_date_time_range_filter_input(
+        filter_value, settings.DATABASE_CONNECTION_DEFAULT_NAME
     )
 
-    assert dict(queries) == {
-        date_attribute.pk: list(
-            date_attribute.values.all().values_list("pk", flat=True)
-        )
-    }
+    assert set(date_attribute.values.all()) == set(values_qs.all())
 
     filter_value = [
         (
             date_attribute.slug,
-            {"gte": datetime(2020, 10, 5).date(), "lte": datetime(2020, 11, 4).date()},
+            {
+                "gte": datetime.datetime(2020, 10, 5, tzinfo=datetime.UTC).date(),
+                "lte": datetime.datetime(2020, 11, 4, tzinfo=datetime.UTC).date(),
+            },
         )
     ]
-    queries = defaultdict(list)
-    _clean_product_attributes_date_time_range_filter_input(
-        filter_value, queries, is_date=True
+    values_qs = _clean_product_attributes_date_time_range_filter_input(
+        filter_value, settings.DATABASE_CONNECTION_DEFAULT_NAME
     )
 
-    assert dict(queries) == {date_attribute.pk: [date_attribute.values.first().pk]}
+    assert {date_attribute.values.first().pk} == set(
+        values_qs.values_list("pk", flat=True)
+    )
 
     # filter date time attribute
     filter_value = [
         (
             date_attribute.slug,
-            {"lte": datetime(2020, 11, 4, tzinfo=timezone.utc)},
+            {"lte": datetime.datetime(2020, 11, 4, tzinfo=datetime.UTC)},
         )
     ]
-    queries = defaultdict(list)
-    _clean_product_attributes_date_time_range_filter_input(filter_value, queries)
+    values_qs = _clean_product_attributes_date_time_range_filter_input(
+        filter_value, settings.DATABASE_CONNECTION_DEFAULT_NAME
+    )
 
-    assert dict(queries) == {date_attribute.pk: [date_attribute.values.first().pk]}
+    assert {date_attribute.values.first().pk} == set(
+        values_qs.values_list("pk", flat=True)
+    )
 
     filter_value = [
         (
             date_attribute.slug,
-            {"lte": datetime(2020, 10, 4, tzinfo=timezone.utc)},
+            {"lte": datetime.datetime(2020, 10, 4, tzinfo=datetime.UTC)},
         )
     ]
-    queries = defaultdict(list)
-    _clean_product_attributes_date_time_range_filter_input(filter_value, queries)
+    values_qs = _clean_product_attributes_date_time_range_filter_input(
+        filter_value, settings.DATABASE_CONNECTION_DEFAULT_NAME
+    )
 
-    assert dict(queries) == {date_attribute.pk: []}
+    assert values_qs.exists() is False
 
 
-def test_clean_product_attributes_boolean_filter_input(boolean_attribute):
+def test_clean_product_attributes_boolean_filter_input(boolean_attribute, settings):
     filter_value = [(boolean_attribute.slug, True)]
     queries = defaultdict(list)
-    _clean_product_attributes_boolean_filter_input(filter_value, queries)
+    _clean_product_attributes_boolean_filter_input(
+        filter_value, queries, settings.DATABASE_CONNECTION_DEFAULT_NAME
+    )
 
     assert dict(queries) == {
         boolean_attribute.pk: [boolean_attribute.values.first().pk]
@@ -201,13 +232,17 @@ def test_clean_product_attributes_boolean_filter_input(boolean_attribute):
 
     filter_value = [(boolean_attribute.slug, False)]
     queries = defaultdict(list)
-    _clean_product_attributes_boolean_filter_input(filter_value, queries)
+    _clean_product_attributes_boolean_filter_input(
+        filter_value, queries, settings.DATABASE_CONNECTION_DEFAULT_NAME
+    )
 
     assert dict(queries) == {boolean_attribute.pk: [boolean_attribute.values.last().pk]}
 
     filter_value = [(boolean_attribute.slug, True), (boolean_attribute.slug, False)]
     queries = defaultdict(list)
-    _clean_product_attributes_boolean_filter_input(filter_value, queries)
+    _clean_product_attributes_boolean_filter_input(
+        filter_value, queries, settings.DATABASE_CONNECTION_DEFAULT_NAME
+    )
 
     assert dict(queries) == {
         boolean_attribute.pk: list(
@@ -217,19 +252,21 @@ def test_clean_product_attributes_boolean_filter_input(boolean_attribute):
 
 
 @pytest.mark.parametrize(
-    "expected_price, include_discounts",
-    [(Decimal("10.00"), True), (Decimal("15.0"), False)],
+    ("price", "discounted_price"),
+    [
+        (Decimal("10.00"), Decimal("8.00")),
+        (Decimal("10.00"), None),
+        (Decimal("10.00"), Decimal("10.00")),
+    ],
 )
 def test_get_price(
+    price,
+    discounted_price,
     product_type,
     category,
-    sale,
-    expected_price,
-    include_discounts,
-    site_settings,
-    discount_info,
     channel_USD,
 ):
+    # given
     product = models.Product.objects.create(
         product_type=product_type,
         category=category,
@@ -238,39 +275,129 @@ def test_get_price(
     channel_listing = models.ProductVariantChannelListing.objects.create(
         variant=variant,
         channel=channel_USD,
-        price_amount=Decimal(15),
+        price_amount=price,
+        discounted_price_amount=discounted_price,
         currency=channel_USD.currency_code,
     )
-    discounts = [discount_info] if include_discounts else []
-    price = variant.get_price(product, [], channel_USD, channel_listing, discounts)
-    assert price.amount == expected_price
+
+    # when
+    price = variant.get_price(channel_listing)
+
+    # then
+    assert price.amount == discounted_price or price
 
 
-def test_product_get_price_do_not_charge_taxes(
-    product_type, category, discount_info, channel_USD
+def test_get_price_overridden_price_no_discount(
+    product_type,
+    category,
+    channel_USD,
 ):
+    # given
     product = models.Product.objects.create(
         product_type=product_type,
         category=category,
-        charge_taxes=False,
     )
     variant = product.variants.create()
+    price_amount = Decimal(15)
     channel_listing = models.ProductVariantChannelListing.objects.create(
         variant=variant,
         channel=channel_USD,
-        price_amount=Decimal(10),
+        price_amount=price_amount,
         currency=channel_USD.currency_code,
     )
-    price = variant.get_price(
-        product, [], channel_USD, channel_listing, discounts=[discount_info]
+    price_override = Decimal(10)
+
+    # when
+    price = variant.get_price(channel_listing, price_override=price_override)
+
+    # then
+    assert price.amount == price_override
+
+
+def test_get_price_overridden_price_with_discount(
+    product_type,
+    category,
+    channel_USD,
+    catalogue_promotion_without_rules,
+):
+    # given
+    product = models.Product.objects.create(
+        product_type=product_type,
+        category=category,
     )
-    assert price == Money("5.00", "USD")
+    variant = product.variants.create()
+    price_amount = Decimal(15)
+    channel_listing = models.ProductVariantChannelListing.objects.create(
+        variant=variant,
+        channel=channel_USD,
+        price_amount=price_amount,
+        currency=channel_USD.currency_code,
+    )
+    price_override = Decimal(20)
+
+    reward_value_1 = Decimal(10)
+    reward_value_2 = Decimal(5)
+    rule_1, rule_2 = PromotionRule.objects.bulk_create(
+        [
+            PromotionRule(
+                promotion=catalogue_promotion_without_rules,
+                catalogue_predicate={
+                    "productPredicate": {
+                        "ids": [
+                            graphene.Node.to_global_id("Product", variant.product.id)
+                        ]
+                    }
+                },
+                reward_value_type=RewardValueType.PERCENTAGE,
+                reward_value=reward_value_1,
+            ),
+            PromotionRule(
+                promotion=catalogue_promotion_without_rules,
+                catalogue_predicate={
+                    "variantPredicate": {
+                        "ids": [
+                            graphene.Node.to_global_id(
+                                "ProductVariant", variant.product.id
+                            )
+                        ]
+                    }
+                },
+                reward_value_type=RewardValueType.FIXED,
+                reward_value=reward_value_2,
+            ),
+        ]
+    )
+
+    models.VariantChannelListingPromotionRule.objects.bulk_create(
+        [
+            models.VariantChannelListingPromotionRule(
+                variant_channel_listing=channel_listing,
+                promotion_rule=rule_1,
+                discount_amount=reward_value_1,
+                currency=channel_USD.currency_code,
+            ),
+            models.VariantChannelListingPromotionRule(
+                variant_channel_listing=channel_listing,
+                promotion_rule=rule_2,
+                discount_amount=reward_value_2,
+                currency=channel_USD.currency_code,
+            ),
+        ]
+    )
+
+    # when
+    price = variant.get_price(
+        channel_listing, price_override=price_override, promotion_rules=[rule_1, rule_2]
+    )
+
+    # then
+    assert price.amount == price_override - reward_value_2 - (
+        reward_value_1 / 100 * price_override
+    )
 
 
 def test_digital_product_view(client, digital_content_url):
-    """Ensure a user (anonymous or not) can download a non-expired digital good
-    using its associated token and that all associated events
-    are correctly generated."""
+    """Ensure a non-expired digital good can be downloaded and results in an event."""
 
     url = digital_content_url.get_absolute_url()
     response = client.get(url)
@@ -278,7 +405,7 @@ def test_digital_product_view(client, digital_content_url):
 
     assert response.status_code == 200
     assert response["content-type"] == "image/jpeg"
-    assert response["content-disposition"] == 'attachment; filename="%s"' % filename
+    assert response["content-disposition"] == f'attachment; filename="{filename}"'
 
     # Ensure an event was generated from downloading a digital good.
     # The validity of this event is checked in test_digital_product_increment_download
@@ -286,17 +413,16 @@ def test_digital_product_view(client, digital_content_url):
 
 
 @pytest.mark.parametrize(
-    "is_user_null, is_line_null", ((False, False), (False, True), (True, True))
+    ("is_user_null", "is_line_null"), [(False, False), (False, True), (True, True)]
 )
 def test_digital_product_increment_download(
     client,
     customer_user,
-    digital_content_url: DigitalContentUrl,
+    digital_content_url: models.DigitalContentUrl,
     is_user_null,
     is_line_null,
 ):
-    """Ensure downloading a digital good is possible without it
-    being associated to an order line/user."""
+    """Ensure a digital good can be downloaded without it belonging to an order or user."""
 
     expected_user = customer_user
 
@@ -323,14 +449,18 @@ def test_digital_product_increment_download(
     assert download_event.type == account_events.CustomerEvents.DIGITAL_LINK_DOWNLOADED
     assert download_event.user == expected_user
     assert download_event.order == digital_content_url.line.order
-    assert download_event.parameters == {"order_line_pk": digital_content_url.line.pk}
+    assert download_event.parameters == {
+        "order_line_pk": str(digital_content_url.line.pk)
+    }
 
 
 def test_digital_product_view_url_downloaded_max_times(client, digital_content):
     digital_content.use_default_settings = False
     digital_content.max_downloads = 1
     digital_content.save()
-    digital_content_url = DigitalContentUrl.objects.create(content=digital_content)
+    digital_content_url = models.DigitalContentUrl.objects.create(
+        content=digital_content
+    )
 
     url = digital_content_url.get_absolute_url()
     response = client.get(url)
@@ -349,7 +479,9 @@ def test_digital_product_view_url_expired(client, digital_content):
     digital_content.save()
 
     with freeze_time("2018-05-31 12:00:01"):
-        digital_content_url = DigitalContentUrl.objects.create(content=digital_content)
+        digital_content_url = models.DigitalContentUrl.objects.create(
+            content=digital_content
+        )
 
     url = digital_content_url.get_absolute_url()
     response = client.get(url)
@@ -358,7 +490,8 @@ def test_digital_product_view_url_expired(client, digital_content):
 
 
 @pytest.mark.parametrize(
-    "price, cost", [(Money("0", "USD"), Money("1", "USD")), (Money("2", "USD"), None)]
+    ("price", "cost"),
+    [(Money("0", "USD"), Money("1", "USD")), (Money("2", "USD"), None)],
 )
 def test_costs_get_margin_for_variant_channel_listing(
     variant, price, cost, channel_USD
@@ -371,14 +504,21 @@ def test_costs_get_margin_for_variant_channel_listing(
     assert not get_margin_for_variant_channel_listing(variant_channel_listing)
 
 
-@patch("saleor.product.thumbnails.create_thumbnails")
-def test_create_product_thumbnails(mock_create_thumbnails, product_with_image):
-    product_image = product_with_image.media.first()
-    create_product_thumbnails(product_image.pk)
-    assert mock_create_thumbnails.call_count == 1
-    args, kwargs = mock_create_thumbnails.call_args
-    assert kwargs == {
-        "model": models.ProductMedia,
-        "pk": product_image.pk,
-        "size_set": "products",
-    }
+@patch("saleor.product.signals.delete_from_storage_task.delay")
+def test_product_media_delete(delete_from_storage_task_mock, product_with_image):
+    # given
+    media = product_with_image.media.first()
+
+    # when
+    media.delete()
+
+    # then
+    delete_from_storage_task_mock.assert_called_once_with(media.image.name)
+
+
+@patch("saleor.product.tasks._update_variants_names")
+def test_product_update_variants_names(mock__update_variants_names, product_type):
+    variant_attributes = [product_type.variant_attributes.first()]
+    variant_attr_ids = [attr.pk for attr in variant_attributes]
+    update_variants_names(product_type.pk, variant_attr_ids)
+    assert mock__update_variants_names.call_count == 1

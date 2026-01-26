@@ -1,19 +1,25 @@
-from graphql.utils import schema_printer
+import pillow_avif  # noqa: F401 # imported for side effects
 
 from .celeryconf import app as celery_app
 
 __all__ = ["celery_app"]
-__version__ = "dev"
+__version__ = "3.23.0-a.0"
 
 
-def patched_print_object(type):
-    interfaces = type.interfaces
-    implemented_interfaces = (
-        " implements {}".format(" & ".join(i.name for i in interfaces))
-        if interfaces
-        else ""
-    )
+class PatchedSubscriberExecutionContext:
+    __slots__ = "exe_context", "errors"
 
-    return ("type {}{} {{\n" "{}\n" "}}").format(
-        type.name, implemented_interfaces, schema_printer._print_fields(type)
-    )
+    def __init__(self, exe_context):
+        self.exe_context = exe_context
+        self.errors = self.exe_context.errors
+
+    def reset(self):
+        self.errors = []
+
+    def __getattr__(self, name):
+        return getattr(self.exe_context, name)
+
+
+_major, _minor, _ = __version__.split(".", 2)
+schema_version = f"{_major}.{_minor}"
+user_agent_version = f"Saleor/{schema_version}"

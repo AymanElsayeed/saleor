@@ -1,86 +1,91 @@
 import datetime
-from typing import TYPE_CHECKING, Iterable, Optional, Union
+from collections.abc import Iterable
+from decimal import Decimal
+from typing import Optional
 from uuid import uuid4
 
+import graphene
 from django.conf import settings
-from django.contrib.postgres.aggregates import StringAgg
-from django.contrib.postgres.indexes import GinIndex
+from django.contrib.postgres.indexes import BTreeIndex, GinIndex
 from django.contrib.postgres.search import SearchVectorField
-from django.db import models
-from django.db.models import JSONField  # type: ignore
-from django.db.models import (
-    BooleanField,
-    Case,
-    Count,
-    DateField,
-    Exists,
-    ExpressionWrapper,
-    F,
-    FilteredRelation,
-    OuterRef,
-    Q,
-    Subquery,
-    Sum,
-    TextField,
-    Value,
-    When,
-)
-from django.db.models.functions import Coalesce
+from django.core.validators import MinValueValidator
+from django.db import models, transaction
+from django.db.models import JSONField, TextField
 from django.urls import reverse
-from django.utils.encoding import smart_text
+from django.utils import timezone
 from django_measurement.models import MeasurementField
-from django_prices.models import MoneyField
 from measurement.measures import Weight
 from mptt.managers import TreeManager
 from mptt.models import MPTTModel
-from versatileimagefield.fields import PPOIField, VersatileImageField
+from prices import Money
 
-from ..account.utils import requestor_is_staff_member_or_app
 from ..channel.models import Channel
-from ..core.db.fields import SanitizedJSONField
-from ..core.models import ModelWithMetadata, PublishableModel, SortableModel
-from ..core.permissions import ProductPermissions, ProductTypePermissions
+from ..core.db.fields import MoneyField, SanitizedJSONField
+from ..core.models import (
+    ModelWithExternalReference,
+    ModelWithMetadata,
+    PublishableModel,
+    SortableModel,
+)
 from ..core.units import WeightUnits
 from ..core.utils import build_absolute_uri
-from ..core.utils.draftjs import json_content_to_raw_text
 from ..core.utils.editorjs import clean_editor_js
-from ..core.utils.translations import Translation, TranslationProxy
+from ..core.utils.translations import Translation, get_translation
 from ..core.weight import zero_weight
-from ..discount import DiscountInfo
-from ..discount.utils import calculate_discounted_price
-from ..seo.models import SeoModel, SeoModelTranslation
-from . import ProductMediaTypes
+from ..discount.models import PromotionRule
+from ..permission.enums import (
+    DiscountPermissions,
+    OrderPermissions,
+    ProductPermissions,
+    ProductTypePermissions,
+)
+from ..seo.models import SeoModel, SeoModelTranslationWithSlug
+from ..tax.models import TaxClass
+from . import ProductMediaTypes, ProductTypeKind, managers
 
-if TYPE_CHECKING:
-    # flake8: noqa
-    from django.db.models import OrderBy
-    from prices import Money
-
-    from ..account.models import User
-    from ..app.models import App
+ALL_PRODUCTS_PERMISSIONS = [
+    # List of permissions, where each of them allows viewing all products
+    # (including unpublished).
+    OrderPermissions.MANAGE_ORDERS,
+    DiscountPermissions.MANAGE_DISCOUNTS,
+    ProductPermissions.MANAGE_PRODUCTS,
+]
 
 
 class Category(ModelWithMetadata, MPTTModel, SeoModel):
     name = models.CharField(max_length=250)
     slug = models.SlugField(max_length=255, unique=True, allow_unicode=True)
     description = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editor_js)
+    description_plaintext = TextField(blank=True)
+    updated_at = models.DateTimeField(auto_now=True, blank=True, null=True)
     parent = models.ForeignKey(
         "self", null=True, blank=True, related_name="children", on_delete=models.CASCADE
     )
-    background_image = VersatileImageField(
+    background_image = models.ImageField(
         upload_to="category-backgrounds", blank=True, null=True
     )
     background_image_alt = models.CharField(max_length=128, blank=True)
 
     objects = models.Manager()
-    tree = TreeManager()
-    translated = TranslationProxy()
+    tree = TreeManager()  # type: ignore[django-manager-missing]
+
+    class Meta:
+        indexes = [
+            *ModelWithMetadata.Meta.indexes,
+            GinIndex(
+                name="category_search_name_slug_gin",
+                # `opclasses` and `fields` should be the same length
+                fields=["name", "slug", "description_plaintext"],
+                opclasses=["gin_trgm_ops"] * 3,
+            ),
+            BTreeIndex(fields=["updated_at"], name="updated_at_idx"),
+        ]
 
     def __str__(self) -> str:
         return self.name
 
 
-class CategoryTranslation(SeoModelTranslation):
+class CategoryTranslation(SeoModelTranslationWithSlug):
     category = models.ForeignKey(
         Category, related_name="translations", on_delete=models.CASCADE
     )
@@ -88,6 +93,12 @@ class CategoryTranslation(SeoModelTranslation):
     description = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editor_js)
 
     class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["language_code", "slug"],
+                name="uniq_lang_slug_categorytransl",
+            ),
+        ]
         unique_together = (("language_code", "category"),)
 
     def __str__(self) -> str:
@@ -95,12 +106,7 @@ class CategoryTranslation(SeoModelTranslation):
 
     def __repr__(self) -> str:
         class_ = type(self)
-        return "%s(pk=%r, name=%r, category_pk=%r)" % (
-            class_.__name__,
-            self.pk,
-            self.name,
-            self.category_id,
-        )
+        return f"{class_.__name__}(pk={self.pk!r}, name={self.name!r}, category_pk={self.category_id!r})"
 
     def get_translated_object_id(self):
         return "Category", self.category_id
@@ -119,13 +125,21 @@ class CategoryTranslation(SeoModelTranslation):
 class ProductType(ModelWithMetadata):
     name = models.CharField(max_length=250)
     slug = models.SlugField(max_length=255, unique=True, allow_unicode=True)
+    kind = models.CharField(max_length=32, choices=ProductTypeKind.CHOICES)
     has_variants = models.BooleanField(default=True)
     is_shipping_required = models.BooleanField(default=True)
     is_digital = models.BooleanField(default=False)
     weight = MeasurementField(
         measurement=Weight,
-        unit_choices=WeightUnits.CHOICES,  # type: ignore
+        unit_choices=WeightUnits.CHOICES,
         default=zero_weight,
+    )
+    tax_class = models.ForeignKey(
+        TaxClass,
+        related_name="product_types",
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
     )
 
     class Meta(ModelWithMetadata.Meta):
@@ -137,215 +151,24 @@ class ProductType(ModelWithMetadata):
                 "Manage product types and attributes.",
             ),
         )
+        indexes = [
+            *ModelWithMetadata.Meta.indexes,
+            GinIndex(
+                name="product_type_search_gin",
+                # `opclasses` and `fields` should be the same length
+                fields=["name", "slug"],
+                opclasses=["gin_trgm_ops"] * 2,
+            ),
+        ]
 
     def __str__(self) -> str:
         return self.name
 
     def __repr__(self) -> str:
-        class_ = type(self)
-        return "<%s.%s(pk=%r, name=%r)>" % (
-            class_.__module__,
-            class_.__name__,
-            self.pk,
-            self.name,
-        )
+        return f"<ProductType: pk={self.pk!r}, name={self.name!r}>"
 
 
-class ProductsQueryset(models.QuerySet):
-    def published(self, channel_slug: str):
-        today = datetime.date.today()
-        channels = Channel.objects.filter(
-            slug=str(channel_slug), is_active=True
-        ).values("id")
-        channel_listings = ProductChannelListing.objects.filter(
-            Q(publication_date__lte=today) | Q(publication_date__isnull=True),
-            Exists(channels.filter(pk=OuterRef("channel_id"))),
-            is_published=True,
-        ).values("id")
-        return self.filter(Exists(channel_listings.filter(product_id=OuterRef("pk"))))
-
-    def not_published(self, channel_slug: str):
-        today = datetime.date.today()
-        return self.annotate_publication_info(channel_slug).filter(
-            Q(publication_date__gt=today) & Q(is_published=True)
-            | Q(is_published=False)
-            | Q(is_published__isnull=True)
-        )
-
-    def published_with_variants(self, channel_slug: str):
-        published = self.published(channel_slug)
-        channels = Channel.objects.filter(
-            slug=str(channel_slug), is_active=True
-        ).values("id")
-        variant_channel_listings = ProductVariantChannelListing.objects.filter(
-            Exists(channels.filter(pk=OuterRef("channel_id"))),
-            price_amount__isnull=False,
-        ).values("id")
-        variants = ProductVariant.objects.filter(
-            Exists(variant_channel_listings.filter(variant_id=OuterRef("pk")))
-        )
-        return published.filter(Exists(variants.filter(product_id=OuterRef("pk"))))
-
-    def visible_to_user(self, requestor: Union["User", "App"], channel_slug: str):
-        if requestor_is_staff_member_or_app(requestor):
-            if channel_slug:
-                channels = Channel.objects.filter(slug=str(channel_slug)).values("id")
-                channel_listings = ProductChannelListing.objects.filter(
-                    Exists(channels.filter(pk=OuterRef("channel_id")))
-                ).values("id")
-                return self.filter(
-                    Exists(channel_listings.filter(product_id=OuterRef("pk")))
-                )
-            return self.all()
-        return self.published_with_variants(channel_slug)
-
-    def annotate_publication_info(self, channel_slug: str):
-        return self.annotate_is_published(channel_slug).annotate_publication_date(
-            channel_slug
-        )
-
-    def annotate_is_published(self, channel_slug: str):
-        query = Subquery(
-            ProductChannelListing.objects.filter(
-                product_id=OuterRef("pk"), channel__slug=str(channel_slug)
-            ).values_list("is_published")[:1]
-        )
-        return self.annotate(
-            is_published=ExpressionWrapper(query, output_field=BooleanField())
-        )
-
-    def annotate_publication_date(self, channel_slug: str):
-        query = Subquery(
-            ProductChannelListing.objects.filter(
-                product_id=OuterRef("pk"), channel__slug=str(channel_slug)
-            ).values_list("publication_date")[:1]
-        )
-        return self.annotate(
-            publication_date=ExpressionWrapper(query, output_field=DateField())
-        )
-
-    def annotate_visible_in_listings(self, channel_slug):
-        query = Subquery(
-            ProductChannelListing.objects.filter(
-                product_id=OuterRef("pk"), channel__slug=str(channel_slug)
-            ).values_list("visible_in_listings")[:1]
-        )
-        return self.annotate(
-            visible_in_listings=ExpressionWrapper(query, output_field=BooleanField())
-        )
-
-    def sort_by_attribute(
-        self, attribute_pk: Union[int, str], descending: bool = False
-    ):
-        """Sort a query set by the values of the given product attribute.
-
-        :param attribute_pk: The database ID (must be a numeric) of the attribute
-                             to sort by.
-        :param descending: The sorting direction.
-        """
-        from ..attribute.models import AttributeProduct, AttributeValue
-
-        qs: models.QuerySet = self
-        # If the passed attribute ID is valid, execute the sorting
-        if not (isinstance(attribute_pk, int) or attribute_pk.isnumeric()):
-            return qs.annotate(
-                concatenated_values_order=Value(
-                    None, output_field=models.IntegerField()
-                ),
-                concatenated_values=Value(None, output_field=models.CharField()),
-            )
-
-        # Retrieve all the products' attribute data IDs (assignments) and
-        # product types that have the given attribute associated to them
-        associated_values = tuple(
-            AttributeProduct.objects.filter(attribute_id=attribute_pk).values_list(
-                "pk", "product_type_id"
-            )
-        )
-
-        if not associated_values:
-            qs = qs.annotate(
-                concatenated_values_order=Value(
-                    None, output_field=models.IntegerField()
-                ),
-                concatenated_values=Value(None, output_field=models.CharField()),
-            )
-
-        else:
-            attribute_associations, product_types_associated_to_attribute = zip(
-                *associated_values
-            )
-
-            qs = qs.annotate(
-                # Contains to retrieve the attribute data (singular) of each product
-                # Refer to `AttributeProduct`.
-                filtered_attribute=FilteredRelation(
-                    relation_name="attributes",
-                    condition=Q(attributes__assignment_id__in=attribute_associations),
-                ),
-                # Implicit `GROUP BY` required for the `StringAgg` aggregation
-                grouped_ids=Count("id"),
-                # String aggregation of the attribute's values to efficiently sort them
-                concatenated_values=Case(
-                    # If the product has no association data but has
-                    # the given attribute associated to its product type,
-                    # then consider the concatenated values as empty (non-null).
-                    When(
-                        Q(product_type_id__in=product_types_associated_to_attribute)
-                        & Q(filtered_attribute=None),
-                        then=models.Value(""),
-                    ),
-                    default=StringAgg(
-                        F("filtered_attribute__values__name"),
-                        delimiter=",",
-                        ordering=(
-                            [
-                                f"filtered_attribute__values__{field_name}"
-                                for field_name in AttributeValue._meta.ordering or []
-                            ]
-                        ),
-                    ),
-                    output_field=models.CharField(),
-                ),
-                concatenated_values_order=Case(
-                    # Make the products having no such attribute be last in the sorting
-                    When(concatenated_values=None, then=2),
-                    # Put the products having an empty attribute value at the bottom of
-                    # the other products.
-                    When(concatenated_values="", then=1),
-                    # Put the products having an attribute value to be always at the top
-                    default=0,
-                    output_field=models.IntegerField(),
-                ),
-            )
-
-        # Sort by concatenated_values_order then
-        # Sort each group of products (0, 1, 2, ...) per attribute values
-        # Sort each group of products by name,
-        # if they have the same values or not values
-        ordering = "-" if descending else ""
-        return qs.order_by(
-            f"{ordering}concatenated_values_order",
-            f"{ordering}concatenated_values",
-            f"{ordering}name",
-        )
-
-    def prefetched_for_webhook(self, single_object=True):
-        common_fields = (
-            "attributes__values",
-            "attributes__assignment__attribute",
-            "media",
-            "variants__attributes__values",
-            "variants__attributes__assignment__attribute",
-            "variants__variant_media__media",
-            "variants__stocks__allocations",
-        )
-        if single_object:
-            return self.prefetch_related(*common_fields)
-        return self.prefetch_related("collections", "category", *common_fields)
-
-
-class Product(SeoModel, ModelWithMetadata):
+class Product(SeoModel, ModelWithMetadata, ModelWithExternalReference):
     product_type = models.ForeignKey(
         ProductType, related_name="products", on_delete=models.CASCADE
     )
@@ -353,7 +176,9 @@ class Product(SeoModel, ModelWithMetadata):
     slug = models.SlugField(max_length=255, unique=True, allow_unicode=True)
     description = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editor_js)
     description_plaintext = TextField(blank=True)
-    search_vector = SearchVectorField(null=True, blank=True)
+    search_document = models.TextField(blank=True, default="")
+    search_vector = SearchVectorField(blank=True, null=True)
+    search_index_dirty = models.BooleanField(default=False, db_index=True)
 
     category = models.ForeignKey(
         Category,
@@ -362,11 +187,11 @@ class Product(SeoModel, ModelWithMetadata):
         null=True,
         blank=True,
     )
-    updated_at = models.DateTimeField(auto_now=True, null=True)
-    charge_taxes = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True, db_index=True)
     weight = MeasurementField(
         measurement=Weight,
-        unit_choices=WeightUnits.CHOICES,  # type: ignore
+        unit_choices=WeightUnits.CHOICES,
         blank=True,
         null=True,
     )
@@ -378,9 +203,15 @@ class Product(SeoModel, ModelWithMetadata):
         related_name="+",
     )
     rating = models.FloatField(null=True, blank=True)
+    tax_class = models.ForeignKey(
+        TaxClass,
+        related_name="products",
+        blank=True,
+        null=True,
+        on_delete=models.SET_NULL,
+    )
 
-    objects = models.Manager.from_queryset(ProductsQueryset)()
-    translated = TranslationProxy()
+    objects = managers.ProductManager()
 
     class Meta:
         app_label = "product"
@@ -388,7 +219,25 @@ class Product(SeoModel, ModelWithMetadata):
         permissions = (
             (ProductPermissions.MANAGE_PRODUCTS.codename, "Manage products."),
         )
-        indexes = [GinIndex(fields=["search_vector"])]
+        indexes = [
+            GinIndex(
+                name="product_search_gin",
+                fields=["search_document"],
+                opclasses=["gin_trgm_ops"],
+            ),
+            GinIndex(
+                name="product_tsearch",
+                fields=["search_vector"],
+            ),
+            GinIndex(
+                name="product_gin",
+                fields=["name", "slug"],
+                opclasses=["gin_trgm_ops"] * 2,
+            ),
+            models.Index(
+                fields=["category_id", "slug"],
+            ),
+        ]
         indexes.extend(ModelWithMetadata.Meta.indexes)
 
     def __iter__(self):
@@ -397,20 +246,10 @@ class Product(SeoModel, ModelWithMetadata):
         return iter(getattr(self, "__variants"))
 
     def __repr__(self) -> str:
-        class_ = type(self)
-        return "<%s.%s(pk=%r, name=%r)>" % (
-            class_.__module__,
-            class_.__name__,
-            self.pk,
-            self.name,
-        )
+        return f"<Product: pk={self.pk!r}, name={self.name!r}>"
 
     def __str__(self) -> str:
         return self.name
-
-    @property
-    def plain_text_description(self) -> str:
-        return json_content_to_raw_text(self.description)
 
     def get_first_image(self):
         all_media = self.media.all()
@@ -422,7 +261,7 @@ class Product(SeoModel, ModelWithMetadata):
         return ["concatenated_values_order", "concatenated_values", "name"]
 
 
-class ProductTranslation(SeoModelTranslation):
+class ProductTranslation(SeoModelTranslationWithSlug):
     product = models.ForeignKey(
         Product, related_name="translations", on_delete=models.CASCADE
     )
@@ -430,6 +269,12 @@ class ProductTranslation(SeoModelTranslation):
     description = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editor_js)
 
     class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["language_code", "slug"],
+                name="uniq_lang_slug_producttransl",
+            ),
+        ]
         unique_together = (("language_code", "product"),)
 
     def __str__(self) -> str:
@@ -437,12 +282,7 @@ class ProductTranslation(SeoModelTranslation):
 
     def __repr__(self) -> str:
         class_ = type(self)
-        return "%s(pk=%r, name=%r, product_pk=%r)" % (
-            class_.__name__,
-            self.pk,
-            self.name,
-            self.product_id,
-        )
+        return f"{class_.__name__}(pk={self.pk!r}, name={self.name!r}, product_pk={self.product_id!r})"
 
     def get_translated_object_id(self):
         return "Product", self.product_id
@@ -456,29 +296,6 @@ class ProductTranslation(SeoModelTranslation):
             }
         )
         return translated_keys
-
-
-class ProductVariantQueryset(models.QuerySet):
-    def annotate_quantities(self):
-        return self.annotate(
-            quantity=Coalesce(Sum("stocks__quantity"), 0),
-            quantity_allocated=Coalesce(
-                Sum("stocks__allocations__quantity_allocated"), 0
-            ),
-        )
-
-    def available_in_channel(self, channel_slug):
-        return self.filter(
-            channel_listings__price_amount__isnull=False,
-            channel_listings__channel__slug=str(channel_slug),
-        )
-
-    def prefetched_for_webhook(self):
-        return self.prefetch_related(
-            "attributes__values",
-            "attributes__assignment__attribute",
-            "variant_media__media",
-        )
 
 
 class ProductChannelListing(PublishableModel):
@@ -497,7 +314,7 @@ class ProductChannelListing(PublishableModel):
         on_delete=models.CASCADE,
     )
     visible_in_listings = models.BooleanField(default=False)
-    available_for_purchase = models.DateField(blank=True, null=True)
+    available_for_purchase_at = models.DateTimeField(blank=True, null=True)
     currency = models.CharField(max_length=settings.DEFAULT_CURRENCY_CODE_LENGTH)
     discounted_price_amount = models.DecimalField(
         max_digits=settings.DEFAULT_MAX_DIGITS,
@@ -508,62 +325,110 @@ class ProductChannelListing(PublishableModel):
     discounted_price = MoneyField(
         amount_field="discounted_price_amount", currency_field="currency"
     )
+    discounted_price_dirty = models.BooleanField(default=False)
 
     class Meta:
         unique_together = [["product", "channel"]]
         ordering = ("pk",)
         indexes = [
-            models.Index(fields=["publication_date"]),
+            models.Index(fields=["published_at"]),
+            BTreeIndex(fields=["discounted_price_amount"]),
         ]
 
     def is_available_for_purchase(self):
         return (
-            self.available_for_purchase is not None
-            and datetime.date.today() >= self.available_for_purchase
+            self.available_for_purchase_at is not None
+            and datetime.datetime.now(tz=datetime.UTC) >= self.available_for_purchase_at
         )
 
 
-class ProductVariant(SortableModel, ModelWithMetadata):
-    sku = models.CharField(max_length=255, unique=True)
+class ProductVariant(SortableModel, ModelWithMetadata, ModelWithExternalReference):
+    sku = models.CharField(max_length=255, unique=True, null=True, blank=True)
     name = models.CharField(max_length=255, blank=True)
     product = models.ForeignKey(
         Product, related_name="variants", on_delete=models.CASCADE
     )
-    media = models.ManyToManyField("ProductMedia", through="VariantMedia")
+    media = models.ManyToManyField(
+        "product.ProductMedia", through="product.VariantMedia"
+    )
     track_inventory = models.BooleanField(default=True)
+    is_preorder = models.BooleanField(default=False)
+    preorder_end_date = models.DateTimeField(null=True, blank=True)
+    preorder_global_threshold = models.IntegerField(blank=True, null=True)
+    quantity_limit_per_customer = models.IntegerField(
+        blank=True, null=True, validators=[MinValueValidator(1)]
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True, db_index=True)
 
     weight = MeasurementField(
         measurement=Weight,
-        unit_choices=WeightUnits.CHOICES,  # type: ignore
+        unit_choices=WeightUnits.CHOICES,
         blank=True,
         null=True,
     )
 
-    objects = models.Manager.from_queryset(ProductVariantQueryset)()
-    translated = TranslationProxy()
+    objects = managers.ProductVariantManager()
 
     class Meta(ModelWithMetadata.Meta):
         ordering = ("sort_order", "sku")
         app_label = "product"
+        indexes = [
+            *ModelWithMetadata.Meta.indexes,
+            GinIndex(
+                name="variant_gin",
+                fields=["name", "sku"],
+                opclasses=["gin_trgm_ops"] * 2,
+            ),
+        ]
 
     def __str__(self) -> str:
-        return self.name or self.sku
+        return self.name or self.sku or f"ID:{self.pk}"
+
+    def get_global_id(self):
+        return graphene.Node.to_global_id("ProductVariant", self.id)
+
+    def get_base_price(
+        self,
+        channel_listing: "ProductVariantChannelListing",
+        price_override: Optional["Decimal"] = None,
+    ) -> "Money":
+        """Return the base variant price before applying the promotion discounts."""
+        return (
+            channel_listing.price
+            if price_override is None
+            else Money(price_override, channel_listing.currency)
+        )
 
     def get_price(
         self,
-        product: Product,
-        collections: Iterable["Collection"],
-        channel: Channel,
         channel_listing: "ProductVariantChannelListing",
-        discounts: Optional[Iterable[DiscountInfo]] = None,
+        price_override: Optional["Decimal"] = None,
+        promotion_rules: Iterable["PromotionRule"] | None = None,
     ) -> "Money":
-        return calculate_discounted_price(
-            product=product,
-            price=channel_listing.price,
-            discounts=discounts,
-            collections=collections,
-            channel=channel,
+        """Return the variant discounted price with applied promotions.
+
+        If a custom price is provided, return the price with applied discounts from
+        valid promotion rules for this variant.
+        """
+        from ..discount.utils.promotion import calculate_discounted_price_for_rules
+
+        if price_override is None:
+            return channel_listing.discounted_price or channel_listing.price
+        price: Money = self.get_base_price(channel_listing, price_override)
+        rules = promotion_rules or []
+        return calculate_discounted_price_for_rules(
+            price=price, rules=rules, currency=channel_listing.currency
         )
+
+    def get_prior_price_amount(
+        self,
+        channel_listing: Optional["ProductVariantChannelListing"],
+    ) -> Decimal | None:
+        if channel_listing is None or channel_listing.prior_price is None:
+            return None
+
+        return channel_listing.prior_price.amount
 
     def get_weight(self):
         return self.weight or self.product.weight or self.product.product_type.weight
@@ -571,24 +436,32 @@ class ProductVariant(SortableModel, ModelWithMetadata):
     def is_shipping_required(self) -> bool:
         return self.product.product_type.is_shipping_required
 
+    def is_gift_card(self) -> bool:
+        return self.product.product_type.kind == ProductTypeKind.GIFT_CARD
+
     def is_digital(self) -> bool:
         is_digital = self.product.product_type.is_digital
         return not self.is_shipping_required() and is_digital
 
     def display_product(self, translated: bool = False) -> str:
         if translated:
-            product = self.product.translated
-            variant_display = str(self.translated)
+            product = get_translation(self.product).name or ""
+            variant_display = get_translation(self).name
         else:
             variant_display = str(self)
             product = self.product
         product_display = (
             f"{product} ({variant_display})" if variant_display else str(product)
         )
-        return smart_text(product_display)
+        return product_display
 
     def get_ordering_queryset(self):
         return self.product.variants.all()
+
+    def is_preorder_active(self):
+        return self.is_preorder and (
+            self.preorder_end_date is None or timezone.now() <= self.preorder_end_date
+        )
 
 
 class ProductVariantTranslation(Translation):
@@ -597,19 +470,12 @@ class ProductVariantTranslation(Translation):
     )
     name = models.CharField(max_length=255, blank=True)
 
-    translated = TranslationProxy()
-
     class Meta:
         unique_together = (("language_code", "product_variant"),)
 
     def __repr__(self):
         class_ = type(self)
-        return "%s(pk=%r, name=%r, variant_pk=%r)" % (
-            class_.__name__,
-            self.pk,
-            self.name,
-            self.product_variant_id,
-        )
+        return f"{class_.__name__}(pk={self.pk!r}, name={self.name!r}, variant_pk={self.product_variant_id!r})"
 
     def __str__(self):
         return self.name or str(self.product_variant)
@@ -653,9 +519,67 @@ class ProductVariantChannelListing(models.Model):
     )
     cost_price = MoneyField(amount_field="cost_price_amount", currency_field="currency")
 
+    prior_price_amount = models.DecimalField(
+        max_digits=settings.DEFAULT_MAX_DIGITS,
+        decimal_places=settings.DEFAULT_DECIMAL_PLACES,
+        blank=True,
+        null=True,
+    )
+    prior_price = MoneyField(
+        amount_field="prior_price_amount", currency_field="currency"
+    )
+
+    discounted_price_amount = models.DecimalField(
+        max_digits=settings.DEFAULT_MAX_DIGITS,
+        decimal_places=settings.DEFAULT_DECIMAL_PLACES,
+        blank=True,
+        null=True,
+    )
+    discounted_price = MoneyField(
+        amount_field="discounted_price_amount", currency_field="currency"
+    )
+    promotion_rules = models.ManyToManyField(
+        PromotionRule,
+        help_text="Promotion rules that were included in the discounted price.",
+        through="product.VariantChannelListingPromotionRule",
+        blank=True,
+    )
+
+    preorder_quantity_threshold = models.IntegerField(blank=True, null=True)
+
+    objects = managers.ProductVariantChannelListingManager()
+
     class Meta:
         unique_together = [["variant", "channel"]]
         ordering = ("pk",)
+        indexes = [
+            GinIndex(fields=["price_amount", "channel_id"]),
+        ]
+
+
+class VariantChannelListingPromotionRule(models.Model):
+    variant_channel_listing = models.ForeignKey(
+        ProductVariantChannelListing,
+        related_name="variantlistingpromotionrule",
+        on_delete=models.CASCADE,
+    )
+    promotion_rule = models.ForeignKey(
+        PromotionRule,
+        related_name="variantlistingpromotionrule",
+        on_delete=models.CASCADE,
+    )
+    discount_amount = models.DecimalField(
+        max_digits=settings.DEFAULT_MAX_DIGITS,
+        decimal_places=settings.DEFAULT_DECIMAL_PLACES,
+        default=Decimal("0.0"),
+    )
+    discount = MoneyField(amount_field="discount_amount", currency_field="currency")
+    currency = models.CharField(
+        max_length=settings.DEFAULT_CURRENCY_CODE_LENGTH,
+    )
+
+    class Meta:
+        unique_together = [["variant_channel_listing", "promotion_rule"]]
 
 
 class DigitalContent(ModelWithMetadata):
@@ -680,7 +604,7 @@ class DigitalContentUrl(models.Model):
     content = models.ForeignKey(
         DigitalContent, related_name="urls", on_delete=models.CASCADE
     )
-    created = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True)
     download_num = models.IntegerField(default=0)
     line = models.OneToOneField(
         "order.OrderLine",
@@ -695,20 +619,29 @@ class DigitalContentUrl(models.Model):
     ):
         if not self.token:
             self.token = str(uuid4()).replace("-", "")
-        super().save(force_insert, force_update, using, update_fields)
+        super().save(
+            force_insert=force_insert,
+            force_update=force_update,
+            using=using,
+            update_fields=update_fields,
+        )
 
-    def get_absolute_url(self) -> Optional[str]:
+    def get_absolute_url(self) -> str | None:
         url = reverse("digital-product", kwargs={"token": str(self.token)})
         return build_absolute_uri(url)
 
 
-class ProductMedia(SortableModel):
-    product = models.ForeignKey(Product, related_name="media", on_delete=models.CASCADE)
-    image = VersatileImageField(
-        upload_to="products", ppoi_field="ppoi", blank=True, null=True
+class ProductMedia(SortableModel, ModelWithMetadata):
+    product = models.ForeignKey(
+        Product,
+        related_name="media",
+        on_delete=models.CASCADE,
+        # DEPRECATED
+        null=True,
+        blank=True,
     )
-    ppoi = PPOIField()
-    alt = models.CharField(max_length=128, blank=True)
+    image = models.ImageField(upload_to="products", blank=True, null=True)
+    alt = models.CharField(max_length=250, blank=True)
     type = models.CharField(
         max_length=32,
         choices=ProductMediaTypes.CHOICES,
@@ -716,13 +649,21 @@ class ProductMedia(SortableModel):
     )
     external_url = models.CharField(max_length=256, blank=True, null=True)
     oembed_data = JSONField(blank=True, default=dict)
+    # DEPRECATED
+    to_remove = models.BooleanField(default=False)
 
-    class Meta:
+    class Meta(ModelWithMetadata.Meta):
         ordering = ("sort_order", "pk")
         app_label = "product"
 
     def get_ordering_queryset(self):
+        if not self.product:
+            return ProductMedia.objects.none()
         return self.product.media.all()
+
+    @transaction.atomic
+    def delete(self, *args, **kwargs):
+        super(SortableModel, self).delete(*args, **kwargs)
 
 
 class VariantMedia(models.Model):
@@ -752,27 +693,8 @@ class CollectionProduct(SortableModel):
         return self.product.collectionproduct.all()
 
 
-class CollectionsQueryset(models.QuerySet):
-    def published(self, channel_slug: str):
-        today = datetime.date.today()
-        return self.filter(
-            Q(channel_listings__publication_date__lte=today)
-            | Q(channel_listings__publication_date__isnull=True),
-            channel_listings__channel__slug=str(channel_slug),
-            channel_listings__channel__is_active=True,
-            channel_listings__is_published=True,
-        )
-
-    def visible_to_user(self, requestor: Union["User", "App"], channel_slug: str):
-        if requestor_is_staff_member_or_app(requestor):
-            if channel_slug:
-                return self.filter(channel_listings__channel__slug=str(channel_slug))
-            return self.all()
-        return self.published(channel_slug)
-
-
 class Collection(SeoModel, ModelWithMetadata):
-    name = models.CharField(max_length=250, unique=True)
+    name = models.CharField(max_length=250)
     slug = models.SlugField(max_length=255, unique=True, allow_unicode=True)
     products = models.ManyToManyField(
         Product,
@@ -781,18 +703,26 @@ class Collection(SeoModel, ModelWithMetadata):
         through=CollectionProduct,
         through_fields=("collection", "product"),
     )
-    background_image = VersatileImageField(
+    background_image = models.ImageField(
         upload_to="collection-backgrounds", blank=True, null=True
     )
     background_image_alt = models.CharField(max_length=128, blank=True)
+
     description = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editor_js)
 
-    objects = models.Manager.from_queryset(CollectionsQueryset)()
-
-    translated = TranslationProxy()
+    objects = managers.CollectionManager()
 
     class Meta(ModelWithMetadata.Meta):
         ordering = ("slug",)
+        indexes = [
+            *ModelWithMetadata.Meta.indexes,
+            GinIndex(
+                name="collection_search_gin",
+                # `opclasses` and `fields` should be the same length
+                fields=["name", "slug"],
+                opclasses=["gin_trgm_ops"] * 2,
+            ),
+        ]
 
     def __str__(self) -> str:
         return self.name
@@ -819,7 +749,7 @@ class CollectionChannelListing(PublishableModel):
         ordering = ("pk",)
 
 
-class CollectionTranslation(SeoModelTranslation):
+class CollectionTranslation(SeoModelTranslationWithSlug):
     collection = models.ForeignKey(
         Collection, related_name="translations", on_delete=models.CASCADE
     )
@@ -827,16 +757,17 @@ class CollectionTranslation(SeoModelTranslation):
     description = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editor_js)
 
     class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["language_code", "slug"],
+                name="uniq_lang_slug_collectiontransl",
+            ),
+        ]
         unique_together = (("language_code", "collection"),)
 
     def __repr__(self):
         class_ = type(self)
-        return "%s(pk=%r, name=%r, collection_pk=%r)" % (
-            class_.__name__,
-            self.pk,
-            self.name,
-            self.collection_id,
-        )
+        return f"{class_.__name__}(pk={self.pk!r}, name={self.name!r}, collection_pk={self.collection_id!r})"
 
     def __str__(self) -> str:
         return self.name if self.name else str(self.pk)

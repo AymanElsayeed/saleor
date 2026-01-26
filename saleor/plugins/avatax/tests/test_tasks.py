@@ -1,3 +1,4 @@
+import os
 from dataclasses import asdict
 from urllib.parse import urljoin
 
@@ -21,17 +22,18 @@ def test_api_post_request_task_sends_request(
 
     site_settings.company_address = address_usa
     site_settings.save()
-
     config = AvataxConfiguration(
-        username_or_account="",
-        password_or_license="",
-        use_sandbox=False,
+        username_or_account=os.environ.get("AVALARA_USERNAME", ""),
+        password_or_license=os.environ.get("AVALARA_PASSWORD", ""),
+        use_sandbox=True,
         from_street_address="Tęczowa 7",
         from_city="WROCŁAW",
         from_postal_code="53-601",
         from_country="PL",
     )
-    request_data = get_order_request_data(order_with_lines, config)
+    request_data = get_order_request_data(
+        order_with_lines, config, list(order_with_lines.lines.all())
+    )
 
     transaction_url = urljoin(
         get_api_url(config.use_sandbox), "transactions/createoradjust"
@@ -55,15 +57,17 @@ def test_api_post_request_task_creates_order_event(
     site_settings.save()
 
     config = AvataxConfiguration(
-        username_or_account="",
-        password_or_license="",
-        use_sandbox=False,
+        username_or_account=os.environ.get("AVALARA_USERNAME", ""),
+        password_or_license=os.environ.get("AVALARA_PASSWORD", ""),
+        use_sandbox=True,
         from_street_address="Tęczowa 7",
         from_city="WROCŁAW",
         from_postal_code="53-601",
         from_country="PL",
     )
-    request_data = get_order_request_data(order_with_lines, config)
+    request_data = get_order_request_data(
+        order_with_lines, config, list(order_with_lines.lines.all())
+    )
 
     transaction_url = urljoin(
         get_api_url(config.use_sandbox), "transactions/createoradjust"
@@ -72,7 +76,7 @@ def test_api_post_request_task_creates_order_event(
         transaction_url, request_data, asdict(config), order_with_lines.id
     )
 
-    expected_event_msg = f"Order sent to Avatax. Order ID: {order_with_lines.token}"
+    expected_event_msg = f"Order sent to Avatax. Order ID: {order_with_lines.id}"
     assert order_with_lines.events.count() == 1
     event = order_with_lines.events.get()
     assert event.type == OrderEvents.EXTERNAL_SERVICE_NOTIFICATION
@@ -96,7 +100,9 @@ def test_api_post_request_task_missing_response(
         from_postal_code="53-601",
         from_country="PL",
     )
-    request_data = get_order_request_data(order_with_lines, config)
+    request_data = get_order_request_data(
+        order_with_lines, config, list(order_with_lines.lines.all())
+    )
 
     transaction_url = urljoin(
         get_api_url(config.use_sandbox), "transactions/createoradjust"

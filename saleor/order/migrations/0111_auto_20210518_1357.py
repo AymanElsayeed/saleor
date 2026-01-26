@@ -24,16 +24,14 @@ def populate_refund_amounts_in_fulfillments(apps, schema_editor):
             [Decimal(event.parameters.get("amount", 0)) for event in refunded_events]
         )
         included_shipping_costs = any(
-            [
-                event.parameters.get("shipping_costs_included", False)
-                for event in refunded_events
-            ]
+            event.parameters.get("shipping_costs_included", False)
+            for event in refunded_events
         )
 
         fulfillment_count = fulfillments.count()
         refunded_events_count = len(refunded_events)
         if fulfillment_count == refunded_events_count:
-            for fulfillment, event in zip(fulfillments, refunded_events):
+            for fulfillment, event in zip(fulfillments, refunded_events, strict=False):
                 amount = event.parameters.get("amount") or 0
                 included_shipping_costs = event.parameters.get(
                     "shipping_costs_included", False
@@ -88,7 +86,6 @@ def populate_refund_amounts_in_fulfillments(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("order", "0110_auto_20210518_0918"),
     ]

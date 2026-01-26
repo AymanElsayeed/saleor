@@ -1,40 +1,47 @@
 import graphene
 
-from ...core.permissions import ProductPermissions
-from ..core.fields import FilterInputConnectionField
+from ...permission.enums import ProductPermissions
+from ..core import ResolveInfo
+from ..core.connection import create_connection_slice, filter_connection_queryset
+from ..core.fields import FilterConnectionField, PermissionsField
 from ..core.utils import from_global_id_or_error
-from ..decorators import permission_required
 from .filters import ExportFileFilterInput
-from .mutations import ExportProducts
+from .mutations import ExportGiftCards, ExportProducts, ExportVoucherCodes
 from .resolvers import resolve_export_file, resolve_export_files
 from .sorters import ExportFileSortingInput
-from .types import ExportFile
+from .types import ExportFile, ExportFileCountableConnection
 
 
 class CsvQueries(graphene.ObjectType):
-    export_file = graphene.Field(
+    export_file = PermissionsField(
         ExportFile,
         id=graphene.Argument(
             graphene.ID, description="ID of the export file job.", required=True
         ),
         description="Look up a export file by ID.",
+        permissions=[ProductPermissions.MANAGE_PRODUCTS],
     )
-    export_files = FilterInputConnectionField(
-        ExportFile,
+    export_files = FilterConnectionField(
+        ExportFileCountableConnection,
         filter=ExportFileFilterInput(description="Filtering options for export files."),
         sort_by=ExportFileSortingInput(description="Sort export files."),
         description="List of export files.",
+        permissions=[ProductPermissions.MANAGE_PRODUCTS],
     )
 
-    @permission_required(ProductPermissions.MANAGE_PRODUCTS)
-    def resolve_export_file(self, info, id):
+    def resolve_export_file(self, info: ResolveInfo, *, id):
         _, id = from_global_id_or_error(id, ExportFile)
-        return resolve_export_file(id)
+        return resolve_export_file(info, id)
 
-    @permission_required(ProductPermissions.MANAGE_PRODUCTS)
-    def resolve_export_files(self, _info, **kwargs):
-        return resolve_export_files()
+    def resolve_export_files(self, info: ResolveInfo, **kwargs):
+        qs = resolve_export_files(info)
+        qs = filter_connection_queryset(
+            qs, kwargs, allow_replica=info.context.allow_replica
+        )
+        return create_connection_slice(qs, info, kwargs, ExportFileCountableConnection)
 
 
 class CsvMutations(graphene.ObjectType):
     export_products = ExportProducts.Field()
+    export_gift_cards = ExportGiftCards.Field()
+    export_voucher_codes = ExportVoucherCodes.Field()

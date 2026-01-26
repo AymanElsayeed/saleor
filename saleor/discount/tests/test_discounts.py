@@ -1,74 +1,71 @@
-from datetime import timedelta
+import datetime
 from decimal import Decimal
 
+import graphene
 import pytest
 from django.utils import timezone
 from prices import Money, TaxedMoney
 
-from ...checkout.fetch import fetch_checkout_info, fetch_checkout_lines
-from ...checkout.utils import get_voucher_discount_for_checkout
-from ...plugins.manager import get_plugins_manager
-from ...product.models import Product, ProductVariant, ProductVariantChannelListing
-from .. import DiscountInfo, DiscountValueType, VoucherType
+from ...checkout.fetch import CheckoutLineInfo
+from ...discount.interface import VariantPromotionRuleInfo
+from ...order import OrderStatus
+from .. import DiscountType, DiscountValueType, RewardValueType, VoucherType
 from ..models import (
     NotApplicable,
-    Sale,
-    SaleChannelListing,
     Voucher,
     VoucherChannelListing,
+    VoucherCode,
     VoucherCustomer,
 )
-from ..templatetags.voucher import discount_as_negative
-from ..utils import (
+from ..utils.manual_discount import split_manual_discount
+from ..utils.promotion import (
+    get_discount_name,
+    get_discount_translated_name,
+)
+from ..utils.shared import discount_info_for_logs
+from ..utils.voucher import (
+    activate_voucher_code,
     add_voucher_usage_by_customer,
-    decrease_voucher_usage,
-    get_product_discount_on_sale,
-    increase_voucher_usage,
+    deactivate_voucher_code,
+    decrease_voucher_code_usage_value,
+    get_the_cheapest_line,
+    increase_voucher_code_usage_value,
+    is_order_level_voucher,
     remove_voucher_usage_by_customer,
     validate_voucher,
 )
 
 
-def test_valid_voucher_min_spent_amount_with_display_gross_prices(
-    channel_USD, site_settings
-):
-    site_settings.display_gross_prices = True
-    site_settings.save()
-
+def test_valid_voucher_min_spent_amount(channel_USD):
     voucher = Voucher.objects.create(
-        code="unique",
         type=VoucherType.SHIPPING,
         discount_value_type=DiscountValueType.FIXED,
     )
+    VoucherCode.objects.create(code="unique", voucher=voucher)
     VoucherChannelListing.objects.create(
         voucher=voucher,
         channel=channel_USD,
         discount=Money(10, "USD"),
         min_spent=Money(7, "USD"),
     )
-    value = TaxedMoney(net=Money(5, "USD"), gross=Money(7, "USD"))
+    value = Money(7, "USD")
 
     voucher.validate_min_spent(value, channel_USD)
 
 
-def test_valid_voucher_min_spent_amount_without_display_gross_prices(
-    channel_USD, site_settings
-):
-    site_settings.display_gross_prices = False
-    site_settings.save()
-
+def test_valid_voucher_min_spent_amount_not_reached(channel_USD):
     voucher = Voucher.objects.create(
-        code="unique",
         type=VoucherType.SHIPPING,
         discount_value_type=DiscountValueType.FIXED,
     )
+    VoucherCode.objects.create(code="unique", voucher=voucher)
     VoucherChannelListing.objects.create(
         voucher=voucher,
         channel=channel_USD,
         discount=Money(10, "USD"),
         min_spent=Money(7, "USD"),
     )
-    value = TaxedMoney(net=Money(5, "USD"), gross=Money(7, "USD"))
+    value = Money(5, "USD")
 
     with pytest.raises(NotApplicable):
         voucher.validate_min_spent(value, channel_USD)
@@ -78,10 +75,10 @@ def test_valid_voucher_min_spent_amount_voucher_not_assigned_to_channel(
     channel_USD, channel_PLN
 ):
     voucher = Voucher.objects.create(
-        code="unique",
         type=VoucherType.SHIPPING,
         discount_value_type=DiscountValueType.FIXED,
     )
+    VoucherCode.objects.create(code="unique", voucher=voucher)
     VoucherChannelListing.objects.create(
         voucher=voucher,
         channel=channel_USD,
@@ -109,91 +106,75 @@ def test_valid_voucher_min_checkout_items_quantity(voucher):
 
 @pytest.mark.integration
 @pytest.mark.django_db(transaction=True)
-def test_variant_discounts(product, channel_USD):
+def test_percentage_discounts(product, channel_USD, catalogue_promotion_without_rules):
+    # given
     variant = product.variants.get()
-    low_sale = Sale.objects.create(type=DiscountValueType.FIXED)
-    low_sale_channel_listing = SaleChannelListing.objects.create(
-        sale=low_sale,
-        discount_value=5,
-        currency=channel_USD.currency_code,
-        channel=channel_USD,
+    reward_value = Decimal(50)
+    rule = catalogue_promotion_without_rules.rules.create(
+        catalogue_predicate={
+            "productPredicate": {
+                "ids": [graphene.Node.to_global_id("Product", variant.product.id)]
+            }
+        },
+        reward_value_type=RewardValueType.PERCENTAGE,
+        reward_value=reward_value,
     )
-    low_discount = DiscountInfo(
-        sale=low_sale,
-        channel_listings={channel_USD.slug: low_sale_channel_listing},
-        product_ids={product.id},
-        category_ids=set(),
-        collection_ids=set(),
-    )
-    sale = Sale.objects.create(type=DiscountValueType.FIXED)
-    sale_channel_listing = SaleChannelListing.objects.create(
-        sale=sale,
-        discount_value=8,
-        currency=channel_USD.currency_code,
-        channel=channel_USD,
-    )
-    discount = DiscountInfo(
-        sale=sale,
-        channel_listings={channel_USD.slug: sale_channel_listing},
-        product_ids={product.id},
-        category_ids=set(),
-        collection_ids=set(),
-    )
-    high_sale = Sale.objects.create(type=DiscountValueType.FIXED)
-    high_sale_channel_listing = SaleChannelListing.objects.create(
-        sale=high_sale,
-        discount_value=50,
-        currency=channel_USD.currency_code,
-        channel=channel_USD,
-    )
-    high_discount = DiscountInfo(
-        sale=high_sale,
-        channel_listings={channel_USD.slug: high_sale_channel_listing},
-        product_ids={product.id},
-        category_ids=set(),
-        collection_ids=set(),
-    )
+
     variant_channel_listing = variant.channel_listings.get(channel=channel_USD)
-    final_price = variant.get_price(
-        product,
-        [],
-        channel_USD,
-        variant_channel_listing,
-        discounts=[low_discount, discount, high_discount],
+    variant_channel_listing.variantlistingpromotionrule.create(
+        promotion_rule=rule,
+        discount_amount=Decimal(5),
+        currency=channel_USD.currency_code,
     )
-    assert final_price == Money(0, "USD")
+    price = Decimal(10)
+
+    # when
+    final_price = variant.get_price(
+        variant_channel_listing, price, promotion_rules=[rule]
+    )
+
+    # then
+    assert final_price.amount == price - reward_value / 100 * price
 
 
 @pytest.mark.integration
 @pytest.mark.django_db(transaction=True)
-def test_percentage_discounts(product, channel_USD):
+def test_fixed_discounts(product, channel_USD, catalogue_promotion_without_rules):
+    # given
     variant = product.variants.get()
-    sale = Sale.objects.create(type=DiscountValueType.PERCENTAGE)
-    sale_channel_listing = SaleChannelListing.objects.create(
-        sale=sale,
-        discount_value=50,
-        currency=channel_USD.currency_code,
-        channel=channel_USD,
+    reward_value = Decimal(5)
+    rule = catalogue_promotion_without_rules.rules.create(
+        catalogue_predicate={
+            "productPredicate": {
+                "ids": [graphene.Node.to_global_id("Product", variant.product.id)]
+            }
+        },
+        reward_value_type=RewardValueType.FIXED,
+        reward_value=reward_value,
     )
-    discount = DiscountInfo(
-        sale=sale,
-        channel_listings={channel_USD.slug: sale_channel_listing},
-        product_ids={product.id},
-        category_ids=set(),
-        collection_ids=set(),
-    )
+
     variant_channel_listing = variant.channel_listings.get(channel=channel_USD)
-    final_price = variant.get_price(
-        product, [], channel_USD, variant_channel_listing, discounts=[discount]
+    variant_channel_listing.variantlistingpromotionrule.create(
+        promotion_rule=rule,
+        discount_amount=Decimal(1),
+        currency=channel_USD.currency_code,
     )
-    assert final_price == Money(5, "USD")
+    price = Decimal(10)
+
+    # when
+    final_price = variant.get_price(
+        variant_channel_listing, price, promotion_rules=[rule]
+    )
+
+    # then
+    assert final_price.amount == price - reward_value
 
 
 def test_voucher_queryset_active(voucher, channel_USD):
     vouchers = Voucher.objects.all()
     assert vouchers.count() == 1
     active_vouchers = Voucher.objects.active_in_channel(
-        date=timezone.now() - timedelta(days=1), channel_slug=channel_USD.slug
+        date=timezone.now() - datetime.timedelta(days=1), channel_slug=channel_USD.slug
     )
     assert active_vouchers.count() == 0
 
@@ -216,176 +197,155 @@ def test_voucher_queryset_active_in_other_channel(voucher, channel_PLN):
     assert active_vouchers.count() == 0
 
 
-@pytest.mark.parametrize(
-    "prices, discount_value, discount_type, apply_once_per_order, expected_value",
-    [
-        ([10], 10, DiscountValueType.FIXED, True, 10),
-        ([5], 10, DiscountValueType.FIXED, True, 5),
-        ([5, 5], 10, DiscountValueType.FIXED, True, 5),
-        ([2, 3], 10, DiscountValueType.FIXED, True, 2),
-        ([10, 10], 5, DiscountValueType.FIXED, False, 10),
-        ([5, 2], 5, DiscountValueType.FIXED, False, 7),
-        ([10, 10, 10], 5, DiscountValueType.FIXED, False, 15),
-    ],
-)
-def test_specific_products_voucher_checkout_discount(
-    monkeypatch,
-    prices,
-    discount_value,
-    discount_type,
-    expected_value,
-    apply_once_per_order,
-    checkout_with_item,
-    channel_USD,
-):
-    discounts = []
-    monkeypatch.setattr(
-        "saleor.checkout.utils.get_prices_of_discounted_specific_product",
-        lambda manager, checkout_info, lines, voucher, channel: (
-            Money(price, "USD") for price in prices
-        ),
-    )
-    voucher = Voucher.objects.create(
-        code="unique",
-        type=VoucherType.SPECIFIC_PRODUCT,
-        discount_value_type=discount_type,
-        apply_once_per_order=apply_once_per_order,
-    )
-    VoucherChannelListing.objects.create(
-        voucher=voucher,
-        channel=channel_USD,
-        discount=Money(discount_value, channel_USD.currency_code),
-    )
-    checkout = checkout_with_item
-    manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
-    checkout_info = fetch_checkout_info(checkout, lines, discounts, manager)
-    manager = get_plugins_manager()
-    discount = get_voucher_discount_for_checkout(
-        manager, voucher, checkout_info, lines, checkout.shipping_address, discounts
-    )
-    assert discount == Money(expected_value, "USD")
-
-
-def test_sale_applies_to_correct_products(product_type, category, channel_USD):
-    product = Product.objects.create(
-        name="Test Product",
-        slug="test-product",
-        description={},
-        product_type=product_type,
-        category=category,
-    )
-    variant = ProductVariant.objects.create(product=product, sku="firstvar")
-    variant_channel_listing = ProductVariantChannelListing.objects.create(
-        variant=variant,
-        channel=channel_USD,
-        price_amount=Decimal(10),
-        currency=channel_USD.currency_code,
-    )
-    product2 = Product.objects.create(
-        name="Second product",
-        slug="second-product",
-        description={},
-        product_type=product_type,
-        category=category,
-    )
-    sec_variant = ProductVariant.objects.create(product=product2, sku="secvar")
-    ProductVariantChannelListing.objects.create(
-        variant=sec_variant,
-        channel=channel_USD,
-        price_amount=Decimal(10),
-        currency=channel_USD.currency_code,
-    )
-    sale = Sale.objects.create(name="Test sale", type=DiscountValueType.FIXED)
-    sale_channel_listing = SaleChannelListing.objects.create(
-        sale=sale,
-        currency=channel_USD.currency_code,
-        channel=channel_USD,
-        discount_value=3,
-    )
-    discount = DiscountInfo(
-        sale=sale,
-        channel_listings={channel_USD.slug: sale_channel_listing},
-        product_ids={product.id},
-        category_ids=set(),
-        collection_ids=set(),
-    )
-    product_discount = get_product_discount_on_sale(
-        variant.product, set(), discount, channel_USD
-    )
-
-    discounted_price = product_discount(variant_channel_listing.price)
-    assert discounted_price == Money(7, "USD")
-    with pytest.raises(NotApplicable):
-        get_product_discount_on_sale(sec_variant.product, set(), discount, channel_USD)
-
-
 def test_increase_voucher_usage(channel_USD):
+    code = ("unique",)
     voucher = Voucher.objects.create(
-        code="unique",
         type=VoucherType.ENTIRE_ORDER,
         discount_value_type=DiscountValueType.FIXED,
         usage_limit=100,
     )
+    code_instance = VoucherCode.objects.create(code=code, voucher=voucher)
     VoucherChannelListing.objects.create(
         voucher=voucher,
         channel=channel_USD,
         discount=Money(10, channel_USD.currency_code),
     )
-    increase_voucher_usage(voucher)
-    voucher.refresh_from_db()
-    assert voucher.used == 1
+    increase_voucher_code_usage_value(code_instance)
+    code_instance.refresh_from_db(fields=["used"])
+    assert code_instance.used == 1
 
 
 def test_decrease_voucher_usage(channel_USD):
+    code = "unique"
     voucher = Voucher.objects.create(
-        code="unique",
         type=VoucherType.ENTIRE_ORDER,
         discount_value_type=DiscountValueType.FIXED,
         usage_limit=100,
-        used=10,
     )
+    code_instance = VoucherCode.objects.create(code=code, voucher=voucher, used=10)
     VoucherChannelListing.objects.create(
         voucher=voucher,
         channel=channel_USD,
         discount=Money(10, channel_USD.currency_code),
     )
-    decrease_voucher_usage(voucher)
-    voucher.refresh_from_db()
-    assert voucher.used == 9
+    decrease_voucher_code_usage_value(code_instance)
+    code_instance.refresh_from_db(fields=["used"])
+    assert code_instance.used == 9
+
+
+def test_decrease_voucher_usage_used_0(channel_USD):
+    # given
+    code = "unique"
+    voucher = Voucher.objects.create(
+        type=VoucherType.ENTIRE_ORDER,
+        discount_value_type=DiscountValueType.FIXED,
+        usage_limit=100,
+    )
+    code_instance = VoucherCode.objects.create(code=code, voucher=voucher, used=0)
+    VoucherChannelListing.objects.create(
+        voucher=voucher,
+        channel=channel_USD,
+        discount=Money(10, channel_USD.currency_code),
+    )
+
+    # when
+    decrease_voucher_code_usage_value(code_instance)
+
+    # then
+    code_instance.refresh_from_db(fields=["used"])
+    assert code_instance.used == 0
+
+
+def test_deactivate_voucher_code(voucher):
+    # given
+    code_instance = voucher.codes.first()
+
+    # when
+    deactivate_voucher_code(code_instance)
+
+    # then
+    code_instance.refresh_from_db(fields=["is_active"])
+    assert code_instance.is_active is False
+
+
+def test_activate_voucher_code(voucher):
+    # given
+    code_instance = voucher.codes.first()
+    code_instance.is_active = False
+    code_instance.save(update_fields=["is_active"])
+
+    # when
+    activate_voucher_code(code_instance)
+
+    # then
+    code_instance.refresh_from_db(fields=["is_active"])
+    assert code_instance.is_active is True
 
 
 def test_add_voucher_usage_by_customer(voucher, customer_user):
+    # given
     voucher_customer_count = VoucherCustomer.objects.all().count()
-    add_voucher_usage_by_customer(voucher, customer_user.email)
+    code = voucher.codes.first()
+
+    # when
+    add_voucher_usage_by_customer(code, customer_user.email)
+
+    # then
     assert VoucherCustomer.objects.all().count() == voucher_customer_count + 1
     voucherCustomer = VoucherCustomer.objects.first()
-    assert voucherCustomer.voucher == voucher
+    assert voucherCustomer.voucher_code == code
     assert voucherCustomer.customer_email == customer_user.email
 
 
 def test_add_voucher_usage_by_customer_raise_not_applicable(voucher_customer):
-    voucher = voucher_customer.voucher
+    # given
+    code = voucher_customer.voucher_code
+
     customer_email = voucher_customer.customer_email
+
+    # when & then
     with pytest.raises(NotApplicable):
-        add_voucher_usage_by_customer(voucher, customer_email)
+        add_voucher_usage_by_customer(code, customer_email)
+
+
+def test_add_voucher_usage_by_customer_without_customer_email(voucher):
+    # given
+    code = voucher.codes.first()
+
+    # when & then
+    with pytest.raises(NotApplicable):
+        add_voucher_usage_by_customer(code, None)
 
 
 def test_remove_voucher_usage_by_customer(voucher_customer):
+    # given
     voucher_customer_count = VoucherCustomer.objects.all().count()
-    voucher = voucher_customer.voucher
+    code = voucher_customer.voucher_code
     customer_email = voucher_customer.customer_email
-    remove_voucher_usage_by_customer(voucher, customer_email)
+
+    # when
+    remove_voucher_usage_by_customer(code, customer_email)
+
+    # then
     assert VoucherCustomer.objects.all().count() == voucher_customer_count - 1
 
 
 def test_remove_voucher_usage_by_customer_not_exists(voucher):
-    remove_voucher_usage_by_customer(voucher, "fake@exmaimpel.com")
+    # given
+    code = voucher.codes.first()
+
+    # when & then
+    remove_voucher_usage_by_customer(code, "fake@exmaimpel.com")
 
 
 @pytest.mark.parametrize(
-    "total, min_spent_amount, total_quantity, min_checkout_items_quantity,"
-    "discount_value_type",
+    (
+        "total",
+        "min_spent_amount",
+        "total_quantity",
+        "min_checkout_items_quantity",
+        "discount_value_type",
+    ),
     [
         (20, 20, 2, 2, DiscountValueType.PERCENTAGE),
         (20, None, 2, None, DiscountValueType.PERCENTAGE),
@@ -402,11 +362,11 @@ def test_validate_voucher(
     channel_USD,
 ):
     voucher = Voucher.objects.create(
-        code="unique",
         type=VoucherType.ENTIRE_ORDER,
         discount_value_type=discount_value_type,
         min_checkout_items_quantity=min_checkout_items_quantity,
     )
+    VoucherCode.objects.create(code="unique", voucher=voucher)
     VoucherChannelListing.objects.create(
         voucher=voucher,
         channel=channel_USD,
@@ -414,9 +374,8 @@ def test_validate_voucher(
         min_spent_amount=min_spent_amount,
     )
     total_price = Money(total, "USD")
-    price = TaxedMoney(gross=total_price, net=total_price)
     validate_voucher(
-        voucher, price, total_quantity, "test@example.com", channel_USD, None
+        voucher, total_price, total_quantity, "test@example.com", channel_USD, None
     )
 
 
@@ -424,11 +383,11 @@ def test_validate_staff_voucher_for_anonymous(
     channel_USD,
 ):
     voucher = Voucher.objects.create(
-        code="unique",
         type=VoucherType.ENTIRE_ORDER,
         discount_value_type=DiscountValueType.PERCENTAGE,
         only_for_staff=True,
     )
+    VoucherCode.objects.create(code="unique", voucher=voucher)
     VoucherChannelListing.objects.create(
         voucher=voucher,
         channel=channel_USD,
@@ -442,11 +401,11 @@ def test_validate_staff_voucher_for_anonymous(
 
 def test_validate_staff_voucher_for_normal_customer(channel_USD, customer_user):
     voucher = Voucher.objects.create(
-        code="unique",
         type=VoucherType.ENTIRE_ORDER,
         discount_value_type=DiscountValueType.PERCENTAGE,
         only_for_staff=True,
     )
+    VoucherCode.objects.create(code="unique", voucher=voucher)
     VoucherChannelListing.objects.create(
         voucher=voucher,
         channel=channel_USD,
@@ -462,11 +421,11 @@ def test_validate_staff_voucher_for_normal_customer(channel_USD, customer_user):
 
 def test_validate_staff_voucher_for_staff_customer(channel_USD, staff_user):
     voucher = Voucher.objects.create(
-        code="unique",
         type=VoucherType.ENTIRE_ORDER,
         discount_value_type=DiscountValueType.PERCENTAGE,
         only_for_staff=True,
     )
+    VoucherCode.objects.create(code="unique", voucher=voucher)
     VoucherChannelListing.objects.create(
         voucher=voucher,
         channel=channel_USD,
@@ -479,8 +438,14 @@ def test_validate_staff_voucher_for_staff_customer(channel_USD, staff_user):
 
 
 @pytest.mark.parametrize(
-    "total, min_spent_amount, total_quantity, min_checkout_items_quantity, "
-    "discount_value, discount_value_type",
+    (
+        "total",
+        "min_spent_amount",
+        "total_quantity",
+        "min_checkout_items_quantity",
+        "discount_value",
+        "discount_value_type",
+    ),
     [
         (20, 50, 2, 10, 50, DiscountValueType.PERCENTAGE),
         (20, 50, 2, None, 50, DiscountValueType.PERCENTAGE),
@@ -497,11 +462,11 @@ def test_validate_voucher_not_applicable(
     channel_USD,
 ):
     voucher = Voucher.objects.create(
-        code="unique",
         type=VoucherType.ENTIRE_ORDER,
         discount_value_type=discount_value_type,
         min_checkout_items_quantity=min_checkout_items_quantity,
     )
+    VoucherCode.objects.create(code="unique", voucher=voucher)
     VoucherChannelListing.objects.create(
         voucher=voucher,
         channel=channel_USD,
@@ -509,125 +474,330 @@ def test_validate_voucher_not_applicable(
         min_spent_amount=min_spent_amount,
     )
     total_price = Money(total, "USD")
-    price = TaxedMoney(net=total_price, gross=total_price)
 
     with pytest.raises(NotApplicable):
         validate_voucher(
-            voucher, price, total_quantity, "test@example.com", channel_USD, None
+            voucher, total_price, total_quantity, "test@example.com", channel_USD, None
         )
 
 
 def test_validate_voucher_not_applicable_once_per_customer(
     voucher, customer_user, channel_USD
 ):
+    # given
     voucher.apply_once_per_customer = True
     voucher.save()
-    VoucherCustomer.objects.create(voucher=voucher, customer_email=customer_user.email)
+
+    code = voucher.codes.first()
+
+    VoucherCustomer.objects.create(
+        voucher_code=code, customer_email=customer_user.email
+    )
     price = Money(0, "USD")
     total_price = TaxedMoney(net=price, gross=price)
+
+    # when & then
     with pytest.raises(NotApplicable):
         validate_voucher(
-            voucher, total_price, 0, customer_user.email, channel_USD, customer_user
+            voucher,
+            total_price,
+            0,
+            customer_user.email,
+            channel_USD,
+            customer_user,
         )
 
 
 date_time_now = timezone.now()
 
 
+def test_get_discount_name_only_rule_name(catalogue_promotion):
+    # given
+    promotion = catalogue_promotion
+    promotion.name = ""
+    promotion.save(update_fields=["name"])
+
+    rule = promotion.rules.first()
+
+    # when
+    name = get_discount_name(rule, promotion)
+
+    # then
+    assert name == rule.name
+
+
+def test_get_discount_name_only_rule_promotion_name(catalogue_promotion):
+    # given
+    promotion = catalogue_promotion
+    rule = promotion.rules.first()
+    rule.name = ""
+    rule.save(update_fields=["name"])
+
+    # when
+    name = get_discount_name(rule, promotion)
+
+    # then
+    assert name == promotion.name
+
+
+def test_get_discount_name_rule_and_promotion_name(catalogue_promotion):
+    # given
+    promotion = catalogue_promotion
+    rule = promotion.rules.first()
+
+    # when
+    name = get_discount_name(rule, promotion)
+
+    # then
+    assert name == f"{promotion.name}: {rule.name}"
+
+
+def test_get_discount_name_empty_names(catalogue_promotion):
+    # given
+    promotion = catalogue_promotion
+    rule = promotion.rules.first()
+
+    rule.name = ""
+    rule.save(update_fields=["name"])
+
+    promotion.name = ""
+    promotion.save(update_fields=["name"])
+
+    # when
+    name = get_discount_name(rule, promotion)
+
+    # then
+    assert name == ""
+
+
+def test_get_discount_translated_name_only_rule_translation(rule_info):
+    # given
+    rule_info_data = rule_info._asdict()
+    rule_info_data["promotion_translation"] = None
+    rule_info = VariantPromotionRuleInfo(**rule_info_data)
+
+    # when
+    translated_name = get_discount_translated_name(rule_info)
+
+    # then
+    assert translated_name == rule_info.rule_translation.name
+
+
+def test_get_discount_translated_name_only_rule_promotion_translation(rule_info):
+    # given
+    rule_info_data = rule_info._asdict()
+    rule_info_data["rule_translation"] = None
+    rule_info = VariantPromotionRuleInfo(**rule_info_data)
+
+    # when
+    translated_name = get_discount_translated_name(rule_info)
+
+    # then
+    assert translated_name == rule_info.promotion_translation.name
+
+
+def test_get_discount_translated_name_rule_and_promotion_translations(rule_info):
+    # when
+    translated_name = get_discount_translated_name(rule_info)
+
+    # then
+    assert (
+        translated_name
+        == f"{rule_info.promotion_translation.name}: {rule_info.rule_translation.name}"
+    )
+
+
+def test_get_discount_translated_name_no_translations(rule_info):
+    # given
+    rule_info_data = rule_info._asdict()
+    rule_info_data["promotion_translation"] = None
+    rule_info_data["rule_translation"] = None
+    rule_info = VariantPromotionRuleInfo(**rule_info_data)
+
+    # when
+    translated_name = get_discount_translated_name(rule_info)
+
+    # then
+    assert translated_name is None
+
+
+def test_is_order_level_voucher(voucher):
+    # given
+    voucher.type = VoucherType.ENTIRE_ORDER
+    voucher.save(update_fields=["type"])
+
+    # when
+    result = is_order_level_voucher(voucher)
+
+    # then
+    assert result is True
+
+
+def test_is_order_level_voucher_apply_once_per_order(voucher):
+    # given
+    voucher.type = VoucherType.ENTIRE_ORDER
+    voucher.apply_once_per_order = True
+    voucher.save(update_fields=["type", "apply_once_per_order"])
+
+    # when
+    result = is_order_level_voucher(voucher)
+
+    # then
+    assert result is False
+
+
+def test_is_order_level_voucher_no_voucher(voucher):
+    # when
+    result = is_order_level_voucher(None)
+
+    # then
+    assert result is False
+
+
 @pytest.mark.parametrize(
-    "current_date, start_date, end_date, is_active",
-    (
-        (date_time_now, date_time_now, date_time_now + timedelta(days=1), True),
-        (
-            date_time_now + timedelta(days=1),
-            date_time_now,
-            date_time_now + timedelta(days=1),
-            True,
-        ),
-        (
-            date_time_now + timedelta(days=2),
-            date_time_now,
-            date_time_now + timedelta(days=1),
-            False,
-        ),
-        (
-            date_time_now - timedelta(days=2),
-            date_time_now,
-            date_time_now + timedelta(days=1),
-            False,
-        ),
-        (date_time_now, date_time_now, None, True),
-        (date_time_now + timedelta(weeks=10), date_time_now, None, True),
-    ),
+    "voucher_type", [VoucherType.SPECIFIC_PRODUCT, VoucherType.SHIPPING]
 )
-def test_sale_active(current_date, start_date, end_date, is_active, channel_USD):
-    sale = Sale.objects.create(
-        type=DiscountValueType.FIXED, start_date=start_date, end_date=end_date
-    )
-    SaleChannelListing.objects.create(
-        sale=sale,
-        currency=channel_USD.currency_code,
-        channel=channel_USD,
-        discount_value=5,
-    )
-    sale_is_active = Sale.objects.active(date=current_date).exists()
-    assert is_active == sale_is_active
-
-
-def test_discount_as_negative():
-    discount = Money(10, "USD")
-    result = discount_as_negative(discount)
-    assert result == "-$10.00"
-
-
-def test_discount_as_negative_for_zero_value():
-    discount = Money(0, "USD")
-    result = discount_as_negative(discount)
-    assert result == "$0.00"
-
-
-def test_discount_as_negative_for_html():
-    discount = Money(10, "USD")
-    result = discount_as_negative(discount, True)
-    assert result == '-<span class="currency">$</span>10.00'
-
-
-def test_get_fixed_sale_discount(sale):
+def test_is_order_level_voucher_another_type(voucher_type, voucher):
     # given
-    sale.type = DiscountValueType.FIXED
-    channel_listing = sale.channel_listings.get()
+    voucher.type = voucher_type
+    voucher.save(update_fields=["type"])
 
     # when
-    result = sale.get_discount(channel_listing).keywords
+    result = is_order_level_voucher(voucher)
 
     # then
-    assert result["discount"] == Money(
-        channel_listing.discount_value, channel_listing.currency
-    )
+    assert result is False
 
 
-def test_get_percentage_sale_discount(sale):
+def test_get_the_cheapest_line_no_lines_provided():
+    # when
+    line_info = get_the_cheapest_line(None)
+    # then
+    assert line_info is None
+
+
+def test_get_the_cheapest_line(checkout_with_items, channel_USD):
     # given
-    sale.type = DiscountValueType.PERCENTAGE
-    channel_listing = sale.channel_listings.get()
+    lines = [
+        CheckoutLineInfo(
+            line=line,
+            channel_listing=line.variant.channel_listings.first(),
+            collections=[],
+            product=line.variant.product,
+            variant=line.variant,
+            discounts=list(line.discounts.all()),
+            rules_info=[],
+            product_type=line.variant.product.product_type,
+            channel=channel_USD,
+            voucher=None,
+            voucher_code=None,
+        )
+        for line in checkout_with_items.lines.all()
+    ]
+    # when
+    line_info = get_the_cheapest_line(lines)
+    # then
+    assert line_info == lines[0]
+
+
+@pytest.mark.parametrize(
+    (
+        "value",
+        "value_type",
+        "subtotal",
+        "shipping_price",
+        "subtotal_portion",
+        "shipping_portion",
+    ),
+    [
+        (20, DiscountValueType.FIXED, 30, 10, 15, 5),
+        (100, DiscountValueType.FIXED, 30, 10, 30, 10),
+        (13.77, DiscountValueType.FIXED, 30, 10, Decimal("10.33"), Decimal("3.44")),
+        (0, DiscountValueType.FIXED, 30, 10, 0, 0),
+        (20, DiscountValueType.FIXED, 0, 10, 0, 10),
+        (50, DiscountValueType.FIXED, 30, 0, 30, 0),
+        (50, DiscountValueType.FIXED, 0, 0, 0, 0),
+        (0, DiscountValueType.PERCENTAGE, 30, 10, 0, 0),
+        (50, DiscountValueType.PERCENTAGE, 30, 10, 15, 5),
+        (33.33, DiscountValueType.PERCENTAGE, 30, 10, 10, Decimal("3.33")),
+        (100, DiscountValueType.PERCENTAGE, 30, 10, 30, 10),
+        (50, DiscountValueType.PERCENTAGE, 0, 10, 0, 5),
+        (50, DiscountValueType.PERCENTAGE, 30, 0, 15, 0),
+        (50, DiscountValueType.PERCENTAGE, 0, 0, 0, 0),
+    ],
+)
+def test_split_manual_discount(
+    value,
+    value_type,
+    subtotal,
+    shipping_price,
+    subtotal_portion,
+    shipping_portion,
+    draft_order_with_fixed_discount_order,
+):
+    # given
+    subtotal = Money(Decimal(subtotal), currency="USD")
+    shipping = Money(Decimal(shipping_price), currency="USD")
+    discount = draft_order_with_fixed_discount_order.discounts.first()
+    discount.value = Decimal(value)
+    discount.value_type = value_type
 
     # when
-    result = sale.get_discount(channel_listing).keywords
+    subtotal_discount, shipping_discount = split_manual_discount(
+        discount, subtotal, shipping
+    )
 
     # then
-    assert result["percentage"] == channel_listing.discount_value
+    assert subtotal_discount == Money(Decimal(subtotal_portion), "USD")
+    assert shipping_discount == Money(Decimal(shipping_portion), "USD")
 
 
-def test_get_unknown_sale_discount(sale):
-    sale.type = "unknown"
-    channel_listing = sale.channel_listings.get()
+def test_discount_info_for_logs(order_with_lines, voucher, order_promotion_with_rule):
+    # given
+    order = order_with_lines
+    promotion = order_promotion_with_rule
+    rule = promotion.rules.first()
+    voucher_code = voucher.codes.first().code
+    order.voucher_code = voucher_code
+    order.voucher = voucher
+    order.status = OrderStatus.DRAFT
+    order.save(update_fields=["voucher_code", "voucher_id", "status"])
 
-    with pytest.raises(NotImplementedError):
-        sale.get_discount(channel_listing)
+    order_discount = order.discounts.create(
+        type=DiscountType.ORDER_PROMOTION,
+        value_type=DiscountValueType.FIXED,
+        value=Decimal(5),
+        amount_value=Decimal(5),
+        promotion_rule=order_promotion_with_rule.rules.first(),
+        currency=order.currency,
+    )
 
+    lines = order.lines.all()
+    line_discount = lines[0].discounts.create(
+        type=DiscountType.VOUCHER,
+        value_type=DiscountValueType.FIXED,
+        value=Decimal(5),
+        currency=order.currency,
+        amount_value=Decimal(5),
+        voucher=voucher,
+    )
 
-def test_get_not_applicable_sale_discount(sale, channel_PLN):
-    sale.type = DiscountValueType.PERCENTAGE
+    # when
+    extra = discount_info_for_logs([order_discount, line_discount])
 
-    with pytest.raises(NotApplicable):
-        sale.get_discount(None)
+    # then
+    assert extra[0]["id"] == graphene.Node.to_global_id(
+        "OrderDiscount", order_discount.pk
+    )
+    assert extra[0]["promotion_rule"]["id"] == graphene.Node.to_global_id(
+        "PromotionRule", rule.pk
+    )
+    assert extra[0]["promotion_rule"]["promotion_id"] == graphene.Node.to_global_id(
+        "Promotion", promotion.pk
+    )
+    assert extra[1]["id"] == graphene.Node.to_global_id(
+        "OrderLineDiscount", line_discount.pk
+    )
+    assert extra[1]["voucher"]["id"] == graphene.Node.to_global_id(
+        "Voucher", voucher.pk
+    )

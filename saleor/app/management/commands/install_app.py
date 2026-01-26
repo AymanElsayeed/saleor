@@ -1,14 +1,13 @@
 import json
-from typing import Any, Optional
+from typing import Any
 
-import requests
 from django.core.exceptions import ValidationError
 from django.core.management import BaseCommand, CommandError
 from django.core.management.base import CommandParser
 
 from ....app.validators import AppURLValidator
 from ....core import JobStatus
-from ...installation_utils import install_app
+from ...installation_utils import fetch_manifest, install_app
 from ...models import AppInstallation
 from .utils import clean_permissions
 
@@ -17,32 +16,36 @@ class Command(BaseCommand):
     help = "Used to install new app."
 
     def add_arguments(self, parser: CommandParser) -> None:
-        parser.add_argument("manifest-url", help="Url with app manifest.", type=str)
+        parser.add_argument("manifest-url", help="URL with app manifest.", type=str)
         parser.add_argument(
             "--activate",
             action="store_true",
             dest="activate",
             help="Activates the app after installation",
         )
+        parser.add_argument(
+            "--quiet",
+            action="store_true",
+            dest="quiet",
+            help="Hide auth token output after installation",
+        )
 
     def validate_manifest_url(self, manifest_url: str):
         url_validator = AppURLValidator()
         try:
             url_validator(manifest_url)
-        except ValidationError:
-            raise CommandError(f"Incorrect format of manifest-url: {manifest_url}")
+        except ValidationError as e:
+            raise CommandError(
+                f"Incorrect format of manifest-url: {manifest_url}"
+            ) from e
 
-    def fetch_manifest_data(self, manifest_url: str) -> dict:
-        response = requests.get(manifest_url)
-        response.raise_for_status()
-        return response.json()
-
-    def handle(self, *args: Any, **options: Any) -> Optional[str]:
+    def handle(self, *args: Any, **options: Any) -> str | None:
         activate = options["activate"]
+        quiet = options["quiet"]
         manifest_url = options["manifest-url"]
 
         self.validate_manifest_url(manifest_url)
-        manifest_data = self.fetch_manifest_data(manifest_url)
+        manifest_data = fetch_manifest(manifest_url)
 
         permissions = clean_permissions(manifest_data.get("permissions", []))
 
@@ -53,10 +56,13 @@ class Command(BaseCommand):
             app_job.permissions.set(permissions)
 
         try:
-            app = install_app(app_job, activate)
+            app, token = install_app(app_job, activate)
+            app.is_installed = True
+            app.save(update_fields=["is_installed"])
+            app_job.delete()
         except Exception as e:
             app_job.status = JobStatus.FAILED
-            app_job.save()
+            app_job.save(update_fields=["status"])
             raise e
-        token = app.tokens.first()
-        return json.dumps({"auth_token": token.auth_token})
+
+        return json.dumps({"auth_token": token}) if not quiet else None

@@ -1,7 +1,11 @@
+from unittest.mock import patch
+
 import graphene
 import pytest
 
 from ....tests.utils import get_graphql_content
+from ...mutations.collection.collection_create import CollectionCreate
+from ...mutations.collection.collection_delete import CollectionDelete
 
 
 @pytest.mark.django_db
@@ -169,7 +173,7 @@ def test_create_collection(
     query = """
         mutation createCollection(
                 $name: String!, $slug: String,
-                $description: JSONString, $products: [ID],
+                $description: JSONString, $products: [ID!],
                 $backgroundImage: Upload, $backgroundImageAlt: String) {
             collectionCreate(
                 input: {
@@ -270,7 +274,7 @@ def test_collection_add_products(
 ):
     query = """
         mutation collectionAddProducts(
-            $id: ID!, $products: [ID]!) {
+            $id: ID!, $products: [ID!]!) {
             collectionAddProducts(collectionId: $id, products: $products) {
                 collection {
                     products {
@@ -311,7 +315,7 @@ def test_remove_products_from_collection(
 ):
     query = """
         mutation collectionRemoveProducts(
-            $id: ID!, $products: [ID]!) {
+            $id: ID!, $products: [ID!]!) {
             collectionRemoveProducts(collectionId: $id, products: $products) {
                 collection {
                     products {
@@ -353,7 +357,7 @@ def test_collection_bulk_delete(
     settings,
 ):
     query = """
-    mutation collectionBulkDelete($ids: [ID]!) {
+    mutation collectionBulkDelete($ids: [ID!]!) {
         collectionBulkDelete(ids: $ids) {
             count
             errors {
@@ -379,3 +383,146 @@ def test_collection_bulk_delete(
     content = get_graphql_content(response)
 
     assert not content["data"]["collectionBulkDelete"]["errors"]
+
+
+@pytest.mark.django_db
+@pytest.mark.count_queries(autouse=False)
+def test_collections_for_federation_query_count(
+    api_client,
+    published_collections,
+    channel_USD,
+    django_assert_num_queries,
+    count_queries,
+):
+    query = """
+        query GetCollectionInFederation($representations: [_Any]) {
+            _entities(representations: $representations) {
+                __typename
+                ... on Collection {
+                    id
+                    name
+                }
+            }
+        }
+    """
+
+    variables = {
+        "representations": [
+            {
+                "__typename": "Collection",
+                "id": graphene.Node.to_global_id(
+                    "Collection", published_collections[0].pk
+                ),
+                "channel": channel_USD.slug,
+            },
+        ],
+    }
+
+    with django_assert_num_queries(2):
+        response = api_client.post_graphql(query, variables)
+        content = get_graphql_content(response)
+        assert len(content["data"]["_entities"]) == 1
+        for collection_data in content["data"]["_entities"]:
+            assert collection_data is not None
+
+    variables = {
+        "representations": [
+            {
+                "__typename": "Collection",
+                "id": graphene.Node.to_global_id("Collection", collection.pk),
+                "channel": channel_USD.slug,
+            }
+            for collection in published_collections
+        ],
+    }
+
+    with django_assert_num_queries(2):
+        response = api_client.post_graphql(query, variables)
+        content = get_graphql_content(response)
+        assert len(content["data"]["_entities"]) == 3
+        for collection_data in content["data"]["_entities"]:
+            assert collection_data is not None
+
+
+@patch(
+    "saleor.graphql.product.mutations.collection.collection_delete.PRODUCTS_BATCH_SIZE",
+    2,
+)
+@patch(
+    "saleor.graphql.product.mutations.collection.collection_create.PRODUCTS_BATCH_SIZE",
+    2,
+)
+@pytest.mark.parametrize(
+    "mutation_class",
+    [
+        CollectionCreate,
+        CollectionDelete,
+    ],
+)
+def test_collection_batching_not_even(mutation_class):
+    ids = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    batches = list(mutation_class.batch_product_ids(ids))
+    assert batches == [[1, 2], [3, 4], [5, 6], [7, 8], [9]]
+
+
+@patch(
+    "saleor.graphql.product.mutations.collection.collection_delete.PRODUCTS_BATCH_SIZE",
+    2,
+)
+@patch(
+    "saleor.graphql.product.mutations.collection.collection_create.PRODUCTS_BATCH_SIZE",
+    2,
+)
+@pytest.mark.parametrize(
+    "mutation_class",
+    [
+        CollectionCreate,
+        CollectionDelete,
+    ],
+)
+def test_collection_batching_even(mutation_class):
+    ids = [1, 2, 3, 4, 5, 6, 7, 8]
+    batches = list(mutation_class.batch_product_ids(ids))
+    assert batches == [[1, 2], [3, 4], [5, 6], [7, 8]]
+
+
+@patch(
+    "saleor.graphql.product.mutations.collection.collection_delete.PRODUCTS_BATCH_SIZE",
+    2,
+)
+@patch(
+    "saleor.graphql.product.mutations.collection.collection_create.PRODUCTS_BATCH_SIZE",
+    2,
+)
+@pytest.mark.parametrize(
+    "mutation_class",
+    [
+        CollectionCreate,
+        CollectionDelete,
+    ],
+)
+def test_collection_batching_smaller_than_batch_size(mutation_class):
+    ids = [1]
+    batches = list(mutation_class.batch_product_ids(ids))
+    assert batches == [[1]]
+
+
+@patch(
+    "saleor.graphql.product.mutations.collection.collection_delete.PRODUCTS_BATCH_SIZE",
+    2,
+)
+@patch(
+    "saleor.graphql.product.mutations.collection.collection_create.PRODUCTS_BATCH_SIZE",
+    2,
+)
+@pytest.mark.parametrize(
+    "mutation_class",
+    [
+        CollectionCreate,
+        CollectionDelete,
+    ],
+)
+def test_collection_batching_no_ids(mutation_class):
+    ids = []
+    batches = list(mutation_class.batch_product_ids(ids))
+    assert batches == []

@@ -3,7 +3,7 @@ from enum import Enum
 
 class PaymentError(Exception):
     def __init__(self, message, code=None):
-        super(PaymentError, self).__init__(message, code)
+        super().__init__(message, code)
         self.message = message
         self.code = code
 
@@ -12,6 +12,10 @@ class PaymentError(Exception):
 
 
 class GatewayError(IOError):
+    pass
+
+
+class TransactionItemIdempotencyUniqueError(Exception):
     pass
 
 
@@ -118,4 +122,183 @@ class ChargeStatus:
         (FULLY_REFUNDED, "Fully refunded"),
         (REFUSED, "Refused"),
         (CANCELLED, "Cancelled"),
+    ]
+
+
+class StorePaymentMethod:
+    """Represents if and how a payment should be stored in a payment gateway.
+
+    The following store types are possible:
+    - ON_SESSION - the payment is stored only to be reused when
+    the customer is present in the checkout flow
+    - OFF_SESSION - the payment is stored to be reused even if
+    the customer is absent
+    - NONE - the payment is not stored.
+    """
+
+    ON_SESSION = "on_session"
+    OFF_SESSION = "off_session"
+    NONE = "none"
+
+    CHOICES = [
+        (ON_SESSION, "On session"),
+        (OFF_SESSION, "Off session"),
+        (NONE, "None"),
+    ]
+
+
+class TransactionAction:
+    """Represents possible actions on payment transaction.
+
+    The following actions are possible:
+    CHARGE - Represents the charge action.
+    REFUND - Represents a refund action.
+    CANCEL - Represents a cancel action. Added in Saleor 3.12.
+    """
+
+    CHARGE = "charge"
+    REFUND = "refund"
+    CANCEL = "cancel"
+
+    CHOICES = [
+        (CHARGE, "Charge payment"),
+        (REFUND, "Refund payment"),
+        (CANCEL, "Cancel payment"),
+    ]
+
+
+class TransactionEventType:
+    """Represents possible event types.
+
+    Added in Saleor 3.12.
+
+    The following types are possible:
+    AUTHORIZATION_SUCCESS - represents success authorization.
+    AUTHORIZATION_FAILURE - represents failure authorization.
+    AUTHORIZATION_ADJUSTMENT - represents authorization adjustment.
+    AUTHORIZATION_REQUEST - represents authorization request.
+    AUTHORIZATION_ACTION_REQUIRED - represents authorization that needs
+    additional actions from the customer.
+    CHARGE_ACTION_REQUIRED - represents charge that needs
+    additional actions from the customer.
+    CHARGE_SUCCESS - represents success charge.
+    CHARGE_FAILURE - represents failure charge.
+    CHARGE_BACK - represents chargeback.
+    CHARGE_REQUEST - represents charge request.
+    REFUND_SUCCESS - represents success refund.
+    REFUND_FAILURE - represents failure refund.
+    REFUND_REVERSE - represents reverse refund.
+    REFUND_REQUEST - represents refund request.
+    CANCEL_SUCCESS - represents success cancel.
+    CANCEL_FAILURE - represents failure cancel.
+    CANCEL_REQUEST - represents cancel request.
+    INFO - represents info event.
+    """
+
+    AUTHORIZATION_SUCCESS = "authorization_success"
+    AUTHORIZATION_FAILURE = "authorization_failure"
+    AUTHORIZATION_ADJUSTMENT = "authorization_adjustment"
+    AUTHORIZATION_REQUEST = "authorization_request"
+    AUTHORIZATION_ACTION_REQUIRED = "authorization_action_required"
+    CHARGE_SUCCESS = "charge_success"
+    CHARGE_FAILURE = "charge_failure"
+    CHARGE_BACK = "charge_back"
+    CHARGE_ACTION_REQUIRED = "charge_action_required"
+    CHARGE_REQUEST = "charge_request"
+    REFUND_SUCCESS = "refund_success"
+    REFUND_FAILURE = "refund_failure"
+    REFUND_REVERSE = "refund_reverse"
+    REFUND_REQUEST = "refund_request"
+    CANCEL_SUCCESS = "cancel_success"
+    CANCEL_FAILURE = "cancel_failure"
+    CANCEL_REQUEST = "cancel_request"
+    INFO = "info"
+
+    CHOICES = [
+        (AUTHORIZATION_SUCCESS, "Represents success authorization"),
+        (AUTHORIZATION_FAILURE, "Represents failure authorization"),
+        (AUTHORIZATION_ADJUSTMENT, "Represents authorization adjustment"),
+        (AUTHORIZATION_REQUEST, "Represents authorization request"),
+        (
+            AUTHORIZATION_ACTION_REQUIRED,
+            "Represents additional actions required for authorization.",
+        ),
+        (CHARGE_ACTION_REQUIRED, "Represents additional actions required for charge."),
+        (CHARGE_SUCCESS, "Represents success charge"),
+        (CHARGE_FAILURE, "Represents failure charge"),
+        (CHARGE_BACK, "Represents chargeback."),
+        (CHARGE_REQUEST, "Represents charge request"),
+        (REFUND_SUCCESS, "Represents success refund"),
+        (REFUND_FAILURE, "Represents failure refund"),
+        (REFUND_REVERSE, "Represents reverse refund"),
+        (REFUND_REQUEST, "Represents refund request"),
+        (CANCEL_SUCCESS, "Represents success cancel"),
+        (CANCEL_FAILURE, "Represents failure cancel"),
+        (CANCEL_REQUEST, "Represents cancel request"),
+        (INFO, "Represents an info event"),
+    ]
+    REFUND_RELATED_EVENT_TYPES = [
+        REFUND_SUCCESS,
+        REFUND_FAILURE,
+        REFUND_REVERSE,
+        REFUND_REQUEST,
+    ]
+
+
+FAILED_TRANSACTION_EVENTS = [
+    TransactionEventType.AUTHORIZATION_FAILURE,
+    TransactionEventType.CHARGE_FAILURE,
+    TransactionEventType.REFUND_FAILURE,
+    TransactionEventType.CANCEL_FAILURE,
+]
+
+
+OPTIONAL_PSP_REFERENCE_EVENTS = [
+    TransactionEventType.CHARGE_ACTION_REQUIRED,
+    TransactionEventType.AUTHORIZATION_ACTION_REQUIRED,
+    TransactionEventType.CHARGE_FAILURE,
+    TransactionEventType.AUTHORIZATION_FAILURE,
+    TransactionEventType.REFUND_FAILURE,
+    TransactionEventType.CHARGE_FAILURE,
+    TransactionEventType.CANCEL_FAILURE,
+]
+
+OPTIONAL_AMOUNT_EVENTS = [
+    *FAILED_TRANSACTION_EVENTS,
+    TransactionEventType.REFUND_REVERSE,
+    TransactionEventType.CHARGE_BACK,
+    TransactionEventType.INFO,
+]
+
+
+class TokenizedPaymentFlow:
+    """Represents possible tokenized payment flows that can be used to process payment.
+
+    The following flows are possible:
+    INTERACTIVE - Payment method can be used for 1 click checkout - it's prefilled in
+    checkout form (might require additional authentication from user)
+    """
+
+    INTERACTIVE = "interactive"
+
+    CHOICES = [
+        (INTERACTIVE, "Interactive"),
+    ]
+
+
+class PaymentMethodType:
+    """Represents possible payment method types.
+
+    The following types are possible:
+    CARD - represents a card payment method.
+    OTHER - represents any payment method that is not a card payment.
+
+    """
+
+    CARD = "card"
+    OTHER = "other"
+
+    CHOICES = [
+        (CARD, "Card"),
+        (OTHER, "Other"),
     ]

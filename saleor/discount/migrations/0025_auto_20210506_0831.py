@@ -5,12 +5,12 @@ from django.db import migrations
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("discount", "0024_orderdiscount"),
     ]
 
     operations = [
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="orderdiscount",
             index=django.contrib.postgres.indexes.GinIndex(

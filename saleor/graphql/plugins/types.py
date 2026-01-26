@@ -1,8 +1,15 @@
+from typing import TYPE_CHECKING
+
 import graphene
 
 from ..channel.types import Channel
+from ..core import ResolveInfo
 from ..core.connection import CountableConnection
+from ..core.types import NonNullList
 from .enums import ConfigurationTypeFieldEnum
+
+if TYPE_CHECKING:
+    from ...plugins.base_plugin import BasePlugin
 
 
 class ConfigurationItem(graphene.ObjectType):
@@ -24,12 +31,16 @@ class PluginConfiguration(graphene.ObjectType):
         Channel,
         description="The channel to which the plugin configuration is assigned to.",
     )
-    configuration = graphene.List(
+    configuration = NonNullList(
         ConfigurationItem, description="Configuration of the plugin."
     )
 
     class Meta:
         description = "Stores information about a configuration of plugin."
+
+    @staticmethod
+    def resolve_configuration(root: "BasePlugin", info: ResolveInfo):
+        return root.resolve_plugin_configuration(info.context)
 
 
 class Plugin(graphene.ObjectType):
@@ -42,18 +53,14 @@ class Plugin(graphene.ObjectType):
         PluginConfiguration,
         description="Global configuration of the plugin (not channel-specific).",
     )
-    channel_configurations = graphene.List(
-        graphene.NonNull(PluginConfiguration),
+    channel_configurations = NonNullList(
+        PluginConfiguration,
         description="Channel-specific plugin configuration.",
         required=True,
     )
 
     class Meta:
         description = "Plugin."
-
-    @staticmethod
-    def resolve_id(root: "Plugin", _info):
-        return root.id
 
     @staticmethod
     def resolve_name(root: "Plugin", _info):

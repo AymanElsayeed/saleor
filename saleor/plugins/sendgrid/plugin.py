@@ -1,9 +1,11 @@
 import logging
+from collections.abc import Callable
 from dataclasses import asdict
 
 from django.core.exceptions import ValidationError
 
-from ...core.notify_events import NotifyEventType, UserNotifyEvent
+from ...core.notify import NotifyEventType, UserNotifyEvent
+from ...plugins.sendgrid.tasks import send_email_with_dynamic_template_id
 from ..base_plugin import BasePlugin, ConfigurationTypeField
 from ..error_codes import PluginErrorCode
 from ..models import PluginConfiguration
@@ -13,6 +15,7 @@ from .tasks import (
     send_account_delete_confirmation_email_task,
     send_fulfillment_confirmation_email_task,
     send_fulfillment_update_email_task,
+    send_gift_card_email_task,
     send_invoice_email_task,
     send_order_canceled_email_task,
     send_order_confirmation_email_task,
@@ -85,12 +88,21 @@ EVENT_MAP = {
         send_order_refund_email_task,
         "order_refund_confirmation_template_id",
     ),
+    UserNotifyEvent.SEND_GIFT_CARD: (
+        send_gift_card_email_task,
+        "send_gift_card_template_id",
+    ),
 }
 
 HELP_TEXT_TEMPLATE = "ID of the dynamic template in Sendgrid"
 
 
-class SendgridEmailPlugin(BasePlugin):
+class DeprecatedSendgridEmailPlugin(BasePlugin):
+    """Deprecated.
+
+    This plugin is deprecated and will be removed in future version.
+    """
+
     PLUGIN_ID = "mirumee.notifications.sendgrid_email"
     PLUGIN_NAME = "Sendgrid"
     DEFAULT_ACTIVE = False
@@ -113,6 +125,7 @@ class SendgridEmailPlugin(BasePlugin):
         {"name": "order_payment_confirmation_template_id", "value": None},
         {"name": "order_canceled_template_id", "value": None},
         {"name": "order_refund_confirmation_template_id", "value": None},
+        {"name": "send_gift_card_template_id", "value": None},
         {"name": "api_key", "value": None},
     ]
     CONFIG_STRUCTURE = {
@@ -196,6 +209,11 @@ class SendgridEmailPlugin(BasePlugin):
             "help_text": HELP_TEXT_TEMPLATE,
             "label": "Order refund confirmation email template",
         },
+        "send_gift_card_template_id": {
+            "type": ConfigurationTypeField.STRING,
+            "help_text": HELP_TEXT_TEMPLATE,
+            "label": "Send gift card email template",
+        },
         "api_key": {
             "type": ConfigurationTypeField.SECRET,
             "help_text": "Your Sendgrid API key.",
@@ -209,29 +227,44 @@ class SendgridEmailPlugin(BasePlugin):
         configuration = {item["name"]: item["value"] for item in self.configuration}
         self.config = SendgridConfiguration(**configuration)
 
-    def notify(self, event: NotifyEventType, payload: dict, previous_value):
+    def notify(
+        self,
+        event: NotifyEventType | str,
+        payload_func: Callable[[], dict],
+        previous_value: None,
+    ) -> None:
         if not self.active:
             return previous_value
 
-        if event not in UserNotifyEvent.CHOICES:
+        event_in_notify_event = event in UserNotifyEvent.CHOICES
+
+        if not event_in_notify_event:
+            logger.info("Send email with event %s as dynamic template ID.", event)
+            payload = payload_func()
+            send_email_with_dynamic_template_id.delay(
+                payload, event, asdict(self.config)
+            )
             return previous_value
 
         if event not in EVENT_MAP:
-            logger.warning(f"Missing handler for event {event}")
+            logger.warning("Missing handler for event %s", event)
             return previous_value
 
         configuration = {item["name"]: item["value"] for item in self.configuration}
 
-        event_task, event_template = EVENT_MAP.get(event)  # type: ignore
+        event_task, event_template = EVENT_MAP.get(event)  # type: ignore[arg-type,misc]
         template_id = configuration.get(event_template)
         if not template_id:
             # the empty fields means that we should not send an email for this event.
             return previous_value
-
+        payload = payload_func()
         event_task.delay(payload, asdict(self.config))
+        return previous_value
 
     @classmethod
-    def validate_plugin_configuration(cls, plugin_configuration: "PluginConfiguration"):
+    def validate_plugin_configuration(
+        cls, plugin_configuration: "PluginConfiguration", **kwargs
+    ):
         """Validate if provided configuration is correct."""
         if not plugin_configuration.active:
             return

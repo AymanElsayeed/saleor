@@ -17,11 +17,11 @@ def get_linked_object_url(menu_item):
         return Category(
             **get_linked_object_kwargs(menu_item.category)
         ).get_absolute_url()
-    elif menu_item.collection:
+    if menu_item.collection:
         return Collection(
             **get_linked_object_kwargs(menu_item.collection)
         ).get_absolute_url()
-    elif menu_item.page:
+    if menu_item.page:
         return Page(**get_linked_object_kwargs(menu_item.page)).get_absolute_url()
     return None
 
@@ -71,7 +71,6 @@ def update_menus(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [("menu", "0006_auto_20180803_0528")]
 
     operations = [

@@ -1,16 +1,18 @@
 from unittest.mock import patch
 
+import dj_email_url
 import pytest
 
+from ....plugins.models import EmailTemplate, PluginConfiguration
 from ...email_common import DEFAULT_EMAIL_VALUE
 from ...manager import get_plugins_manager
 from ..constants import (
     CSV_EXPORT_FAILED_DEFAULT_SUBJECT,
     CSV_EXPORT_FAILED_SUBJECT_FIELD,
     CSV_EXPORT_FAILED_TEMPLATE_FIELD,
-    CSV_PRODUCT_EXPORT_SUCCESS_DEFAULT_SUBJECT,
-    CSV_PRODUCT_EXPORT_SUCCESS_SUBJECT_FIELD,
-    CSV_PRODUCT_EXPORT_SUCCESS_TEMPLATE_FIELD,
+    CSV_EXPORT_SUCCESS_DEFAULT_SUBJECT,
+    CSV_EXPORT_SUCCESS_SUBJECT_FIELD,
+    CSV_EXPORT_SUCCESS_TEMPLATE_FIELD,
     SET_STAFF_PASSWORD_DEFAULT_SUBJECT,
     SET_STAFF_PASSWORD_SUBJECT_FIELD,
     SET_STAFF_PASSWORD_TEMPLATE_FIELD,
@@ -54,13 +56,13 @@ def admin_email_plugin(settings):
         csv_product_export_failed=DEFAULT_EMAIL_VALUE,
         set_staff_password_title=STAFF_ORDER_CONFIRMATION_DEFAULT_SUBJECT,
         staff_order_confirmation_title=SET_STAFF_PASSWORD_DEFAULT_SUBJECT,
-        csv_product_export_title=CSV_PRODUCT_EXPORT_SUCCESS_DEFAULT_SUBJECT,
+        csv_product_export_title=CSV_EXPORT_SUCCESS_DEFAULT_SUBJECT,
         csv_product_export_failed_title=CSV_EXPORT_FAILED_DEFAULT_SUBJECT,
         staff_password_reset_template=DEFAULT_EMAIL_VALUE,
         staff_password_reset_subject=STAFF_PASSWORD_RESET_DEFAULT_SUBJECT,
     ):
         settings.PLUGINS = ["saleor.plugins.admin_email.plugin.AdminEmailPlugin"]
-        manager = get_plugins_manager()
+        manager = get_plugins_manager(allow_replica=False)
         with patch(
             "saleor.plugins.admin_email.plugin.validate_default_email_configuration"
         ):
@@ -91,7 +93,7 @@ def admin_email_plugin(settings):
                             "value": staff_order_confirmation,
                         },
                         {
-                            "name": CSV_PRODUCT_EXPORT_SUCCESS_TEMPLATE_FIELD,
+                            "name": CSV_EXPORT_SUCCESS_TEMPLATE_FIELD,
                             "value": csv_product_export,
                         },
                         {
@@ -111,7 +113,7 @@ def admin_email_plugin(settings):
                             "value": set_staff_password_title,
                         },
                         {
-                            "name": CSV_PRODUCT_EXPORT_SUCCESS_SUBJECT_FIELD,
+                            "name": CSV_EXPORT_SUCCESS_SUBJECT_FIELD,
                             "value": csv_product_export_title,
                         },
                         {
@@ -121,7 +123,47 @@ def admin_email_plugin(settings):
                     ],
                 },
             )
-        manager = get_plugins_manager()
+        manager = get_plugins_manager(allow_replica=False)
+        manager.get_all_plugins()
+        return manager.global_plugins[0]
+
+    return fun
+
+
+@pytest.fixture
+def admin_email_template(admin_email_plugin):
+    plugin = admin_email_plugin()
+    config = PluginConfiguration.objects.get(identifier=plugin.PLUGIN_ID)
+    return EmailTemplate.objects.create(
+        name=STAFF_PASSWORD_RESET_TEMPLATE_FIELD,
+        value="Custom staff reset password email template",
+        plugin_configuration=config,
+    )
+
+
+@pytest.fixture
+def default_admin_email_plugin(settings):
+    def fun(
+        default_email_from: str = "noreply@example.com",
+        email_url: str = "",
+    ):
+        settings.DEFAULT_FROM_EMAIL = default_email_from
+        settings.EMAIL_URL = email_url
+
+        email_config = dj_email_url.parse(email_url)
+
+        settings.EMAIL_FILE_PATH = email_config.get("EMAIL_FILE_PATH", "")
+        settings.EMAIL_HOST_USER = email_config.get("EMAIL_HOST_USER", "")
+        settings.EMAIL_HOST_PASSWORD = email_config.get("EMAIL_HOST_PASSWORD", "")
+        settings.EMAIL_HOST = email_config.get("EMAIL_HOST", "")
+        settings.EMAIL_PORT = str(email_config.get("EMAIL_PORT", ""))
+        settings.EMAIL_BACKEND = email_config.get("EMAIL_BACKEND", "")
+        settings.EMAIL_USE_TLS = email_config.get("EMAIL_USE_TLS", False)
+        settings.EMAIL_USE_SSL = email_config.get("EMAIL_USE_SSL", False)
+
+        settings.PLUGINS = ["saleor.plugins.admin_email.plugin.AdminEmailPlugin"]
+        manager = get_plugins_manager(allow_replica=False)
+        manager.get_all_plugins()
         return manager.global_plugins[0]
 
     return fun

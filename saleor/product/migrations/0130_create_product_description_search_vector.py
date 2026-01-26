@@ -30,7 +30,6 @@ def parse_description_json_field(apps, schema):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("product", "0129_add_product_types_and_attributes_perm"),
     ]
@@ -48,6 +47,7 @@ class Migration(migrations.Migration):
                 blank=True, null=True
             ),
         ),
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="product",
             index=django.contrib.postgres.indexes.GinIndex(
@@ -61,9 +61,8 @@ class Migration(migrations.Migration):
             tsvector_update_trigger(
                 'search_vector', 'pg_catalog.english', 'description_plaintext', 'name'
             )
-
-
-        """
+            """,
+            reverse_sql=migrations.RunSQL.noop,
         ),
         migrations.RunSQL(
             """
@@ -84,7 +83,8 @@ class Migration(migrations.Migration):
 
             CREATE TRIGGER tsvectorupdate BEFORE INSERT OR UPDATE
                 ON product_product FOR EACH ROW EXECUTE FUNCTION messages_trigger();
-            """
+            """,
+            reverse_sql=migrations.RunSQL.noop,
         ),
         migrations.RunPython(
             parse_description_json_field,

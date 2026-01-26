@@ -1,40 +1,43 @@
-from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+import datetime
+from collections.abc import Iterable
+from typing import Any
 
 import graphene
 import jwt
 from django.conf import settings
-from django.core.handlers.wsgi import WSGIRequest
 
 from ..account.models import User
-from ..app.models import App
-from .permissions import (
+from ..app.models import App, AppExtension
+from ..permission.enums import (
     get_permission_names,
     get_permissions_from_codenames,
     get_permissions_from_names,
 )
+from ..permission.models import Permission
+from .jwt_manager import get_jwt_manager
 
-JWT_ALGORITHM = "HS256"
-
-SALEOR_AUTH_HEADER = "HTTP_AUTHORIZATION_BEARER"
-DEFAULT_AUTH_HEADER = "HTTP_AUTHORIZATION"
-
-AUTH_HEADER_PREFIXES = ["JWT", "BEARER"]
 JWT_ACCESS_TYPE = "access"
 JWT_REFRESH_TYPE = "refresh"
 JWT_THIRDPARTY_ACCESS_TYPE = "thirdparty"
 JWT_REFRESH_TOKEN_COOKIE_NAME = "refreshToken"
 
+APP_KEY_FIELD = "app"
 PERMISSIONS_FIELD = "permissions"
+USER_PERMISSION_FIELD = "user_permissions"
 JWT_SALEOR_OWNER_NAME = "saleor"
 JWT_OWNER_FIELD = "owner"
 
 
 def jwt_base_payload(
-    exp_delta: Optional[timedelta], token_owner: str
-) -> Dict[str, Any]:
-    utc_now = datetime.utcnow()
-    payload = {"iat": utc_now, JWT_OWNER_FIELD: token_owner}
+    exp_delta: datetime.timedelta | None, token_owner: str
+) -> dict[str, Any]:
+    utc_now = datetime.datetime.now(tz=datetime.UTC)
+
+    payload = {
+        "iat": utc_now,
+        JWT_OWNER_FIELD: token_owner,
+        "iss": get_jwt_manager().get_issuer(),
+    }
     if exp_delta:
         payload["exp"] = utc_now + exp_delta
     return payload
@@ -43,11 +46,10 @@ def jwt_base_payload(
 def jwt_user_payload(
     user: User,
     token_type: str,
-    exp_delta: Optional[timedelta],
-    additional_payload: Optional[Dict[str, Any]] = None,
+    exp_delta: datetime.timedelta | None,
+    additional_payload: dict[str, Any] | None = None,
     token_owner: str = JWT_SALEOR_OWNER_NAME,
-) -> Dict[str, Any]:
-
+) -> dict[str, Any]:
     payload = jwt_base_payload(exp_delta, token_owner)
     payload.update(
         {
@@ -63,39 +65,34 @@ def jwt_user_payload(
     return payload
 
 
-def jwt_encode(payload: Dict[str, Any]) -> str:
-    return jwt.encode(
-        payload,
-        settings.SECRET_KEY,  # type: ignore
-        JWT_ALGORITHM,
-    )
+def jwt_encode(payload: dict[str, Any]) -> str:
+    jwt_manager = get_jwt_manager()
+    return jwt_manager.encode(payload)
 
 
 def jwt_decode_with_exception_handler(
     token: str, verify_expiration=settings.JWT_EXPIRE
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     try:
         return jwt_decode(token, verify_expiration=verify_expiration)
     except jwt.PyJWTError:
         return None
 
 
-def jwt_decode(token: str, verify_expiration=settings.JWT_EXPIRE) -> Dict[str, Any]:
-    return jwt.decode(
-        token,
-        settings.SECRET_KEY,  # type: ignore
-        algorithms=[JWT_ALGORITHM],
-        options={"verify_exp": verify_expiration},
-    )
+def jwt_decode(
+    token: str, verify_expiration=settings.JWT_EXPIRE, verify_aud: bool = False
+) -> dict[str, Any]:
+    jwt_manager = get_jwt_manager()
+    return jwt_manager.decode(token, verify_expiration, verify_aud=verify_aud)
 
 
-def create_token(payload: Dict[str, Any], exp_delta: timedelta) -> str:
+def create_token(payload: dict[str, Any], exp_delta: datetime.timedelta) -> str:
     payload.update(jwt_base_payload(exp_delta, token_owner=JWT_SALEOR_OWNER_NAME))
     return jwt_encode(payload)
 
 
 def create_access_token(
-    user: User, additional_payload: Optional[Dict[str, Any]] = None
+    user: User, additional_payload: dict[str, Any] | None = None
 ) -> str:
     payload = jwt_user_payload(
         user, JWT_ACCESS_TYPE, settings.JWT_TTL_ACCESS, additional_payload
@@ -104,7 +101,7 @@ def create_access_token(
 
 
 def create_refresh_token(
-    user: User, additional_payload: Optional[Dict[str, Any]] = None
+    user: User, additional_payload: dict[str, Any] | None = None
 ) -> str:
     payload = jwt_user_payload(
         user,
@@ -115,18 +112,8 @@ def create_refresh_token(
     return jwt_encode(payload)
 
 
-def get_token_from_request(request: WSGIRequest) -> Optional[str]:
-    auth_token = request.META.get(SALEOR_AUTH_HEADER)
-
-    if not auth_token:
-        auth = request.META.get(DEFAULT_AUTH_HEADER, "").split(maxsplit=1)
-
-        if len(auth) == 2 and auth[0].upper() in AUTH_HEADER_PREFIXES:
-            auth_token = auth[1]
-    return auth_token
-
-
-def get_user_from_payload(payload: Dict[str, Any]) -> Optional[User]:
+def get_user_from_payload(payload: dict[str, Any], request=None) -> User | None:
+    # TODO: dataloader
     user = User.objects.filter(email=payload["email"], is_active=True).first()
     user_jwt_token = payload.get("token")
     if not user_jwt_token or not user:
@@ -152,21 +139,14 @@ def is_saleor_token(token: str) -> bool:
     return True
 
 
-def get_user_from_access_token(token: str) -> Optional[User]:
-    if not is_saleor_token(token):
-        return None
-    payload = jwt_decode(token)
-    return get_user_from_access_payload(payload)
-
-
-def get_user_from_access_payload(payload: dict) -> Optional[User]:
+def get_user_from_access_payload(payload: dict, request=None) -> User | None:
     jwt_type = payload.get("type")
     if jwt_type not in [JWT_ACCESS_TYPE, JWT_THIRDPARTY_ACCESS_TYPE]:
         raise jwt.InvalidTokenError(
             "Invalid token. Create new one by using tokenCreate mutation."
         )
     permissions = payload.get(PERMISSIONS_FIELD, None)
-    user = get_user_from_payload(payload)
+    user = get_user_from_payload(payload, request)
     if user:
         if permissions is not None:
             token_permissions = get_permissions_from_names(permissions)
@@ -179,24 +159,27 @@ def get_user_from_access_payload(payload: dict) -> Optional[User]:
     return user
 
 
-def create_access_token_for_app(app: "App", user: "User"):
-    """Create access token for app.
+def _create_access_token_for_third_party_actions(
+    permissions: Iterable["Permission"],
+    user: "User",
+    app: "App",
+    extra: dict[str, Any] | None = None,
+    database_connection_name: str = settings.DATABASE_CONNECTION_DEFAULT_NAME,
+):
+    app_permission_enums = get_permission_names(permissions)
 
-    App can use user jwt token to proceed given operation on the Saleor side.
-    The token which can be used by App has additional field defining the permissions
-    assigned to it. The permissions set is the intersection of user permissions and
-    app permissions.
-    """
-    app_permissions = app.permissions.all()
-    app_permission_enums = get_permission_names(app_permissions)
-
-    permissions = user.effective_permissions
+    permissions = user.effective_permissions.using(database_connection_name)
     user_permission_enums = get_permission_names(permissions)
-    app_id = graphene.Node.to_global_id("App", app.id)
     additional_payload = {
-        "app": app_id,
+        APP_KEY_FIELD: graphene.Node.to_global_id("App", app.id),
         PERMISSIONS_FIELD: list(app_permission_enums & user_permission_enums),
+        USER_PERMISSION_FIELD: list(user_permission_enums),
     }
+    if app.audience:
+        additional_payload["aud"] = app.audience
+    if extra:
+        additional_payload.update(extra)
+
     payload = jwt_user_payload(
         user,
         JWT_THIRDPARTY_ACCESS_TYPE,
@@ -204,3 +187,41 @@ def create_access_token_for_app(app: "App", user: "User"):
         additional_payload=additional_payload,
     )
     return jwt_encode(payload)
+
+
+def create_access_token_for_app(
+    app: "App",
+    user: "User",
+    database_connection_name: str = settings.DATABASE_CONNECTION_DEFAULT_NAME,
+):
+    """Create access token for app.
+
+    App can use user's JWT token to proceed given operation in Saleor.
+    The token which can be used by App has additional field defining the permissions
+    assigned to it. The permissions set is the intersection of user permissions and
+    app permissions.
+    """
+    app_permissions = app.permissions.all()
+    return _create_access_token_for_third_party_actions(
+        permissions=app_permissions,
+        user=user,
+        app=app,
+        database_connection_name=database_connection_name,
+    )
+
+
+def create_access_token_for_app_extension(
+    app_extension: "AppExtension",
+    permissions: Iterable["Permission"],
+    user: "User",
+    app: "App",
+    database_connection_name: str = settings.DATABASE_CONNECTION_DEFAULT_NAME,
+):
+    app_extension_id = graphene.Node.to_global_id("AppExtension", app_extension.id)
+    return _create_access_token_for_third_party_actions(
+        permissions=permissions,
+        user=user,
+        app=app,
+        extra={"app_extension": app_extension_id},
+        database_connection_name=database_connection_name,
+    )

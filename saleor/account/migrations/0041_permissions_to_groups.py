@@ -55,6 +55,7 @@ def get_group_with_given_permissions(permissions, groups):
         group_perm_pks = {perm.pk for perm in group.permissions.all()}
         if group_perm_pks == set(permissions):
             return group
+    return None
 
 
 def create_group_with_given_permissions(perm_pks, counter, Group):
@@ -66,7 +67,6 @@ def create_group_with_given_permissions(perm_pks, counter, Group):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("account", "0040_auto_20200415_0443"),
     ]

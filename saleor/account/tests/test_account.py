@@ -1,23 +1,23 @@
-import uuid
+from unittest.mock import patch
 from urllib.parse import urlencode
 
 import i18naddress
 import pytest
 from django.core.exceptions import ValidationError
 from django.http import QueryDict
-from django.template import Context, Template
 from django_countries.fields import Country
 
 from ...order.models import Order
 from .. import forms, i18n
+from ..i18n_valid_address_extension import VALID_ADDRESS_EXTENSION_MAP
 from ..models import User
-from ..templatetags.i18n_address_tags import format_address
-from ..utils import remove_staff_member, requestor_is_staff_member_or_app
 from ..validators import validate_possible_number
 
 
-@pytest.mark.parametrize("country", ["CN", "PL", "US", "IE"])
+# Don't remove `XK` from the list of countries, it is override defined in saleor.settings.COUNTRIES_OVERRIDE.
+@pytest.mark.parametrize("country", ["CN", "PL", "US", "IE", "XK"])
 def test_address_form_for_country(country):
+    # given
     data = {
         "first_name": "John",
         "last_name": "Doe",
@@ -25,10 +25,13 @@ def test_address_form_for_country(country):
         "phone": "123456789",
     }
 
-    form = forms.get_address_form(data, country_code=country)[0]
+    # when
+    form = forms.get_address_form(data, country_code=country)
     errors = form.errors
     rules = i18naddress.get_validation_rules({"country_code": country})
     required = rules.required_fields
+
+    # then
     if "street_address" in required:
         assert "street_address_1" in errors
     else:
@@ -52,28 +55,94 @@ def test_address_form_for_country(country):
 
 
 def test_address_form_postal_code_validation():
+    # given
     data = {
         "first_name": "John",
         "last_name": "Doe",
         "country": "PL",
         "postal_code": "XXX",
     }
-    form = forms.get_address_form(data, country_code="PL")[0]
+
+    # when
+    form = forms.get_address_form(data, country_code="PL")
     errors = form.errors
+    # then
     assert "postal_code" in errors
 
 
+def test_address_form_Japanese_city_is_excluded_from_normalization():
+    # given
+    data = {
+        "first_name": "John",
+        "last_name": "Doe",
+        "street_address_1": "2344 Oya",
+        "country": "JP",
+        "country_area": "Saitama",
+        "city": "Fukaya-Shi",
+        "postal_code": "366-0814",
+    }
+    form = forms.get_address_form(data, country_code="JP")
+
+    # when
+    validated_address = form.validate_address(data)
+
+    # then
+    assert validated_address["city"] == "Fukaya-Shi"
+    assert not form.errors
+
+
+def test_city_is_allowed_in_Japanese_addresses():
+    # given
+
+    # when
+    country_rules = i18naddress.get_validation_rules({"country_code": "JP"})
+
+    # the
+    assert "city" in country_rules.allowed_fields
+    assert "%C" in country_rules.address_format
+    assert "%C" in country_rules.address_latin_format
+
+
+def test_address_form_long_street_address_validation():
+    # given
+    data = {
+        "city": "test",
+        "city_area": "test",
+        "company_name": "test",
+        "first_name": "Amelia",
+        "last_name": "Doe",
+        "country": "US",
+        "country_area": "IN",
+        "phone": "",
+        "postal_code": "46802",
+        "street_address_1": (
+            "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut "
+            "labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris "
+            "nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit "
+            "esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt "
+            "in culpa qui officia deserunt mollit anim id est laborum"
+        ),
+    }
+
+    # when
+    form = forms.get_address_form(data, country_code="US")
+    errors = form.errors
+
+    # then
+    assert "street_address_1" in errors
+
+
 @pytest.mark.parametrize(
-    "country, phone, is_valid",
-    (
+    ("country", "phone", "is_valid"),
+    [
         ("US", "123-456-7890", False),
         ("US", "(541) 754-3010", True),
         ("FR", "0600000000", True),
-    ),
+    ],
 )
 def test_address_form_phone_number_validation(country, phone, is_valid):
     data = {"country": country, "phone": phone}
-    form = forms.get_address_form(data, country_code="PL")[0]
+    form = forms.get_address_form(data, country_code="PL")
     errors = form.errors
     if not is_valid:
         assert "phone" in errors
@@ -82,48 +151,43 @@ def test_address_form_phone_number_validation(country, phone, is_valid):
 
 
 @pytest.mark.parametrize(
-    "form_data, form_valid, expected_preview, expected_country",
+    ("form_data", "form_valid", "expected_country"),
     [
-        ({"preview": True}, False, True, "PL"),
+        ({}, False, "PL"),
         (
             {
-                "preview": False,
                 "street_address_1": "Foo bar",
                 "postal_code": "00-123",
                 "city": "Warsaw",
             },
             True,
-            False,
             "PL",
         ),
-        ({"preview": True, "country": "US"}, False, True, "US"),
+        ({"country": "US"}, False, "US"),
         (
             {
-                "preview": False,
                 "street_address_1": "Foo bar",
                 "postal_code": "0213",
                 "city": "Warsaw",
             },
             False,
-            False,
             "PL",
         ),
     ],
 )
-def test_get_address_form(form_data, form_valid, expected_preview, expected_country):
+def test_get_address_form(form_data, form_valid, expected_country):
     data = {"first_name": "John", "last_name": "Doe", "country": "PL"}
     data.update(form_data)
     query_dict = urlencode(data)
-    form, preview = forms.get_address_form(
+    form = forms.get_address_form(
         data=QueryDict(query_dict), country_code=data["country"]
     )
-    assert preview is expected_preview
     assert form.is_valid() is form_valid
     assert form.i18n_country_code == expected_country
 
 
 def test_get_address_form_no_country_code():
-    form, _ = forms.get_address_form(data={}, country_code=None)
+    form = forms.get_address_form(data={}, country_code=None)
     assert isinstance(form, i18n.AddressForm)
 
 
@@ -139,8 +203,8 @@ def test_country_aware_form_has_only_supported_countries():
 
 
 @pytest.mark.parametrize(
-    "input_data, is_valid",
-    (
+    ("input_data", "is_valid"),
+    [
         ({"phone": "123"}, False),
         ({"phone": "+48123456789"}, True),
         ({"phone": "+12025550169"}, True),
@@ -157,7 +221,7 @@ def test_country_aware_form_has_only_supported_countries():
         ({"country": "US", "phone": "1-541-754-3010"}, True),
         ({"country": "FR", "phone": "1234567890"}, False),
         ({"country": "FR", "phone": "0600000000"}, True),
-    ),
+    ],
 )
 def test_validate_possible_number(input_data, is_valid):
     if not is_valid:
@@ -165,34 +229,6 @@ def test_validate_possible_number(input_data, is_valid):
             validate_possible_number(**input_data)
     else:
         validate_possible_number(**input_data)
-
-
-def test_format_address(address):
-    formatted_address = format_address(address)
-    address_html = "<br>".join(map(str, formatted_address["address_lines"]))
-    context = Context({"address": address})
-    tpl = Template("{% load i18n_address_tags %}" "{% format_address address %}")
-    rendered_html = tpl.render(context)
-    assert address_html in rendered_html
-    assert "inline-address" not in rendered_html
-    assert str(address.phone) in rendered_html
-
-
-def test_format_address_all_options(address):
-    formatted_address = format_address(
-        address, include_phone=False, inline=True, latin=True
-    )
-    address_html = ", ".join(map(str, formatted_address["address_lines"]))
-    context = Context({"address": address})
-    tpl = Template(
-        r"{% load i18n_address_tags %}"
-        r"{% format_address address include_phone=False inline=True"
-        r" latin=True %}"
-    )
-    rendered_html = tpl.render(context)
-    assert address_html in rendered_html
-    assert "inline-address" in rendered_html
-    assert str(address.phone) not in rendered_html
 
 
 def test_address_as_data(address):
@@ -209,6 +245,9 @@ def test_address_as_data(address):
         "country": "PL",
         "country_area": "",
         "phone": "+48713988102",
+        "metadata": {},
+        "private_metadata": {},
+        "validation_skipped": False,
     }
 
 
@@ -216,11 +255,6 @@ def test_copy_address(address):
     copied_address = address.get_copy()
     assert copied_address.pk != address.pk
     assert copied_address == address
-
-
-def test_compare_addresses(address):
-    copied_address = address.get_copy()
-    assert address == copied_address
 
 
 def test_compare_addresses_with_country_object(address):
@@ -238,7 +272,7 @@ def test_compare_addresses_different_country(address):
 
 
 @pytest.mark.parametrize(
-    "email, first_name, last_name, full_name",
+    ("email", "first_name", "last_name", "full_name"),
     [
         ("John@example.com", "John", "Doe", "John Doe"),
         ("John@example.com", "John", "", "John"),
@@ -254,7 +288,7 @@ def test_get_full_name_user_with_names(
 
 
 @pytest.mark.parametrize(
-    "email, first_name, last_name, full_name",
+    ("email", "first_name", "last_name", "full_name"),
     [
         ("John@example.com", "John", "Doe", "John Doe"),
         ("John@example.com", "John", "", "John"),
@@ -272,7 +306,7 @@ def test_get_full_name_user_with_address(
 
 
 @pytest.mark.parametrize(
-    "email, first_name, last_name, full_name",
+    ("email", "first_name", "last_name", "full_name"),
     [
         ("John@example.com", "John", "Doe", "John Doe"),
         ("John@example.com", "John", "", "John"),
@@ -292,64 +326,18 @@ def test_get_full_name(email, first_name, last_name, full_name, address):
     assert user.get_full_name() == full_name
 
 
-def test_remove_staff_member_with_orders(staff_user, permission_manage_products, order):
-    order.user = staff_user
-    order.save()
-    staff_user.user_permissions.add(permission_manage_products)
-
-    remove_staff_member(staff_user)
-    staff_user = User.objects.get(pk=staff_user.pk)
-    assert not staff_user.is_staff
-    assert not staff_user.user_permissions.exists()
-
-
-def test_remove_staff_member(staff_user):
-    remove_staff_member(staff_user)
-    assert not User.objects.filter(pk=staff_user.pk).exists()
-
-
-def test_requestor_is_staff_member_or_app_active_app(app):
-    assert app.is_active is True
-    assert requestor_is_staff_member_or_app(app) is True
-
-
-def test_requestor_is_staff_member_or_app_not_active_app(app):
-    app.is_active = False
-    app.save(update_fields=["is_active"])
-    assert requestor_is_staff_member_or_app(app) is False
-
-
-def test_requestor_is_staff_member_or_app_not_active_staff_user(staff_user):
-    staff_user.is_active = False
-    staff_user.save(update_fields=["is_active"])
-    assert requestor_is_staff_member_or_app(staff_user) is False
-
-
-def test_requestor_is_staff_member_or_app_active_staff_user(staff_user):
-    assert staff_user.is_active is True
-    assert requestor_is_staff_member_or_app(staff_user) is True
-
-
-def test_requestor_is_staff_member_or_app_superuser(superuser):
-    assert requestor_is_staff_member_or_app(superuser) is True
-
-
-def test_requestor_is_staff_member_or_app_customer_user(customer_user):
-    assert requestor_is_staff_member_or_app(customer_user) is False
-
-
 def test_customers_doesnt_return_duplicates(customer_user, channel_USD):
     Order.objects.bulk_create(
         [
             Order(
                 user=customer_user,
                 channel=channel_USD,
-                token=str(uuid.uuid4()),
+                lines_count=0,
             ),
             Order(
                 user=customer_user,
                 channel=channel_USD,
-                token=str(uuid.uuid4()),
+                lines_count=0,
             ),
         ]
     )
@@ -361,6 +349,46 @@ def test_customers_show_staff_with_order(admin_user, channel_USD):
     Order.objects.create(
         user=admin_user,
         channel=channel_USD,
-        token=str(uuid.uuid4()),
+        lines_count=0,
     )
     assert User.objects.customers().count() == 1
+
+
+@pytest.mark.parametrize(
+    ("country_area_input", "country_area_output", "is_valid"),
+    [
+        ("Dublin", "Co. Dublin", True),
+        ("Co. Dublin", "Co. Dublin", True),
+        ("Dummy Area", None, False),
+        ("dublin", "Co. Dublin", True),
+        (" dublin ", "Co. Dublin", True),
+        ("", "", True),
+        (None, "", True),
+    ],
+)
+@patch.dict(
+    VALID_ADDRESS_EXTENSION_MAP,
+    {"IE": {"country_area": {"dublin": "Co. Dublin"}, "city_area": {"dummy": "dummy"}}},
+)
+def test_substitute_invalid_values(country_area_input, country_area_output, is_valid):
+    # given
+    data = {
+        "first_name": "John",
+        "last_name": "Doe",
+        "country": "IE",
+        "country_area": country_area_input,
+        "city": "Dublin",
+        "street_address_1": "1 Anglesea St",
+        "postal_code": "D02 FK84",
+    }
+
+    # when
+    form = forms.get_address_form(data, country_code="PL")
+    errors = form.errors
+
+    # then
+    assert form.cleaned_data.get("country_area") == country_area_output
+    if not is_valid:
+        assert "country_area" in errors
+    else:
+        assert not errors

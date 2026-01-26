@@ -1,6 +1,3 @@
-# -*- coding: utf-8 -*-
-from __future__ import unicode_literals
-
 import uuid
 
 import django.core.validators
@@ -9,7 +6,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("product", "0012_auto_20160218_0812"),
         ("discount", "0003_auto_20160207_0534"),
@@ -132,6 +128,6 @@ class Migration(migrations.Migration):
             options={"db_table": "cart_cartline"},
         ),
         migrations.AlterUniqueTogether(
-            name="cartline", unique_together=set([("cart", "product", "data")])
+            name="cartline", unique_together={("cart", "product", "data")}
         ),
     ]

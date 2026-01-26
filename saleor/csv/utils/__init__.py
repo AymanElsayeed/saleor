@@ -8,10 +8,16 @@ class ProductExportFields:
             "description": "description_as_str",
             "category": "category__slug",
             "product type": "product_type__name",
-            "charge taxes": "charge_taxes",
+            # charge taxes are deprecated, and do not return any value. In case of
+            # requesting them, the headers number needs to match to the size of the row
+            "charge taxes": "",  # deprecated; remove in Saleor 4.0
             "product weight": "product_weight",
+            "variant id": "variants__id",
             "variant sku": "variants__sku",
             "variant weight": "variant_weight",
+            "variant is preorder": "variants__is_preorder",
+            "variant preorder global threshold": "variants__preorder_global_threshold",
+            "variant preorder end date": "variants__preorder_end_date",
         },
         "product_many_to_many": {
             "collections": "collections__slug",
@@ -21,26 +27,34 @@ class ProductExportFields:
     }
 
     PRODUCT_ATTRIBUTE_FIELDS = {
-        "value": "attributes__values__slug",
-        "file_url": "attributes__values__file_url",
-        "rich_text": "attributes__values__rich_text",
-        "boolean": "attributes__values__boolean",
-        "date_time": "attributes__values__date_time",
-        "slug": "attributes__assignment__attribute__slug",
-        "input_type": "attributes__assignment__attribute__input_type",
-        "entity_type": "attributes__assignment__attribute__entity_type",
-        "unit": "attributes__assignment__attribute__unit",
-        "attribute_pk": "attributes__assignment__attribute__pk",
+        "value_slug": "attributevalues__value__slug",
+        "value_name": "attributevalues__value__name",
+        "file_url": "attributevalues__value__file_url",
+        "rich_text": "attributevalues__value__rich_text",
+        "value": "attributevalues__value__value",
+        "boolean": "attributevalues__value__boolean",
+        "date_time": "attributevalues__value__date_time",
+        "slug": "attributevalues__value__attribute__slug",
+        "input_type": "attributevalues__value__attribute__input_type",
+        "entity_type": "attributevalues__value__attribute__entity_type",
+        "unit": "attributevalues__value__attribute__unit",
+        "attribute_pk": "attributevalues__value__attribute__pk",
+        "reference_page": "attributevalues__value__reference_page",
+        "reference_product": "attributevalues__value__reference_product",
+        "reference_variant": "attributevalues__value__reference_variant",
+        "reference_category": "attributevalues__value__reference_category",
+        "reference_collection": "attributevalues__value__reference_collection",
     }
 
     PRODUCT_CHANNEL_LISTING_FIELDS = {
-        "channel_pk": "channel_listings__channel__pk",
-        "slug": "channel_listings__channel__slug",
-        "product_currency_code": "channel_listings__currency",
-        "published": "channel_listings__is_published",
-        "publication_date": "channel_listings__publication_date",
-        "searchable": "channel_listings__visible_in_listings",
-        "available for purchase": "channel_listings__available_for_purchase",
+        "channel_pk": "channel_id",
+        "slug": "channel__slug",
+        "product_currency_code": "currency",
+        "published": "is_published",
+        "publication_date": "published_at",
+        "published_at": "published_at",
+        "searchable": "visible_in_listings",
+        "available for purchase": "available_for_purchase_at",
     }
 
     WAREHOUSE_FIELDS = {
@@ -50,22 +64,30 @@ class ProductExportFields:
     }
 
     VARIANT_ATTRIBUTE_FIELDS = {
-        "value": "variants__attributes__values__slug",
-        "file_url": "variants__attributes__values__file_url",
-        "rich_text": "variants__attributes__values__rich_text",
-        "boolean": "variants__attributes__values__boolean",
-        "date_time": "variants__attributes__values__date_time",
-        "slug": "variants__attributes__assignment__attribute__slug",
-        "input_type": "variants__attributes__assignment__attribute__input_type",
-        "entity_type": "variants__attributes__assignment__attribute__entity_type",
-        "unit": "variants__attributes__assignment__attribute__unit",
-        "attribute_pk": "variants__attributes__assignment__attribute__pk",
+        "value_slug": "values__slug",
+        "value_name": "values__name",
+        "file_url": "values__file_url",
+        "rich_text": "values__rich_text",
+        "value": "values__value",
+        "boolean": "values__boolean",
+        "date_time": "values__date_time",
+        "slug": "assignment__attribute__slug",
+        "input_type": "assignment__attribute__input_type",
+        "entity_type": "assignment__attribute__entity_type",
+        "unit": "assignment__attribute__unit",
+        "attribute_pk": "assignment__attribute__pk",
+        "reference_page": "values__reference_page",
+        "reference_product": "values__reference_product",
+        "reference_variant": "values__reference_variant",
+        "reference_category": "values__reference_category",
+        "reference_collection": "values__reference_collection",
     }
 
     VARIANT_CHANNEL_LISTING_FIELDS = {
-        "channel_pk": "variants__channel_listings__channel__pk",
-        "slug": "variants__channel_listings__channel__slug",
-        "price_amount": "variants__channel_listings__price_amount",
-        "variant_currency_code": "variants__channel_listings__currency",
-        "variant_cost_price": "variants__channel_listings__cost_price_amount",
+        "channel_pk": "channel__pk",
+        "slug": "channel__slug",
+        "price_amount": "price_amount",
+        "variant_currency_code": "currency",
+        "variant_cost_price": "cost_price_amount",
+        "variant_preorder_quantity_threshold": "preorder_quantity_threshold",
     }
