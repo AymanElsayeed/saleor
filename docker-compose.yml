@@ -1,0 +1,53 @@
+services:
+  app:
+    build: .
+    image: saleor:latest
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgres://saleor:saleor@db:5432/saleor
+      CACHE_URL: redis://cache:6379/0
+      CELERY_BROKER_URL: redis://cache:6379/1
+      EMAIL_URL: smtp://mailpit:1025
+      SECRET_KEY: changeme-dev-secret-key
+      HTTP_IP_FILTER_ALLOW_LOOPBACK_IPS: "True"
+      DASHBOARD_URL: http://localhost:9000/
+      DEFAULT_FROM_EMAIL: noreply@example.com
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_started
+
+  db:
+    image: library/postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: saleor
+      POSTGRES_PASSWORD: saleor
+      POSTGRES_DB: saleor
+    volumes:
+      - saleor-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U saleor -d saleor"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  cache:
+    image: valkey/valkey:8.1-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - saleor-cache:/data
+
+  mailpit:
+    image: axllent/mailpit
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+volumes:
+  saleor-db:
+  saleor-cache:
